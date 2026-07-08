@@ -380,6 +380,14 @@ def search_mmdit(target_params=2_000_000_000, top_k=5):
         "attention_head_dim": [64, 72, 80, 96],
     }
 
+    def constraint(cfg):
+        # In SD3/MMDiT the joint-attention stream width is
+        # inner_dim = num_attention_heads * attention_head_dim, and the text
+        # (context) stream must share that width. Keep caption_projection_dim in
+        # sync with inner_dim, otherwise the joint attention blocks cannot run.
+        cfg["caption_projection_dim"] = cfg["num_attention_heads"] * cfg["attention_head_dim"]
+        return True
+
     baseline_col, candidate_cols = run_search(
         baseline_cfg=baseline_cfg,
         baseline_params=baseline_params,
@@ -388,7 +396,7 @@ def search_mmdit(target_params=2_000_000_000, top_k=5):
         to_dict_fn=lambda cfg: dict(cfg),
         override_grid=override_grid,
         target_params=target_params,
-        constraint=None,
+        constraint=constraint,
         top_k=top_k,
     )
     print_config_table(
