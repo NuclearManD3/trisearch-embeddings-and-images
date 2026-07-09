@@ -44,12 +44,13 @@ def _solid(color: tuple[int, int, int], size: tuple[int, int] = (640, 480)) -> I
 
 class TestResizeAndCaptions(unittest.TestCase):
     def test_resize_square(self):
-        img = resize_square_rgb(_solid((10, 20, 30), (800, 400)), 512)
-        self.assertEqual(img.size, (512, 512))
+        img = resize_square_rgb(_solid((10, 20, 30), (800, 400)), DEFAULT_IMAGE_SIZE)
+        self.assertEqual(img.size, (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
         self.assertEqual(img.mode, "RGB")
 
     def test_resize_scale_short_side_then_crop(self):
-        """Landscape: scale min side to 512, then center-crop (not crop-first)."""
+        """Landscape: scale min side to target, then center-crop (not crop-first)."""
+        size = 512  # smaller target so the synthetic stripe test stays light
         # Left=red, middle=green, right=blue stripes on 900×300.
         src = Image.new("RGB", (900, 300))
         for x in range(900):
@@ -61,10 +62,10 @@ class TestResizeAndCaptions(unittest.TestCase):
                 c = (0, 0, 255)
             for y in range(300):
                 src.putpixel((x, y), c)
-        out = resize_square_rgb(src, 512)
-        self.assertEqual(out.size, (512, 512))
+        out = resize_square_rgb(src, size)
+        self.assertEqual(out.size, (size, size))
         # After scale: 1536×512; center crop keeps the green band.
-        r, g, b = out.getpixel((256, 256))
+        r, g, b = out.getpixel((size // 2, size // 2))
         self.assertGreater(g, 200)  # green dominant
         self.assertLess(r, 80)
         self.assertLess(b, 80)
@@ -139,7 +140,9 @@ class TestSaveLoadRoundtrip(unittest.TestCase):
 
             loaded = load_dataset_records(out)
             self.assertEqual(len(loaded), 4)
-            self.assertEqual(loaded[0]["image"].size, (512, 512))
+            self.assertEqual(
+                loaded[0]["image"].size, (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)
+            )
             self.assertGreaterEqual(len(loaded[0]["captions"]), 2)
 
             train_rows = load_curated_training_rows(out, seed=0)

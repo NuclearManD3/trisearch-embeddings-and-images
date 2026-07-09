@@ -24,7 +24,7 @@ Each row (parquet / in-memory) has:
 | captions         | list[string]   | ≥2 human/source captions for the image           |
 | query            | string         | search-style query that should find this image   |
 | unrelated_query  | string         | search-style distractor on a different topic     |
-| image            | Image          | RGB, 512×512 (embedded in parquet as JPEG bytes) |
+| image            | Image          | RGB, 1024×1024 (embedded in parquet as JPEG bytes) |
 
 Load with::
 
@@ -45,7 +45,7 @@ from typing import Any, Iterable, Sequence
 from PIL import Image
 
 DATASET_FORMAT_VERSION = 1
-DEFAULT_IMAGE_SIZE = 512
+DEFAULT_IMAGE_SIZE = 1024
 DEFAULT_DATASET_ROOT = Path("models/data/trisearch-v1")
 DOMAIN_GENERAL = "general"
 DOMAIN_SATELLITE = "satellite"
@@ -73,9 +73,8 @@ def resize_square_rgb(image: Image.Image, size: int = DEFAULT_IMAGE_SIZE) -> Ima
        tall images become ``size×(>size)``. Upscales if the image is smaller.
     3. Center-crop the long side to ``size×size``.
 
-    Example: ``2000×1000`` → scale 0.512 → ``1024×512`` → crop → ``512×512``
-    (keeps full height). Crop-first would take a ``1000×1000`` center then
-    downscale and throw away half the width *before* shrinking.
+    Example (size=1024): ``2000×1000`` → ``2048×1024`` → crop → ``1024×1024``
+    (keeps full height). Crop-first would discard width early.
     """
     img = image.convert("RGB")
     w, h = img.size

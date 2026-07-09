@@ -95,7 +95,7 @@ def build_viewer(records: list[dict]):
             next_btn = gr.Button("Next →")
             index_in = gr.Number(value=0, label="Index", precision=0)
             go_btn = gr.Button("Go")
-        image = gr.Image(type="pil", label="Image (512×512)")
+        image = gr.Image(type="pil", label="Image (1024×1024)")
         meta = gr.HTML()
         # Keep index only as a Number (visible); do not pass gr.State(const)
         # into .click() — Gradio 5.12 get_api_info crashes on that pattern.

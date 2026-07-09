@@ -72,7 +72,7 @@ Keep shared code in modules, not duplicated in scripts:
 |--------|----------------|
 | `trisearch_models/` | Model constants, inference embedders, 8-bit loading, training losses, `Stage1AlignmentModel`, checkpoint I/O, optimizer helpers |
 | `trisearch_dataset.py` | HF/JSONL loading, mixing, `ImageCaptionDataset`, sampling for eval/index |
-| `trisearch_data_format.py` | Curated TriSearch dataset schema, 512px resize, HF export/load |
+| `trisearch_data_format.py` | Curated TriSearch dataset schema, 1024px resize, HF export/load |
 | `generate_datasets.py` | Build curated Stage-1 dataset (COCO + SkyScript/RSICD, queries) |
 | `view_dataset.py` | Gradio browser for curated dataset |
 | `train_stage1.py` | Stage-1 CLI only — argparse + `main()` |

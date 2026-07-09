@@ -6,13 +6,14 @@ Memory model
 ------------
 Images are **never** all kept in RAM. Flow:
 
-1. Stream sources → resize to 512 → write staging JPEG to disk → keep metadata only.
+1. Stream sources → resize to 1024 → write staging JPEG to disk → keep metadata only.
 2. Diversify captions / generate queries (text-only, low RAM).
 3. Export parquet + hf/ in small chunks (``--write-chunk``, default 64).
 
 Sources
 -------
-- **general**: MS-COCO via ``bitmind/MS-COCO`` (grouped multi-captions).
+- **general**: MS-COCO via a **local on-disk mirror** of ``bitmind/MS-COCO``
+  (downloaded once under ``models/data/bitmind-MS-COCO``).
 - **satellite**: SkyScript (CSV + local image zips). Optional RSICD fallback.
 
 Examples
@@ -58,7 +59,9 @@ from trisearch_dataset import (
 )
 
 COCO_HF_ID = "bitmind/MS-COCO"
+DEFAULT_COCO_LOCAL_DIR = Path("models/data/bitmind-MS-COCO")
 RSICD_HF_ID = "arampacha/rsicd"
+DEFAULT_RSICD_LOCAL_DIR = Path("models/data/arampacha-rsicd")
 SKYSCRIPT_CSV_URL = (
     "https://opendatasharing.s3.us-west-2.amazonaws.com/SkyScript/dataframe/"
     "SkyScript_train_top30pct_filtered_by_CLIP_laion_RS_language_polished.csv"
@@ -67,6 +70,7 @@ DEFAULT_SKYSCRIPT_ROOT = Path("models/data/SkyScript")
 DEFAULT_TOTAL = 65_536
 DEFAULT_SATELLITE_FRACTION = 0.5
 STAGING_JPEG_QUALITY = 90
+DEFAULT_STAGE_WORKERS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +87,17 @@ def _pil_from_row_image(value: Any) -> Image.Image:
     raise TypeError(f"Unsupported image type: {type(value)}")
 
 
+def _staging_jpeg_ready(path: Path, *, image_size: int) -> bool:
+    """True if ``path`` is a usable staged square JPEG (skip re-encode)."""
+    if not path.is_file() or path.stat().st_size < 1024:
+        return False
+    try:
+        with Image.open(path) as im:
+            return im.size == (image_size, image_size)
+    except OSError:
+        return False
+
+
 def _save_staging_jpeg(
     image: Image.Image,
     path: Path,
@@ -91,6 +106,12 @@ def _save_staging_jpeg(
 ) -> Path:
     """Resize to square and write JPEG; free the large source image."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if _staging_jpeg_ready(path, image_size=image_size):
+        try:
+            image.close()
+        except Exception:
+            pass
+        return path
     small = resize_square_rgb(image, image_size)
     small.save(path, format="JPEG", quality=STAGING_JPEG_QUALITY, optimize=True)
     small.close()
@@ -102,9 +123,110 @@ def _save_staging_jpeg(
     return path
 
 
+def _stage_job_from_path(
+    src_path: str,
+    dest_path: str,
+    image_size: int,
+) -> str:
+    """Worker: open disk image → stage JPEG (skip if dest already good)."""
+    dest = Path(dest_path)
+    if _staging_jpeg_ready(dest, image_size=image_size):
+        return dest_path
+    with Image.open(src_path) as img:
+        img.load()
+        rgb = img.convert("RGB")
+        _save_staging_jpeg(rgb, dest, image_size=image_size)
+    return dest_path
+
+
+def _parallel_stage_path_jobs(
+    jobs: list[tuple[str, str, list[str], str, str]],
+    *,
+    image_size: int,
+    workers: int,
+) -> list[dict[str, Any]]:
+    """Stage many (src_path, dest_path, captions, source, domain) jobs in parallel.
+
+    Each job tuple: (src_path, dest_path, captions, source, domain).
+    Returns metadata dicts with ``image_path`` set (no PIL retained).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not jobs:
+        return []
+    workers = max(1, min(workers, len(jobs)))
+    print(
+        f"  parallel image staging: {len(jobs):,} jobs, workers={workers}",
+        flush=True,
+    )
+    results: list[dict[str, Any] | None] = [None] * len(jobs)
+
+    def work(i: int) -> tuple[int, dict[str, Any] | None]:
+        src, dest, caps, source, domain = jobs[i]
+        try:
+            _stage_job_from_path(src, dest, image_size)
+            return i, {
+                "image_path": dest,
+                "captions": caps,
+                "source": source,
+                "domain": domain,
+            }
+        except OSError as exc:
+            print(f"  skip staging {src}: {exc}", flush=True)
+            return i, None
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(work, i) for i in range(len(jobs))]
+        for fut in as_completed(futs):
+            i, item = fut.result()
+            results[i] = item
+            done += 1
+            if done == 1 or done % 50 == 0 or done == len(jobs):
+                print(f"    staged images {done}/{len(jobs)}", flush=True)
+
+    return [r for r in results if r is not None]
+
+
 # ---------------------------------------------------------------------------
-# MS-COCO — stream groups without holding all images
+# MS-COCO — local on-disk mirror (download once)
 # ---------------------------------------------------------------------------
+
+def ensure_local_hf_dataset(
+    local_dir: Path,
+    hf_id: str,
+    *,
+    split: str = "train",
+) -> Any:
+    """Load a HF dataset from a local ``save_to_disk`` mirror; download once if missing.
+
+    This is the “local COCO mirror”: Hub is contacted only when ``local_dir`` is
+    absent. Later runs read only from disk (no re-download / re-stream).
+    """
+    from datasets import load_dataset, load_from_disk
+
+    local_dir = Path(local_dir)
+    # datasets.save_to_disk writes state.json (Dataset) or dataset_dict.json
+    if (local_dir / "state.json").is_file() or (local_dir / "dataset_dict.json").is_file():
+        print(f"Loading local dataset mirror from {local_dir} ...", flush=True)
+        from datasets import DatasetDict
+
+        ds = load_from_disk(str(local_dir))
+        if isinstance(ds, DatasetDict):
+            return ds[split]
+        return ds
+
+    print(
+        f"Local mirror missing at {local_dir}; downloading {hf_id!r} once "
+        f"(split={split}) and saving to disk ...",
+        flush=True,
+    )
+    local_dir.parent.mkdir(parents=True, exist_ok=True)
+    ds = load_dataset(hf_id, split=split)  # materializes into HF cache, then we mirror
+    ds.save_to_disk(str(local_dir))
+    print(f"  saved local mirror -> {local_dir}", flush=True)
+    return ds
+
 
 def iter_coco_staged(
     *,
@@ -112,56 +234,32 @@ def iter_coco_staged(
     seed: int,
     staging_dir: Path,
     image_size: int,
+    workers: int = DEFAULT_STAGE_WORKERS,
     hf_id: str = COCO_HF_ID,
+    local_dir: Path = DEFAULT_COCO_LOCAL_DIR,
 ) -> Iterator[dict[str, Any]]:
-    """Yield staged general records (metadata + image_path only)."""
-    from datasets import load_dataset
+    """Stage general COCO images from a local mirror (no Hub re-stream).
 
-    print(f"Streaming general source {hf_id!r} (disk-staged, low RAM) ...", flush=True)
-    ds = load_dataset(hf_id, split="train", streaming=True)
+    Pass 1: text-only column scan to group multi-captions (no image decode).
+    Pass 2: shuffle + take exactly ``max_images`` groups (no overscan).
+    Pass 3: parallel resize/JPEG for groups not already staged.
+    """
+    ds = ensure_local_hf_dataset(local_dir, hf_id, split="train")
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    # Reservoir of completed groups: only paths + captions (no pixels).
-    reservoir: list[dict[str, Any]] = []
-    seen = 0
-    rng = random.Random(seed)
+    # Text-only pass: avoid decoding images while grouping captions.
+    text_cols = [c for c in ds.column_names if c != "image"]
+    text_ds = ds.select_columns(text_cols) if "image" in ds.column_names else ds
 
-    current_id: Any = None
-    current_caps: list[str] = []
-    current_path: Path | None = None
-
-    def _commit_group() -> None:
-        nonlocal seen, current_id, current_caps, current_path
-        if current_id is None or current_path is None:
-            return
-        try:
-            caps = normalize_captions(current_caps, min_count=2)
-        except ValueError:
-            # Keep raw for later diversify if we have anything.
-            caps = list(dict.fromkeys(c for c in current_caps if c))
-            if not caps:
-                if current_path.is_file():
-                    current_path.unlink(missing_ok=True)
-                return
-        item = {
-            "image_path": str(current_path),
-            "captions": caps,
-            "source": hf_id,
-            "domain": DOMAIN_GENERAL,
-        }
-        seen += 1
-        if len(reservoir) < max_images:
-            reservoir.append(item)
-        else:
-            j = rng.randint(0, seen - 1)
-            if j < max_images:
-                old = reservoir[j]
-                Path(old["image_path"]).unlink(missing_ok=True)
-                reservoir[j] = item
-            else:
-                current_path.unlink(missing_ok=True)
-
-    for row in ds:
+    print(
+        f"Grouping COCO multi-captions from local mirror "
+        f"({len(text_ds):,} rows, text-only) ...",
+        flush=True,
+    )
+    groups: dict[Any, dict[str, Any]] = {}
+    order: list[Any] = []
+    for i in range(len(text_ds)):
+        row = text_ds[i]
         cid = row.get("cocoid", row.get("imgid"))
         sent = row.get("sentences") or {}
         if isinstance(sent, dict):
@@ -170,45 +268,85 @@ def iter_coco_staged(
             cap = str(sent).strip()
         if not cap:
             continue
+        if cid not in groups:
+            groups[cid] = {"indices": [i], "captions": [cap]}
+            order.append(cid)
+        else:
+            groups[cid]["indices"].append(i)
+            if cap not in groups[cid]["captions"]:
+                groups[cid]["captions"].append(cap)
 
-        if current_id is None:
-            current_id = cid
-            current_caps = [cap]
-            try:
-                img = _pil_from_row_image(row["image"])
-            except Exception:
-                current_id = None
-                current_caps = []
-                continue
-            current_path = staging_dir / f"coco_{cid}.jpg"
-            _save_staging_jpeg(img, current_path, image_size=image_size)
-            continue
+    # Need ≥2 caption strings; near-dup diversity may be fixed later by diversify step.
+    eligible = [cid for cid in order if len(groups[cid]["captions"]) >= 2]
 
-        if cid == current_id:
-            if cap not in current_caps:
-                current_caps.append(cap)
-            continue
+    rng = random.Random(seed)
+    rng.shuffle(eligible)
+    selected = eligible[:max_images]
+    print(
+        f"  COCO groups with multi-captions: {len(eligible):,}; "
+        f"selected {len(selected):,} (no overscan)",
+        flush=True,
+    )
 
-        _commit_group()
-        current_id = cid
-        current_caps = [cap]
+    # Parallel stage: load image only for selected groups missing staging files.
+    jobs: list[tuple[int, str, list[str]]] = []  # (ds_index, dest, captions)
+    ready: list[dict[str, Any]] = []
+    for cid in selected:
+        g = groups[cid]
+        dest = staging_dir / f"coco_{cid}.jpg"
+        caps = g["captions"]
         try:
-            img = _pil_from_row_image(row["image"])
-        except Exception:
-            current_id = None
-            current_caps = []
-            current_path = None
-            continue
-        current_path = staging_dir / f"coco_{cid}.jpg"
-        _save_staging_jpeg(img, current_path, image_size=image_size)
+            caps = normalize_captions(caps, min_count=2)
+        except ValueError:
+            caps = list(dict.fromkeys(c for c in caps if c.strip()))
+        if _staging_jpeg_ready(dest, image_size=image_size):
+            ready.append({
+                "image_path": str(dest),
+                "captions": caps,
+                "source": hf_id,
+                "domain": DOMAIN_GENERAL,
+            })
+        else:
+            jobs.append((g["indices"][0], str(dest), caps))
 
-        # Early stop: enough reservoir fills and stream has moved on a bit.
-        if seen >= max_images * 8 and len(reservoir) >= max_images:
-            break
+    if jobs:
+        print(
+            f"  COCO staging: {len(ready):,} cached, {len(jobs):,} to encode "
+            f"(workers={workers})",
+            flush=True,
+        )
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    _commit_group()
-    print(f"  staged {len(reservoir):,} COCO images (from {seen:,} groups)", flush=True)
-    yield from reservoir
+        def work(job: tuple[int, str, list[str]]) -> dict[str, Any] | None:
+            idx, dest, caps = job
+            try:
+                img = _pil_from_row_image(ds[idx]["image"])
+                _save_staging_jpeg(img, Path(dest), image_size=image_size)
+                return {
+                    "image_path": dest,
+                    "captions": caps,
+                    "source": hf_id,
+                    "domain": DOMAIN_GENERAL,
+                }
+            except Exception as exc:
+                print(f"  skip COCO idx={idx}: {exc}", flush=True)
+                return None
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futs = [pool.submit(work, j) for j in jobs]
+            for fut in as_completed(futs):
+                item = fut.result()
+                done += 1
+                if item is not None:
+                    ready.append(item)
+                if done == 1 or done % 50 == 0 or done == len(jobs):
+                    print(f"    COCO encode {done}/{len(jobs)}", flush=True)
+    else:
+        print(f"  COCO staging: all {len(ready):,} already cached", flush=True)
+
+    print(f"  staged {len(ready):,} COCO images", flush=True)
+    yield from ready
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +404,7 @@ def iter_skyscript_staged(
     download_csv: bool,
     staging_dir: Path,
     image_size: int,
+    workers: int = DEFAULT_STAGE_WORKERS,
 ) -> Iterator[dict[str, Any]]:
     csv_path = ensure_skyscript_csv(root, download=download_csv)
     if not root.is_dir():
@@ -320,28 +459,15 @@ def iter_skyscript_staged(
         flush=True,
     )
     staging_dir.mkdir(parents=True, exist_ok=True)
-    taken = 0
-    for row in reservoir:
-        try:
-            with Image.open(row["src"]) as img:
-                img.load()
-                img = img.convert("RGB")
-                out = staging_dir / f"sky_{taken:06d}.jpg"
-                _save_staging_jpeg(img, out, image_size=image_size)
-        except OSError:
-            continue
-        raw_caps = [c for c in (row["title"], row["multi"]) if c]
-        yield {
-            "image_path": str(out),
-            "captions": raw_caps,
-            "source": "SkyScript",
-            "domain": DOMAIN_SATELLITE,
-        }
-        taken += 1
-        if taken % 200 == 0:
-            print(f"  staged {taken:,} SkyScript images ...", flush=True)
-            gc.collect()
-    print(f"  staged {taken:,} SkyScript images", flush=True)
+    jobs: list[tuple[str, str, list[str], str, str]] = []
+    for i, row in enumerate(reservoir):
+        dest = str(staging_dir / f"sky_{i:06d}.jpg")
+        caps = [c for c in (row["title"], row["multi"]) if c]
+        jobs.append((row["src"], dest, caps, "SkyScript", DOMAIN_SATELLITE))
+    # Use module-level default workers via parallel helper; caller can pass later.
+    staged = _parallel_stage_path_jobs(jobs, image_size=image_size, workers=workers)
+    print(f"  staged {len(staged):,} SkyScript images", flush=True)
+    yield from staged
 
 
 def iter_rsicd_staged(
@@ -350,48 +476,70 @@ def iter_rsicd_staged(
     seed: int,
     staging_dir: Path,
     image_size: int,
+    workers: int = DEFAULT_STAGE_WORKERS,
+    local_dir: Path = DEFAULT_RSICD_LOCAL_DIR,
 ) -> Iterator[dict[str, Any]]:
-    """Stream RSICD; stage JPEGs immediately (no full-row list of PIL images)."""
-    from datasets import load_dataset
-
-    print(f"Streaming satellite fallback {RSICD_HF_ID!r} (disk-staged) ...", flush=True)
-    ds = load_dataset(RSICD_HF_ID, split="train", streaming=True)
+    """Stage RSICD from a local on-disk mirror (download once if missing)."""
+    ds = ensure_local_hf_dataset(local_dir, RSICD_HF_ID, split="train")
     staging_dir.mkdir(parents=True, exist_ok=True)
+    n = len(ds)
+    indices = list(range(n))
     rng = random.Random(seed)
-    reservoir: list[dict[str, Any]] = []
-    seen = 0
+    rng.shuffle(indices)
+    indices = indices[:max_images]
 
-    for row in ds:
-        caps = row.get("captions") or []
-        if not isinstance(caps, list) or not caps:
-            continue
+    print(
+        f"RSICD local mirror: selecting {len(indices):,}/{n:,} images "
+        f"(workers={workers})",
+        flush=True,
+    )
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def work(rank_i: int, ds_idx: int) -> dict[str, Any] | None:
+        dest = staging_dir / f"rsicd_{rank_i:06d}.jpg"
         try:
+            row = ds[ds_idx]
+            caps = row.get("captions") or []
+            if not isinstance(caps, list) or not caps:
+                return None
+            caps = [str(c).strip() for c in caps if str(c).strip()]
+            if _staging_jpeg_ready(dest, image_size=image_size):
+                return {
+                    "image_path": str(dest),
+                    "captions": caps,
+                    "source": RSICD_HF_ID,
+                    "domain": DOMAIN_SATELLITE,
+                }
             img = _pil_from_row_image(row["image"])
-        except (TypeError, OSError):
-            continue
-        seen += 1
-        path = staging_dir / f"rsicd_{seen:06d}.jpg"
-        _save_staging_jpeg(img, path, image_size=image_size)
-        item = {
-            "image_path": str(path),
-            "captions": [str(c).strip() for c in caps if str(c).strip()],
-            "source": RSICD_HF_ID,
-            "domain": DOMAIN_SATELLITE,
-        }
-        if len(reservoir) < max_images:
-            reservoir.append(item)
-        else:
-            j = rng.randint(0, seen - 1)
-            if j < max_images:
-                Path(reservoir[j]["image_path"]).unlink(missing_ok=True)
-                reservoir[j] = item
-            else:
-                path.unlink(missing_ok=True)
-        if seen >= max_images * 5 and len(reservoir) >= max_images:
-            break
+            _save_staging_jpeg(img, dest, image_size=image_size)
+            return {
+                "image_path": str(dest),
+                "captions": caps,
+                "source": RSICD_HF_ID,
+                "domain": DOMAIN_SATELLITE,
+            }
+        except Exception as exc:
+            print(f"  skip RSICD idx={ds_idx}: {exc}", flush=True)
+            return None
 
-    print(f"  staged {len(reservoir):,} RSICD images (from {seen:,} seen)", flush=True)
-    yield from reservoir
+    ready: list[dict[str, Any]] = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futs = {
+            pool.submit(work, rank, idx): rank
+            for rank, idx in enumerate(indices)
+        }
+        for fut in as_completed(futs):
+            item = fut.result()
+            done += 1
+            if item is not None:
+                ready.append(item)
+            if done == 1 or done % 50 == 0 or done == len(indices):
+                print(f"    RSICD stage {done}/{len(indices)}", flush=True)
+
+    print(f"  staged {len(ready):,} RSICD images", flush=True)
+    yield from ready
 
 
 # ---------------------------------------------------------------------------
@@ -589,9 +737,10 @@ def build_staged_records(
     allow_rsicd_fallback: bool,
     image_size: int,
     staging_dir: Path,
+    stage_workers: int = DEFAULT_STAGE_WORKERS,
+    coco_local_dir: Path = DEFAULT_COCO_LOCAL_DIR,
 ) -> list[dict[str, Any]]:
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
+    # Reuse staging dir so existing JPEGs are not re-encoded.
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict[str, Any]] = []
@@ -603,6 +752,8 @@ def build_staged_records(
             seed=seed,
             staging_dir=gen_dir,
             image_size=image_size,
+            workers=stage_workers,
+            local_dir=coco_local_dir,
         )
     ):
         item = dict(item)
@@ -621,6 +772,7 @@ def build_staged_records(
             download_csv=download_skyscript_csv,
             staging_dir=sat_dir,
             image_size=image_size,
+            workers=stage_workers,
         )
         sat_items = list(sat_iter)
     except FileNotFoundError as exc:
@@ -633,6 +785,7 @@ def build_staged_records(
                 seed=seed + 1,
                 staging_dir=sat_dir,
                 image_size=image_size,
+                workers=stage_workers,
             )
         )
 
@@ -672,9 +825,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--satellite-fraction", type=float,
                    default=DEFAULT_SATELLITE_FRACTION)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
+    p.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE,
+                   help=f"Output square size (default {DEFAULT_IMAGE_SIZE}).")
     p.add_argument("--write-chunk", type=int, default=DEFAULT_WRITE_CHUNK,
                    help="Rows per parquet flush (default 64; lower = less RAM).")
+    p.add_argument("--stage-workers", type=int, default=DEFAULT_STAGE_WORKERS,
+                   help="Parallel workers for image resize/JPEG staging.")
+    p.add_argument(
+        "--coco-local-dir",
+        type=Path,
+        default=DEFAULT_COCO_LOCAL_DIR,
+        help="On-disk MS-COCO mirror (download once, reuse forever).",
+    )
     p.add_argument("--skyscript-root", type=Path, default=DEFAULT_SKYSCRIPT_ROOT)
     p.add_argument("--download-skyscript-csv", action="store_true")
     p.add_argument("--allow-rsicd-fallback", action="store_true",
@@ -730,6 +892,8 @@ def main(argv: list[str] | None = None) -> int:
         allow_rsicd_fallback=args.allow_rsicd_fallback or args.preview,
         image_size=args.image_size,
         staging_dir=staging_dir,
+        stage_workers=args.stage_workers,
+        coco_local_dir=args.coco_local_dir,
     )
     if not records:
         print("No records produced.", file=sys.stderr)
