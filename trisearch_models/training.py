@@ -48,40 +48,196 @@ DEFAULT_MATRYOSHKA_DIMS = (64, 128, 256, 512, 1024)
 def differentiable_late_interaction_score(
     query: torch.Tensor, doc: torch.Tensor
 ) -> torch.Tensor:
+    """Mean-MaxSim: mean over query tokens of max cosine to any doc token.
+
+    Using the mean (not sum) keeps logits O(1) for InfoNCE with temperature
+    ~0.07 even when captions are long, avoiding softmax saturation and
+    pathological gradient norms with a large memory bank.
+    """
     if query.numel() == 0 or doc.numel() == 0:
         return query.new_zeros(())
+    if query.ndim == 1:
+        query = query.unsqueeze(0)
+    if doc.ndim == 1:
+        doc = doc.unsqueeze(0)
     sim = query @ doc.T
-    return sim.max(dim=1).values.sum()
+    return sim.max(dim=1).values.mean()
 
 
 def build_late_interaction_matrix(
-    text_tokens: list[torch.Tensor],
-    image_tokens: list[torch.Tensor],
+    query_tokens: list[torch.Tensor],
+    doc_tokens: list[torch.Tensor],
 ) -> torch.Tensor:
-    if len(text_tokens) < 2:
+    """Pairwise mean-MaxSim matrix of shape ``(len(queries), len(docs))``."""
+    if not query_tokens or not doc_tokens:
         raise ValueError(
-            f"Contrastive loss needs batch_size >= 2 (got {len(text_tokens)}). "
-            "In-batch negatives require at least one negative pair."
+            f"Late-interaction matrix needs non-empty query and doc lists "
+            f"(got {len(query_tokens)} queries, {len(doc_tokens)} docs)."
         )
     rows = []
-    for text in text_tokens:
+    for query in query_tokens:
         rows.append(torch.stack([
-            differentiable_late_interaction_score(text, image)
-            for image in image_tokens
+            differentiable_late_interaction_score(query, doc)
+            for doc in doc_tokens
         ]))
     return torch.stack(rows)
+
+
+@torch.no_grad()
+def mean_positive_rank(
+    scores: torch.Tensor,
+    labels: torch.Tensor | None = None,
+) -> float:
+    """1-based mean rank of the positive class (1 = best). Lower is better."""
+    if scores.ndim != 2 or scores.size(0) == 0:
+        return float("nan")
+    batch = scores.size(0)
+    if labels is None:
+        labels = torch.arange(batch, device=scores.device)
+    pos = scores.gather(1, labels.view(-1, 1)).squeeze(1)
+    # Ties: count strictly better scores only (optimistic rank).
+    ranks = 1 + (scores > pos.unsqueeze(1)).sum(dim=1).to(dtype=torch.float32)
+    return float(ranks.mean().item())
+
+
+class EmbeddingMemoryBank:
+    """FIFO queue of detached multi-token embeddings used as contrastive negatives.
+
+    Stores *raw* (pre-normalization) projected token sequences so Matryoshka
+    prefixes can be re-derived. Entries never receive gradients — they act as
+    a MoCo-style memory bank, giving a large effective negative set without
+    holding a large micro-batch of activations.
+    """
+
+    def __init__(self, capacity: int = 0):
+        self.capacity = max(0, int(capacity))
+        self._image_raw: list[torch.Tensor] = []
+        self._text_raw: list[torch.Tensor] = []
+
+    def __len__(self) -> int:
+        return len(self._image_raw)
+
+    @property
+    def enabled(self) -> bool:
+        return self.capacity > 0
+
+    def clear(self) -> None:
+        self._image_raw.clear()
+        self._text_raw.clear()
+
+    def _enqueue(self, bucket: list[torch.Tensor], items: list[torch.Tensor]) -> None:
+        if not self.enabled or not items:
+            return
+        for item in items:
+            bucket.append(item.detach().contiguous())
+        overflow = len(bucket) - self.capacity
+        if overflow > 0:
+            del bucket[:overflow]
+
+    def enqueue(
+        self,
+        *,
+        image_raw: list[torch.Tensor] | None = None,
+        text_raw: list[torch.Tensor] | None = None,
+    ) -> None:
+        if image_raw is not None:
+            self._enqueue(self._image_raw, image_raw)
+        if text_raw is not None:
+            self._enqueue(self._text_raw, text_raw)
+
+    def image_raw(self) -> list[torch.Tensor]:
+        return list(self._image_raw)
+
+    def text_raw(self) -> list[torch.Tensor]:
+        return list(self._text_raw)
+
+    def normalized_images(self, dim: int | None = None) -> list[torch.Tensor]:
+        return [matryoshka_normalize(t, dim=dim) for t in self._image_raw]
+
+    def normalized_texts(self, dim: int | None = None) -> list[torch.Tensor]:
+        return [matryoshka_normalize(t, dim=dim) for t in self._text_raw]
+
+
+DEFAULT_MEMORY_BANK_SIZE = 128
 
 
 def contrastive_late_interaction_loss(
     text_tokens: list[torch.Tensor],
     image_tokens: list[torch.Tensor],
     temperature: float = 0.07,
-) -> torch.Tensor:
-    scores = build_late_interaction_matrix(text_tokens, image_tokens) / temperature
-    labels = torch.arange(scores.size(0), device=scores.device)
-    loss_t2i = F.cross_entropy(scores, labels)
-    loss_i2t = F.cross_entropy(scores.T, labels)
-    return 0.5 * (loss_t2i + loss_i2t)
+    *,
+    bank_text_tokens: list[torch.Tensor] | None = None,
+    bank_image_tokens: list[torch.Tensor] | None = None,
+    return_metrics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+    """Bidirectional late-interaction InfoNCE with optional memory-bank negatives.
+
+    When the bank is empty this matches the historical square-matrix form
+    (t2i on ``S``, i2t on ``S.T``). With a bank, each side scores the live batch
+    positives first, then bank docs as extra negatives (labels stay in ``0..B-1``).
+
+    Scores use mean-MaxSim (see ``differentiable_late_interaction_score``).
+    When ``return_metrics`` is True, also returns mean positive ranks (1 = best)
+    averaged over t2i and i2t — useful as a bank-size-invariant health signal.
+    """
+    batch = len(text_tokens)
+    if batch != len(image_tokens):
+        raise ValueError(
+            f"text/image batch size mismatch: {batch} vs {len(image_tokens)}"
+        )
+    bank_text = bank_text_tokens or []
+    bank_image = bank_image_tokens or []
+    if batch < 2 and not bank_text and not bank_image:
+        raise ValueError(
+            f"Contrastive loss needs batch_size >= 2 (got {batch}), "
+            "or a non-empty memory bank for negatives."
+        )
+    if batch < 1:
+        raise ValueError("Contrastive loss needs a non-empty batch.")
+
+    labels = torch.arange(batch, device=text_tokens[0].device)
+    n_image_docs = batch + len(bank_image)
+    n_text_docs = batch + len(bank_text)
+
+    if not bank_text and not bank_image:
+        scores = build_late_interaction_matrix(text_tokens, image_tokens) / temperature
+        loss_t2i = F.cross_entropy(scores, labels)
+        loss_i2t = F.cross_entropy(scores.T, labels)
+        loss = 0.5 * (loss_t2i + loss_i2t)
+        if not return_metrics:
+            return loss
+        rank_t2i = mean_positive_rank(scores.detach(), labels)
+        rank_i2t = mean_positive_rank(scores.T.detach(), labels)
+        return loss, {
+            "pos_rank_t2i": rank_t2i,
+            "pos_rank_i2t": rank_i2t,
+            "pos_rank": 0.5 * (rank_t2i + rank_i2t),
+            "n_image_docs": float(n_image_docs),
+            "n_text_docs": float(n_text_docs),
+        }
+
+    image_docs = list(image_tokens) + list(bank_image)
+    text_docs = list(text_tokens) + list(bank_text)
+    scores_t2i = (
+        build_late_interaction_matrix(text_tokens, image_docs) / temperature
+    )
+    scores_i2t = (
+        build_late_interaction_matrix(image_tokens, text_docs) / temperature
+    )
+    loss_t2i = F.cross_entropy(scores_t2i, labels)
+    loss_i2t = F.cross_entropy(scores_i2t, labels)
+    loss = 0.5 * (loss_t2i + loss_i2t)
+    if not return_metrics:
+        return loss
+    rank_t2i = mean_positive_rank(scores_t2i.detach(), labels)
+    rank_i2t = mean_positive_rank(scores_i2t.detach(), labels)
+    return loss, {
+        "pos_rank_t2i": rank_t2i,
+        "pos_rank_i2t": rank_i2t,
+        "pos_rank": 0.5 * (rank_t2i + rank_i2t),
+        "n_image_docs": float(n_image_docs),
+        "n_text_docs": float(n_text_docs),
+    }
 
 
 def text_text_contrastive_loss(
@@ -89,17 +245,20 @@ def text_text_contrastive_loss(
     caption_tokens: list[torch.Tensor],
     distractor_tokens: list[torch.Tensor],
     temperature: float = 0.07,
+    *,
+    bank_doc_tokens: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Reward query↔caption matches; penalize wrong captions and distractors."""
+    """Reward query↔caption matches; penalize wrong captions, distractors, bank."""
     if len(query_tokens) != len(caption_tokens):
         raise ValueError(
             "query_tokens and caption_tokens must have the same batch size."
         )
-    if len(query_tokens) < 2:
+    bank_docs = bank_doc_tokens or []
+    if len(query_tokens) < 2 and not distractor_tokens and not bank_docs:
         raise ValueError(
             "text-text contrastive loss needs batch_size >= 2 for negatives."
         )
-    all_docs = list(caption_tokens) + list(distractor_tokens)
+    all_docs = list(caption_tokens) + list(distractor_tokens) + list(bank_docs)
     scores = build_late_interaction_matrix(query_tokens, all_docs) / temperature
     labels = torch.arange(scores.size(0), device=scores.device)
     return F.cross_entropy(scores, labels)
@@ -112,10 +271,13 @@ def text_text_matryoshka_loss(
     dims: tuple[int, ...],
     temperature: float,
     dim_weights: list[float] | None = None,
+    *,
+    bank_doc_raw: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if dim_weights is None:
         dim_weights = [1.0] * len(dims)
     total_weight = sum(dim_weights)
+    bank_raw = bank_doc_raw or []
     loss = query_raw[0].new_zeros(())
     for dim, weight in zip(dims, dim_weights):
         query_prefix = [matryoshka_normalize(t, dim=dim) for t in query_raw]
@@ -123,11 +285,13 @@ def text_text_matryoshka_loss(
         distractor_prefix = [
             matryoshka_normalize(t, dim=dim) for t in distractor_raw
         ]
+        bank_prefix = [matryoshka_normalize(t, dim=dim) for t in bank_raw]
         loss = loss + weight * text_text_contrastive_loss(
             query_prefix,
             caption_prefix,
             distractor_prefix,
             temperature=temperature,
+            bank_doc_tokens=bank_prefix,
         )
     return loss / total_weight
 
@@ -138,16 +302,27 @@ def matryoshka_loss(
     dims: tuple[int, ...],
     temperature: float,
     dim_weights: list[float] | None = None,
+    *,
+    bank_text_raw: list[torch.Tensor] | None = None,
+    bank_image_raw: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if dim_weights is None:
         dim_weights = [1.0] * len(dims)
     total_weight = sum(dim_weights)
+    bank_text = bank_text_raw or []
+    bank_image = bank_image_raw or []
     loss = text_raw[0].new_zeros(())
     for dim, weight in zip(dims, dim_weights):
         text_prefix = [matryoshka_normalize(t, dim=dim) for t in text_raw]
         image_prefix = [matryoshka_normalize(t, dim=dim) for t in image_raw]
+        bank_text_prefix = [matryoshka_normalize(t, dim=dim) for t in bank_text]
+        bank_image_prefix = [matryoshka_normalize(t, dim=dim) for t in bank_image]
         loss = loss + weight * contrastive_late_interaction_loss(
-            text_prefix, image_prefix, temperature=temperature
+            text_prefix,
+            image_prefix,
+            temperature=temperature,
+            bank_text_tokens=bank_text_prefix,
+            bank_image_tokens=bank_image_prefix,
         )
     return loss / total_weight
 
@@ -171,6 +346,7 @@ class Stage1AlignmentModel(nn.Module):
         text_text_weight: float = 1.0,
         text_text_matryoshka_weight: float = 0.5,
         compute_dtype: torch.dtype = torch.float16,
+        memory_bank_size: int = DEFAULT_MEMORY_BANK_SIZE,
     ):
         super().__init__()
         self.vision_device = vision_device
@@ -192,6 +368,7 @@ class Stage1AlignmentModel(nn.Module):
         self.matryoshka_weight = matryoshka_weight
         self.text_text_weight = text_text_weight
         self.text_text_matryoshka_weight = text_text_matryoshka_weight
+        self.memory_bank = EmbeddingMemoryBank(memory_bank_size)
         self._init_projection_heads()
 
     def _init_projection_heads(self):
@@ -299,17 +476,41 @@ class Stage1AlignmentModel(nn.Module):
 
         loss_text_tokens = [self._to_loss(t) for t in text_tokens]
         loss_image_tokens = [self._to_loss(t) for t in image_tokens]
+        # Per-sample raw projected tokens (unnormalized) for Matryoshka + bank.
         loss_text_raw = [self._to_loss(t) for t in text_raw_masked]
-        loss_image_raw = [self._to_loss(t) for t in vision_raw]
+        loss_image_raw = [
+            self._to_loss(vision_raw[i]) for i in range(vision_raw.size(0))
+        ]
 
-        contrastive = contrastive_late_interaction_loss(
-            loss_text_tokens, loss_image_tokens, temperature=self.temperature
+        bank = self.memory_bank
+        bank_text_raw = (
+            [self._to_loss(t) for t in bank.text_raw()] if bank.enabled else []
+        )
+        bank_image_raw = (
+            [self._to_loss(t) for t in bank.image_raw()] if bank.enabled else []
+        )
+        bank_text_tokens = (
+            [matryoshka_normalize(t) for t in bank_text_raw] if bank_text_raw else []
+        )
+        bank_image_tokens = (
+            [matryoshka_normalize(t) for t in bank_image_raw] if bank_image_raw else []
+        )
+
+        contrastive, contrastive_metrics = contrastive_late_interaction_loss(
+            loss_text_tokens,
+            loss_image_tokens,
+            temperature=self.temperature,
+            bank_text_tokens=bank_text_tokens,
+            bank_image_tokens=bank_image_tokens,
+            return_metrics=True,
         )
         matryoshka = matryoshka_loss(
             loss_text_raw,
             loss_image_raw,
             dims=self.matryoshka_dims,
             temperature=self.temperature,
+            bank_text_raw=bank_text_raw,
+            bank_image_raw=bank_image_raw,
         )
         loss = (
             self.contrastive_weight * contrastive
@@ -347,6 +548,7 @@ class Stage1AlignmentModel(nn.Module):
                     loss_caption_tokens,
                     loss_distractor_tokens,
                     temperature=self.temperature,
+                    bank_doc_tokens=bank_text_tokens,
                 )
                 loss = loss + self.text_text_weight * text_text
             if self.text_text_matryoshka_weight > 0.0:
@@ -356,8 +558,13 @@ class Stage1AlignmentModel(nn.Module):
                     loss_distractor_raw,
                     dims=self.matryoshka_dims,
                     temperature=self.temperature,
+                    bank_doc_raw=bank_text_raw,
                 )
                 loss = loss + self.text_text_matryoshka_weight * text_text_matryoshka
+
+        # Enqueue *after* scoring so the current batch is never its own negative.
+        if bank.enabled:
+            bank.enqueue(image_raw=loss_image_raw, text_raw=loss_text_raw)
 
         return {
             "loss": loss,
@@ -365,6 +572,12 @@ class Stage1AlignmentModel(nn.Module):
             "matryoshka_loss": matryoshka.detach(),
             "text_text_loss": text_text.detach(),
             "text_text_matryoshka_loss": text_text_matryoshka.detach(),
+            "memory_bank_size": len(bank),
+            "pos_rank": contrastive_metrics["pos_rank"],
+            "pos_rank_t2i": contrastive_metrics["pos_rank_t2i"],
+            "pos_rank_i2t": contrastive_metrics["pos_rank_i2t"],
+            "n_image_docs": contrastive_metrics["n_image_docs"],
+            "n_text_docs": contrastive_metrics["n_text_docs"],
         }
 
 
@@ -998,11 +1211,14 @@ def sanity_check_loss(model: Stage1AlignmentModel, dataloader: DataLoader):
     matryoshka = float(outputs["matryoshka_loss"])
     text_text = float(outputs.get("text_text_loss", 0.0))
     text_text_matryoshka = float(outputs.get("text_text_matryoshka_loss", 0.0))
+    pos_rank = float(outputs.get("pos_rank", float("nan")))
+    n_docs = int(outputs.get("n_image_docs", batch["input_ids"].shape[0]))
     model.train()
     print(
         f"Sanity check (batch={batch['input_ids'].shape[0]}): "
         f"loss={loss:.4f} contrastive={contrastive:.4f} matryoshka={matryoshka:.4f} "
-        f"text_text={text_text:.4f} text_text_matryoshka={text_text_matryoshka:.4f}"
+        f"text_text={text_text:.4f} text_text_matryoshka={text_text_matryoshka:.4f} "
+        f"pos_rank={pos_rank:.2f}/{n_docs}"
     )
     if loss <= 0.0 or not math.isfinite(loss):
         raise RuntimeError(
@@ -1046,6 +1262,7 @@ def run_training(
     log_matryoshka = 0.0
     log_text_text = 0.0
     log_text_text_matryoshka = 0.0
+    log_pos_rank = 0.0
     log_batches = 0
 
     if max_steps is not None and start_step >= max_steps:
@@ -1071,6 +1288,7 @@ def run_training(
             log_text_text_matryoshka += float(
                 outputs.get("text_text_matryoshka_loss", 0.0)
             )
+            log_pos_rank += float(outputs.get("pos_rank", 0.0))
             log_batches += 1
             micro_step += 1
 
@@ -1109,10 +1327,16 @@ def run_training(
                     msg += (
                         f" | text_text_m {log_text_text_matryoshka / log_batches:.4f}"
                     )
+                bank_len = len(getattr(model, "memory_bank", ()))
+                if bank_len or getattr(args, "memory_bank_size", 0):
+                    msg += f" | bank {bank_len}"
+                n_docs = int(outputs.get("n_image_docs", args.batch_size))
+                msg += f" | pos_rank {log_pos_rank / log_batches:.1f}/{n_docs}"
                 msg += f" | grad_norm {float(grad_norm):.4f} | lr {text_lr:.2e}"
                 print(msg)
                 log_loss = log_contrastive = log_matryoshka = 0.0
                 log_text_text = log_text_text_matryoshka = 0.0
+                log_pos_rank = 0.0
                 log_batches = 0
 
             if global_step % args.save_steps == 0:

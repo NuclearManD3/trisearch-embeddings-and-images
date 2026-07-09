@@ -37,6 +37,7 @@ from transformers.utils import logging as transformers_logging
 #warnings.filterwarnings("ignore")
 
 from trisearch_dataset import (
+    DEFAULT_CURATED_DATASET_DIR,
     DEFAULT_GENERAL_CAPTION_COLUMN,
     DEFAULT_GENERAL_DATASET,
     DEFAULT_GENERAL_SPLIT,
@@ -54,6 +55,7 @@ from trisearch_dataset import (
 from trisearch_models import (
     DEFAULT_MATRYOSHKA_DIMS,
     DEFAULT_MAX_TEXT_LENGTH,
+    DEFAULT_MEMORY_BANK_SIZE,
     DEFAULT_SEED_TEXT_DIR,
     DEFAULT_SEED_VISION_DIR,
     DEFAULT_TRAINED_DIR,
@@ -91,6 +93,17 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--data-jsonl", default=None,
                         help="Local JSONL with image path + caption fields.")
+    parser.add_argument(
+        "--curated-dataset-dir",
+        default=str(DEFAULT_CURATED_DATASET_DIR),
+        help="TriSearch curated dataset from generate_datasets.py "
+             f"(default {DEFAULT_CURATED_DATASET_DIR}).",
+    )
+    parser.add_argument(
+        "--no-curated-dataset",
+        action="store_true",
+        help="Ignore curated export; use legacy HF satellite/general mix.",
+    )
     parser.add_argument("--image-root", default=None,
                         help="Base directory for relative image paths in JSONL.")
 
@@ -125,6 +138,15 @@ def parse_args() -> argparse.Namespace:
                         help="Weight for Matryoshka text-text contrastive loss.")
     parser.add_argument("--no-text-text-training", action="store_true",
                         help="Disable text-to-text semantic similarity training.")
+    parser.add_argument(
+        "--memory-bank-size",
+        type=int,
+        default=DEFAULT_MEMORY_BANK_SIZE,
+        help="FIFO queue of detached embeddings used as extra contrastive "
+             f"negatives (default {DEFAULT_MEMORY_BANK_SIZE}). "
+             "Gives a large effective negative set without a large micro-batch. "
+             "Set 0 to disable.",
+    )
     parser.add_argument("--openrouter-config", default=str(DEFAULT_OPENROUTER_CONFIG),
                         help="YAML file with openrouter.api_key and openrouter.model.")
     parser.add_argument("--query-cache", default=str(DEFAULT_QUERY_CACHE_PATH),
@@ -187,6 +209,8 @@ def main():
 
     mixed_rows, image_column, caption_column, image_root = load_stage1_training_rows(
         data_jsonl=args.data_jsonl,
+        curated_dataset_dir=args.curated_dataset_dir,
+        prefer_curated=not args.no_curated_dataset,
         image_root=args.image_root,
         satellite_dataset=args.satellite_dataset,
         satellite_split=args.satellite_split,
@@ -275,6 +299,7 @@ def main():
             args.text_text_matryoshka_weight if with_text_queries else 0.0
         ),
         compute_dtype=compute_dtype,
+        memory_bank_size=args.memory_bank_size,
     )
     alignment_model.vision_projection.to(device=vision_device, dtype=compute_dtype)
     alignment_model.text_projection.to(device=text_device, dtype=compute_dtype)
@@ -311,7 +336,12 @@ def main():
 
     print("\n--- Stage 1 training ---")
     print(f"  samples        : {len(train_dataset):,}")
+    print(f"  micro-batch    : {args.batch_size}")
     print(f"  effective batch: {args.batch_size * args.gradient_accumulation_steps}")
+    print(
+        f"  memory bank    : {args.memory_bank_size} "
+        f"(contrastive negatives ≈ micro-batch-1 + bank)"
+    )
     print(f"  max tokens     : {args.max_text_length}")
     print(f"  matryoshka dims: {matryoshka_dims}")
     print(f"  text-text train: {with_text_queries}")

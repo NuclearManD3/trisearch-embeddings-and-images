@@ -23,10 +23,12 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 # Stage 1 defaults (training_plan.md §2–3)
-DEFAULT_SATELLITE_DATASET = "JessicaYuan/ChatEarthNet"
+# Prefer the curated TriSearch export from generate_datasets.py when present.
+DEFAULT_CURATED_DATASET_DIR = Path("models/data/trisearch-v1")
+DEFAULT_SATELLITE_DATASET = "SkyScript"
 DEFAULT_SATELLITE_SPLIT = "train"
 # Parquet/streaming-native general captions (HuggingFaceM4/COCO uses a deprecated script).
-DEFAULT_GENERAL_DATASET = "jxie/flickr8k"
+DEFAULT_GENERAL_DATASET = "bitmind/MS-COCO"
 DEFAULT_GENERAL_SPLIT = "train"
 DEFAULT_GENERAL_CAPTION_COLUMN = "caption_0"
 
@@ -333,9 +335,77 @@ def build_mixed_dataset(
     return mixed
 
 
+def curated_dataset_available(path: str | Path | None = None) -> bool:
+    root = Path(path or DEFAULT_CURATED_DATASET_DIR)
+    return (root / "hf").is_dir() or any((root / "data").glob("*.parquet")) if root.is_dir() else False
+
+
+def load_curated_training_rows(
+    dataset_dir: str | Path | None = None,
+    *,
+    max_samples: int | None = None,
+    seed: int = 42,
+    satellite_fraction: float | None = None,
+) -> list[dict[str, Any]]:
+    """Load generate_datasets.py output into Stage-1 training row dicts.
+
+    Each row has:
+      - image (PIL), caption, captions (list), domain, source
+      - related_query (search query), unrelated_query
+    Extra captions beyond the primary are available as related text pairs.
+    """
+    from trisearch_data_format import load_dataset_records
+
+    root = Path(dataset_dir or DEFAULT_CURATED_DATASET_DIR)
+    records = load_dataset_records(root, max_samples=None)
+    rng = random.Random(seed)
+
+    if satellite_fraction is not None and 0.0 < satellite_fraction < 1.0:
+        sat = [r for r in records if r["domain"] == "satellite"]
+        gen = [r for r in records if r["domain"] == "general"]
+        if sat and gen:
+            if max_samples is not None:
+                n_sat = int(round(max_samples * satellite_fraction))
+                n_gen = max_samples - n_sat
+            else:
+                n_sat, n_gen = len(sat), len(gen)
+            rng.shuffle(sat)
+            rng.shuffle(gen)
+            records = sat[:n_sat] + gen[:n_gen]
+            rng.shuffle(records)
+        elif max_samples is not None and len(records) > max_samples:
+            records = rng.sample(records, max_samples)
+    elif max_samples is not None and len(records) > max_samples:
+        records = rng.sample(records, max_samples)
+
+    rows: list[dict[str, Any]] = []
+    for rec in records:
+        captions = list(rec["captions"])
+        primary = captions[0]
+        # Prefer curated search query; fall back to a secondary caption.
+        related = str(rec.get("query") or "").strip()
+        if not related and len(captions) > 1:
+            related = captions[1]
+        unrelated = str(rec.get("unrelated_query") or "").strip()
+        rows.append({
+            "image": rec["image"],
+            "caption": primary,
+            "captions": captions,
+            "domain": rec["domain"],
+            "source": rec["source"],
+            "id": rec["id"],
+            QUERY_CACHE_RELATED_KEY: related,
+            QUERY_CACHE_UNRELATED_KEY: unrelated,
+        })
+    print(f"Loaded curated TriSearch dataset from {root}: {len(rows):,} rows")
+    return rows
+
+
 def load_stage1_training_rows(
     *,
     data_jsonl: str | None = None,
+    curated_dataset_dir: str | None = None,
+    prefer_curated: bool = True,
     image_root: str | None = None,
     satellite_dataset: str = DEFAULT_SATELLITE_DATASET,
     satellite_split: str = DEFAULT_SATELLITE_SPLIT,
@@ -352,14 +422,43 @@ def load_stage1_training_rows(
     seed: int = 42,
     download_satellite_images: bool = False,
 ) -> tuple[list[dict[str, Any]], str, str, str | None]:
-    """Return (rows, image_column, caption_column, image_root) for stage-1 training."""
+    """Return (rows, image_column, caption_column, image_root) for stage-1 training.
+
+    Preference order:
+      1. ``--data-jsonl`` local JSONL
+      2. Curated TriSearch dataset from ``generate_datasets.py`` (default path)
+      3. Legacy HF satellite + general mix
+    """
     if data_jsonl:
         rows = load_jsonl_rows(data_jsonl, max_samples=None)
         effective_root = image_root or satellite_image_root
         validate_image_rows(rows, effective_root, label="JSONL")
         return rows, "image", "caption", effective_root
 
+    curated_path = Path(curated_dataset_dir or DEFAULT_CURATED_DATASET_DIR)
+    if prefer_curated and curated_dataset_available(curated_path):
+        max_total = None
+        if max_satellite_samples is not None or max_general_samples is not None:
+            max_total = (max_satellite_samples or 0) + (max_general_samples or 0)
+            if max_total <= 0:
+                max_total = None
+        rows = load_curated_training_rows(
+            curated_path,
+            max_samples=max_total,
+            seed=seed,
+            satellite_fraction=satellite_fraction,
+        )
+        # Images are already PIL; image_root unused.
+        return rows, "image", "caption", None
+
+    if prefer_curated:
+        print(
+            f"Curated dataset not found at {curated_path}; "
+            f"falling back to HF mix. Run: python3 generate_datasets.py"
+        )
+
     explicit_sat_root = satellite_image_root or image_root
+    # Legacy ChatEarthNet path only when that dataset is explicitly requested.
     satellite_rows = normalize_rows(
         load_hf_rows(
             DataSourceConfig(
@@ -375,7 +474,10 @@ def load_stage1_training_rows(
         image_column=satellite_image_column,
         caption_column=satellite_caption_column,
     )
-    if satellite_dataset == DEFAULT_SATELLITE_DATASET and satellite_rows:
+    if (
+        satellite_dataset == "JessicaYuan/ChatEarthNet"
+        and satellite_rows
+    ):
         explicit_sat_root = resolve_chatearthnet_image_root(
             satellite_rows,
             explicit_root=explicit_sat_root,
@@ -386,6 +488,8 @@ def load_stage1_training_rows(
             explicit_sat_root,
             label="satellite",
         )
+    else:
+        validate_image_rows(satellite_rows, explicit_sat_root, label="satellite")
 
     general_rows = normalize_rows(
         load_hf_rows(
@@ -464,6 +568,104 @@ def load_dataset_samples(
             f"No images could be loaded from {dataset!r}. "
             "For ChatEarthNet, pass --image-root to the directory of PNG files."
         )
+    return samples
+
+
+def load_stage1_demo_samples(
+    count: int,
+    seed: int = 42,
+    *,
+    satellite_dataset: str = DEFAULT_SATELLITE_DATASET,
+    satellite_split: str = DEFAULT_SATELLITE_SPLIT,
+    satellite_image_column: str = "image",
+    satellite_caption_column: str = "caption",
+    satellite_image_root: str | None = None,
+    general_dataset: str = DEFAULT_GENERAL_DATASET,
+    general_split: str = DEFAULT_GENERAL_SPLIT,
+    general_image_column: str = "image",
+    general_caption_column: str = DEFAULT_GENERAL_CAPTION_COLUMN,
+    satellite_fraction: float = 0.5,
+    download_satellite_images: bool = False,
+    curated_dataset_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Sample ``count`` images using the same sat/general mix as Stage-1 training.
+
+    Returns a list of ``{"image": PIL.Image, "caption": str, "source": str}``
+    ready for the retrieval demo index. Prefers the curated TriSearch export
+    when present.
+    """
+    curated = Path(curated_dataset_dir or DEFAULT_CURATED_DATASET_DIR)
+    if curated_dataset_available(curated):
+        rows = load_curated_training_rows(
+            curated,
+            max_samples=count,
+            seed=seed,
+            satellite_fraction=satellite_fraction,
+        )
+        return [
+            {
+                "image": r["image"],
+                "caption": r["caption"],
+                "source": r.get("source", "trisearch-curated"),
+            }
+            for r in rows[:count]
+        ]
+
+    # Over-sample each source so the mix can hit ``count`` after path failures.
+    per_source = max(1, (count + 1) // 2)
+    oversample = max(per_source + 8, int(per_source * 1.25))
+    rows, image_column, caption_column, image_root = load_stage1_training_rows(
+        prefer_curated=False,
+        satellite_dataset=satellite_dataset,
+        satellite_split=satellite_split,
+        satellite_image_column=satellite_image_column,
+        satellite_caption_column=satellite_caption_column,
+        satellite_image_root=satellite_image_root,
+        general_dataset=general_dataset,
+        general_split=general_split,
+        general_image_column=general_image_column,
+        general_caption_column=general_caption_column,
+        satellite_fraction=satellite_fraction,
+        max_satellite_samples=oversample,
+        max_general_samples=oversample,
+        seed=seed,
+        download_satellite_images=download_satellite_images,
+    )
+    rng = random.Random(seed)
+    if len(rows) > count:
+        rows = rng.sample(rows, count)
+
+    samples: list[dict[str, Any]] = []
+    skipped = 0
+    for row in rows:
+        try:
+            image = load_pil_image(row[image_column], image_root=image_root)
+            caption = pick_caption(row, caption_column)
+            if not caption:
+                raise ValueError("empty caption")
+            samples.append({
+                "image": image,
+                "caption": caption,
+                "source": "stage1_mix",
+            })
+        except (FileNotFoundError, KeyError, TypeError, ValueError, OSError) as exc:
+            skipped += 1
+            if skipped <= 3:
+                print(f"  skipped demo row: {exc}")
+        if len(samples) >= count:
+            break
+    if skipped:
+        print(f"  skipped {skipped:,} demo rows without loadable image/caption")
+    if not samples:
+        raise RuntimeError(
+            "No images could be loaded for the Stage-1 demo mix. "
+            "Pass --satellite-image-root / --download-satellite-images for ChatEarthNet, "
+            "or --dataset to index a single HuggingFace corpus instead."
+        )
+    print(
+        f"Stage-1 demo mix ready: {len(samples):,} images "
+        f"(target {count:,}, satellite_fraction={satellite_fraction:.0%})"
+    )
     return samples
 
 
@@ -632,6 +834,84 @@ def _openrouter_chat_completion(
     return str(choices[0].get("message", {}).get("content", "")).strip()
 
 
+QUERY_OBJECT_PROMPT = (
+    '{"thinking": "...", "synonyms": "...", "related_query": "...", "unrelated_query": "..."}\n'
+    "Try to come up with queries a human would use in a google search for similar images.\n"
+    "thinking: thoughts on what the caption is fundamentally describing.\n"
+    "synonyms: words not in the caption which describe the same thing.\n"
+    "related_query: what search someone would type to find an image matching the caption.  DO NOT USE THE SAME WORDS AS THE ORIGINAL CAPTION.  Use terms that are things someone could be interested in searching for.\n"
+    "unrelated_query: a completely different topic; must not relate to the caption.  Must be a search looking for images, cannot be non-image topic.\n"
+)
+
+CAPTION_DIVERSIFY_PROMPT = (
+    '{"captions": ["...", "...", "..."]}\n'
+    "Write 2 or 3 DISTINCT English captions for the SAME image, based on the source text.\n"
+    "Rules:\n"
+    "- Captions must be meaningfully different (not synonym swaps of one sentence).\n"
+    "- Vary focus: (1) overall scene, (2) notable objects/vehicles/structures, "
+    "(3) layout/geometry/environment if relevant.\n"
+    "- Do NOT reuse the same skeleton with only preposition/casing changes "
+    "(e.g. 'planes parked in an airport' vs 'planes parked at an airport' is invalid).\n"
+    "- Prefer concrete visual wording; keep each under 20 words.\n"
+    "- For satellite/aerial scenes, use overhead/remote-sensing language when natural.\n"
+)
+
+
+def _parse_caption_list(content: str, *, min_count: int = 2) -> list[str]:
+    from trisearch_data_format import normalize_captions
+
+    payload = _extract_json_value(content)
+    if isinstance(payload, dict):
+        caps = payload.get("captions", payload.get("caption"))
+    else:
+        caps = payload
+    if isinstance(caps, str):
+        caps = [caps]
+    if not isinstance(caps, list):
+        raise ValueError(f"Expected captions list, got {type(caps)!r}")
+    return normalize_captions(caps, min_count=min_count)
+
+
+def openrouter_diversify_captions(
+    source_captions: list[str],
+    *,
+    api_key: str,
+    model: str,
+    domain: str = "general",
+    timeout: float = 120.0,
+    max_attempts: int = OPENROUTER_MAX_ATTEMPTS,
+    min_count: int = 2,
+) -> list[str]:
+    """Rewrite near-duplicate source captions into 2–3 genuinely varied ones."""
+    joined = " | ".join(str(c).strip() for c in source_captions if str(c).strip())
+    prompt = (
+        "You help build a multimodal training dataset.\n"
+        "Return ONLY one JSON object and nothing else:\n"
+        f"{CAPTION_DIVERSIFY_PROMPT}"
+        f"Domain: {domain}\n"
+        f"Source text: {joined}\n"
+    )
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            content = _openrouter_chat_completion(
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                max_tokens=220,
+                timeout=timeout,
+            )
+            return _parse_caption_list(content, min_count=min_count)
+        except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+            if attempt + 1 < max_attempts:
+                time.sleep(0.75 * (attempt + 1))
+    raise RuntimeError(
+        f"Failed to diversify captions for {joined[:100]!r} "
+        f"after {max_attempts} attempts"
+    ) from last_error
+
+
 def openrouter_generate_queries(
     caption: str,
     *,
@@ -644,10 +924,7 @@ def openrouter_generate_queries(
     prompt = (
         "You help train a text embedding model.\n"
         "Return ONLY one JSON object and nothing else:\n"
-        '{"related_query": "...", "unrelated_query": "..."}\n'
-        "Use 2-8 English words per query.\n"
-        "related_query: what someone would type to find an image matching the caption.\n"
-        "unrelated_query: a completely different topic; must not relate to the caption.\n"
+        f"{QUERY_OBJECT_PROMPT}"
         f"Caption: {caption}"
     )
     last_error: Exception | None = None
@@ -657,7 +934,7 @@ def openrouter_generate_queries(
                 api_key=api_key,
                 model=model,
                 prompt=prompt,
-                max_tokens=128,
+                max_tokens=1024,
                 timeout=timeout,
             )
             return _parse_query_json(content)
@@ -692,10 +969,7 @@ def openrouter_generate_queries_batch(
         "You help train a text embedding model.\n"
         f"Return ONLY a JSON array of exactly {len(captions)} objects and nothing else.\n"
         "Each object must be:\n"
-        '{"related_query": "...", "unrelated_query": "..."}\n'
-        "Use 2-8 English words per query. Keep the same order as the captions.\n"
-        "related_query: what someone would type to find an image matching the caption.\n"
-        "unrelated_query: a completely different image description; must not relate to that caption.\n"
+        f"{QUERY_OBJECT_PROMPT}"
         f"Captions:\n{numbered}"
     )
     last_error: Exception | None = None
@@ -705,7 +979,7 @@ def openrouter_generate_queries_batch(
                 api_key=api_key,
                 model=model,
                 prompt=prompt,
-                max_tokens=max(256, 64 * len(captions)),
+                max_tokens=32768,
                 timeout=timeout,
             )
             return _parse_query_batch_json(content, len(captions))
@@ -806,12 +1080,32 @@ def enrich_rows_with_text_queries(
     query_batch_size: int = OPENROUTER_QUERY_BATCH_SIZE,
     query_parallelism: int = OPENROUTER_QUERY_PARALLELISM,
 ) -> list[dict[str, Any]]:
-    """Attach related/unrelated search queries to each row (cached on disk)."""
+    """Attach related/unrelated search queries to each row (cached on disk).
+
+    Rows that already include both query fields (e.g. curated TriSearch export)
+    are left unchanged and do not require OpenRouter.
+    """
+    already: list[dict[str, Any]] = []
+    need: list[dict[str, Any]] = []
+    for row in rows:
+        related = str(row.get(QUERY_CACHE_RELATED_KEY, "")).strip()
+        unrelated = str(row.get(QUERY_CACHE_UNRELATED_KEY, "")).strip()
+        if related and unrelated:
+            already.append(row)
+        else:
+            need.append(row)
+    if not need:
+        print(
+            f"All {len(already):,} rows already have text queries "
+            f"(curated dataset); skipping OpenRouter."
+        )
+        return list(rows)
+
     cache = load_query_cache(cache_path)
 
     unique_captions: list[str] = []
     seen: set[str] = set()
-    for row in rows:
+    for row in need:
         caption = pick_caption(row, caption_column)
         if caption and caption not in seen:
             seen.add(caption)
@@ -821,11 +1115,28 @@ def enrich_rows_with_text_queries(
     if max_new_queries is not None:
         missing = missing[: max_new_queries]
 
+    def _row_can_offline_query(row: dict[str, Any]) -> bool:
+        caption = pick_caption(row, caption_column)
+        extras = row.get("captions")
+        if not isinstance(extras, (list, tuple)):
+            return False
+        return any(str(t).strip() and str(t).strip() != caption for t in extras)
+
     if missing and skip_generation:
-        raise RuntimeError(
-            f"{len(missing)} captions lack cached queries at {cache_path}. "
-            "Run without --skip-query-generation or pre-fill the cache."
-        )
+        unresolved = [
+            c for c in missing
+            if not any(
+                pick_caption(r, caption_column) == c and _row_can_offline_query(r)
+                for r in need
+            )
+        ]
+        if unresolved:
+            raise RuntimeError(
+                f"{len(unresolved)} captions lack cached queries at {cache_path} "
+                f"and have no alternate multi-captions. "
+                "Run without --skip-query-generation or pre-fill the cache."
+            )
+        missing = []
 
     if missing:
         if query_batch_size < 1:
@@ -894,10 +1205,29 @@ def enrich_rows_with_text_queries(
             f"{elapsed:.1f}s)"
         )
 
-    enriched: list[dict[str, Any]] = []
-    for row in rows:
+    enriched: list[dict[str, Any]] = list(already)
+    for row in need:
         caption = pick_caption(row, caption_column)
         if caption not in cache:
+            # Multi-caption rows can use another caption as related offline.
+            extras = row.get("captions")
+            alt = ""
+            if isinstance(extras, (list, tuple)):
+                for text in extras:
+                    text = str(text).strip()
+                    if text and text != caption:
+                        alt = text
+                        break
+            if alt and skip_generation:
+                enriched.append({
+                    **row,
+                    QUERY_CACHE_RELATED_KEY: alt,
+                    QUERY_CACHE_UNRELATED_KEY: row.get(
+                        QUERY_CACHE_UNRELATED_KEY,
+                        "red sports car on a racetrack at night",
+                    ),
+                })
+                continue
             raise KeyError(
                 f"No cached queries for caption {caption!r}. "
                 f"Cache at {cache_path} may be incomplete."
@@ -910,7 +1240,7 @@ def enrich_rows_with_text_queries(
         })
     print(
         f"Attached text queries to {len(enriched):,} rows "
-        f"({len(unique_captions):,} unique captions)."
+        f"({len(already):,} pre-filled, {len(unique_captions):,} unique captions)."
     )
     return enriched
 
@@ -957,6 +1287,7 @@ class ImageCaptionDataset(Dataset):
         with_text_queries: bool = False,
         related_query_column: str = QUERY_CACHE_RELATED_KEY,
         unrelated_query_column: str = QUERY_CACHE_UNRELATED_KEY,
+        use_extra_captions_as_related: bool = True,
     ):
         self.rows = rows
         self.image_processor = image_processor
@@ -968,9 +1299,24 @@ class ImageCaptionDataset(Dataset):
         self.with_text_queries = with_text_queries
         self.related_query_column = related_query_column
         self.unrelated_query_column = unrelated_query_column
+        self.use_extra_captions_as_related = use_extra_captions_as_related
 
     def __len__(self) -> int:
         return len(self.rows)
+
+    def _resolve_related_query(self, row: dict[str, Any], caption: str) -> str:
+        """Search query, else another caption for multi-caption COCO/SkyScript rows."""
+        related = str(row.get(self.related_query_column, "")).strip()
+        if related:
+            return related
+        if self.use_extra_captions_as_related:
+            extras = row.get("captions")
+            if isinstance(extras, (list, tuple)):
+                for text in extras:
+                    text = str(text).strip()
+                    if text and text != caption:
+                        return text
+        return ""
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
@@ -987,8 +1333,8 @@ class ImageCaptionDataset(Dataset):
             "attention_mask": text["attention_mask"][0],
         }
         if self.with_text_queries:
-            related = str(row[self.related_query_column]).strip()
-            unrelated = str(row[self.unrelated_query_column]).strip()
+            related = self._resolve_related_query(row, caption)
+            unrelated = str(row.get(self.unrelated_query_column, "")).strip()
             if not related or not unrelated:
                 raise ValueError(
                     f"Row {idx} is missing text queries "

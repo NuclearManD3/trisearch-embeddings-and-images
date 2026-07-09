@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Index a random subset of images from a HuggingFace dataset, embed them with the
-SigLIP vision tower, then search by text using ColBERT-style late interaction.
+Index a mixed subset of images (same Stage-1 satellite/general mix as training),
+embed them with the SigLIP vision tower, then search by text using ColBERT-style
+late interaction.
 
-Default dataset: ``jxie/flickr8k`` (PIL images + natural-language captions).
-For ``JessicaYuan/ChatEarthNet``, pass ``--image-root`` pointing at the PNG
-files that accompany the captions.
+Default data: 50/50 ``JessicaYuan/ChatEarthNet`` + ``jxie/flickr8k`` (via
+``load_stage1_demo_samples``). Override with ``--dataset`` to index a single
+HuggingFace corpus instead.
 
 Run:
   python3 demo_image_search.py
-  python3 demo_image_search.py --phase 1 --count 1000
-  python3 demo_image_search.py --dataset JessicaYuan/ChatEarthNet --image-root /path/to/images
+  python3 demo_image_search.py --phase 1 --count 1000 --rebuild-index
+  python3 demo_image_search.py --dataset jxie/flickr8k --count 200
+  python3 demo_image_search.py --download-satellite-images
 
 The Gradio UI opens after indexing (or after loading a cached index).
 """
@@ -32,9 +34,13 @@ from PIL import Image
 from tqdm import tqdm
 
 from trisearch_dataset import (
-    DEFAULT_FLICKR8K_DATASET,
-    DEFAULT_FLICKR8K_SPLIT,
+    DEFAULT_GENERAL_CAPTION_COLUMN,
+    DEFAULT_GENERAL_DATASET,
+    DEFAULT_GENERAL_SPLIT,
+    DEFAULT_SATELLITE_DATASET,
+    DEFAULT_SATELLITE_SPLIT,
     load_dataset_samples,
+    load_stage1_demo_samples,
 )
 from trisearch_models import (
     MAX_TRAINING_PHASE,
@@ -45,11 +51,10 @@ from trisearch_models import (
     late_interaction_score,
 )
 
-DEFAULT_DATASET = DEFAULT_FLICKR8K_DATASET
-DEFAULT_SPLIT = DEFAULT_FLICKR8K_SPLIT
 DEFAULT_COUNT = 1000
 DEFAULT_CACHE_DIR = "models/demo_index"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+STAGE1_MIX_LABEL = "stage1_mix"
 
 
 @dataclass
@@ -84,9 +89,6 @@ def _jpeg_bytes_to_image(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data)).convert("RGB")
 
 
-
-
-
 def cache_path_for(
     cache_dir: Path,
     *,
@@ -95,9 +97,13 @@ def cache_path_for(
     count: int,
     seed: int,
     phase: int,
+    satellite_fraction: float,
 ) -> Path:
     safe = dataset.replace("/", "__")
-    return cache_dir / f"{safe}_{split}_n{count}_seed{seed}_phase{phase}.pt"
+    frac = f"{satellite_fraction:.2f}".replace(".", "p")
+    return cache_dir / (
+        f"{safe}_{split}_n{count}_seed{seed}_phase{phase}_sat{frac}.pt"
+    )
 
 
 class ImageSearchIndex:
@@ -177,7 +183,11 @@ class ImageSearchIndex:
         except TypeError:
             payload = torch.load(path, map_location="cpu")
         if payload.get("version") != CACHE_VERSION:
-            raise ValueError(f"Unsupported cache version in {path}")
+            raise ValueError(
+                f"Unsupported cache version in {path} "
+                f"(got {payload.get('version')}, need {CACHE_VERSION}). "
+                "Re-run with --rebuild-index."
+            )
         entries = []
         for item in payload["entries"]:
             entries.append(
@@ -204,14 +214,48 @@ class ImageSearchIndex:
         return scored[:top_k]
 
 
+def _load_demo_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Load either the Stage-1 sat/general mix (default) or a single HF dataset."""
+    if args.dataset:
+        return load_dataset_samples(
+            dataset=args.dataset,
+            split=args.split,
+            count=args.count,
+            seed=args.seed,
+            image_column=args.image_column,
+            caption_column=args.caption_column,
+            image_root=args.image_root or args.satellite_image_root,
+        )
+    return load_stage1_demo_samples(
+        count=args.count,
+        seed=args.seed,
+        satellite_dataset=args.satellite_dataset,
+        satellite_split=args.satellite_split,
+        satellite_image_column=args.satellite_image_column,
+        satellite_caption_column=args.satellite_caption_column,
+        satellite_image_root=args.satellite_image_root or args.image_root,
+        general_dataset=args.general_dataset,
+        general_split=args.general_split,
+        general_image_column=args.general_image_column,
+        general_caption_column=args.general_caption_column,
+        satellite_fraction=args.satellite_fraction,
+        download_satellite_images=args.download_satellite_images,
+    )
+
+
 def build_or_load_index(args: argparse.Namespace) -> ImageSearchIndex:
+    dataset_label = args.dataset or STAGE1_MIX_LABEL
+    split_label = args.split if args.dataset else "mixed"
     cache_file = cache_path_for(
         Path(args.cache_dir),
-        dataset=args.dataset,
-        split=args.split,
+        dataset=dataset_label,
+        split=split_label,
         count=args.count,
         seed=args.seed,
         phase=args.phase,
+        satellite_fraction=(
+            args.satellite_fraction if not args.dataset else 0.0
+        ),
     )
     if cache_file.is_file() and not args.rebuild_index:
         print(f"Loading cached index from {cache_file} ...")
@@ -226,15 +270,7 @@ def build_or_load_index(args: argparse.Namespace) -> ImageSearchIndex:
     print(f"Vision embedder on {vision_device}: {describe_phase(args.phase, 'siglip')}")
     vision = SiglipEmbedder(phase=args.phase, device=vision_device)
 
-    samples = load_dataset_samples(
-        dataset=args.dataset,
-        split=args.split,
-        count=args.count,
-        seed=args.seed,
-        image_column=args.image_column,
-        caption_column=args.caption_column,
-        image_root=args.image_root,
-    )
+    samples = _load_demo_samples(args)
     index = ImageSearchIndex()
     index.build(
         samples,
@@ -244,12 +280,19 @@ def build_or_load_index(args: argparse.Namespace) -> ImageSearchIndex:
     )
     if not args.no_cache:
         meta = {
-            "dataset": args.dataset,
-            "split": args.split,
+            "dataset": dataset_label,
+            "split": split_label,
             "count": args.count,
             "seed": args.seed,
             "phase": args.phase,
             "num_indexed": len(index),
+            "satellite_fraction": (
+                None if args.dataset else args.satellite_fraction
+            ),
+            "satellite_dataset": (
+                None if args.dataset else args.satellite_dataset
+            ),
+            "general_dataset": None if args.dataset else args.general_dataset,
         }
         index.save(cache_file, meta)
     return index
@@ -314,7 +357,12 @@ def create_search_fn(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder):
     return search
 
 
-def build_ui(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder, phase: int):
+def build_ui(
+    index: ImageSearchIndex,
+    text_embedder: Qwen3MoeEmbedder,
+    phase: int,
+    data_desc: str,
+):
     search_fn = create_search_fn(index, text_embedder)
 
     with gr.Blocks(title="TriSearch image search") as demo:
@@ -322,13 +370,14 @@ def build_ui(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder, phase: in
             f"## TriSearch image search\n"
             f"Search **{len(index):,}** indexed images with natural-language "
             f"queries using ColBERT-style late interaction.\n\n"
+            f"Index data: **{data_desc}**\n\n"
             f"Training phase **{phase}** "
             f"(vision + text towers from `{describe_phase(phase, 'siglip')}`)"
         )
         with gr.Row():
             query = gr.Textbox(
                 label="Search query",
-                placeholder="e.g. a dog running in the snow",
+                placeholder="e.g. agricultural fields next to a river",
                 scale=3,
             )
             top_k = gr.Slider(
@@ -348,9 +397,10 @@ def build_ui(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder, phase: in
         gr.Examples(
             examples=[
                 ["a dog running in the snow", 12],
+                ["agricultural fields and farmland", 12],
                 ["people on a beach at sunset", 12],
+                ["dense forest canopy from above", 8],
                 ["a city street with cars", 8],
-                ["trees and grass in a park", 8],
             ],
             inputs=[query, top_k],
         )
@@ -360,18 +410,41 @@ def build_ui(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder, phase: in
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", default=DEFAULT_DATASET,
-                        help=f"HuggingFace dataset name (default: {DEFAULT_DATASET}).")
-    parser.add_argument("--split", default=DEFAULT_SPLIT)
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="If set, index only this HuggingFace dataset (disables Stage-1 mix). "
+             f"Examples: {DEFAULT_GENERAL_DATASET}, {DEFAULT_SATELLITE_DATASET}.",
+    )
+    parser.add_argument("--split", default=DEFAULT_GENERAL_SPLIT,
+                        help="Split for --dataset mode (ignored for Stage-1 mix).")
     parser.add_argument("--count", type=int, default=DEFAULT_COUNT,
                         help="Number of random images to index.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--image-column", default="image")
+    parser.add_argument("--image-column", default="image",
+                        help="Image column when using --dataset.")
     parser.add_argument("--caption-column", default=None,
-                        help="Caption field name (auto-detected when omitted).")
+                        help="Caption field when using --dataset "
+                             "(auto-detected when omitted).")
     parser.add_argument("--image-root", default=None,
                         help="Directory of image files for path-only datasets "
-                             "(e.g. ChatEarthNet).")
+                             "(alias for --satellite-image-root).")
+
+    # Stage-1 mix options (default mode when --dataset is omitted).
+    parser.add_argument("--satellite-dataset", default=DEFAULT_SATELLITE_DATASET)
+    parser.add_argument("--satellite-split", default=DEFAULT_SATELLITE_SPLIT)
+    parser.add_argument("--satellite-image-column", default="image")
+    parser.add_argument("--satellite-caption-column", default="caption")
+    parser.add_argument("--satellite-image-root", default=None,
+                        help="Directory of ChatEarthNet PNGs.")
+    parser.add_argument("--download-satellite-images", action="store_true",
+                        help="Download/extract ChatEarthNet RGB PNGs if missing.")
+    parser.add_argument("--general-dataset", default=DEFAULT_GENERAL_DATASET)
+    parser.add_argument("--general-split", default=DEFAULT_GENERAL_SPLIT)
+    parser.add_argument("--general-image-column", default="image")
+    parser.add_argument("--general-caption-column", default=DEFAULT_GENERAL_CAPTION_COLUMN)
+    parser.add_argument("--satellite-fraction", type=float, default=0.5,
+                        help="Target satellite share in the Stage-1 mix (default 0.5).")
 
     parser.add_argument("--phase", type=int, default=1,
                         choices=range(MIN_TRAINING_PHASE, MAX_TRAINING_PHASE + 1),
@@ -418,10 +491,19 @@ def main():
     args.text_device = text_device
     index = build_or_load_index(args)
 
+    if args.dataset:
+        data_desc = f"`{args.dataset}` ({args.split})"
+    else:
+        data_desc = (
+            f"Stage-1 mix ({args.satellite_fraction:.0%} "
+            f"`{args.satellite_dataset}` + "
+            f"{1.0 - args.satellite_fraction:.0%} `{args.general_dataset}`)"
+        )
+
     print(f"Text embedder on {text_device}: {describe_phase(args.phase, 'qwen')}")
     text_embedder = Qwen3MoeEmbedder(phase=args.phase, device=text_device)
 
-    demo = build_ui(index, text_embedder, phase=args.phase)
+    demo = build_ui(index, text_embedder, phase=args.phase, data_desc=data_desc)
     print(f"\nOpening search UI at http://{args.host}:{args.port}")
     demo.launch(
         server_name=args.host,

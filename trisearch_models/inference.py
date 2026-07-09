@@ -82,8 +82,13 @@ def late_interaction_score(query_embeddings, doc_embeddings):
     """ColBERT-style MaxSim late-interaction score between two token sets.
 
     query_embeddings / doc_embeddings : (n, D) / (m, D) tensors of normalized
-    embeddings. The score is ``sum_i max_j <q_i, d_j>`` -- for each query token
-    we take its best-matching document token and sum those similarities.
+    embeddings. For each query token we take its best-matching document token
+    (max over docs), then **mean** over query tokens (mean-MaxSim).
+
+    Mean (not sum) keeps scores in roughly ``[-1, 1]`` regardless of query
+    length, which stabilizes contrastive CE and makes scores comparable across
+    captions of different lengths. Ranking of docs for a *fixed* query is
+    identical to sum-MaxSim.
     """
     q = _stack(query_embeddings).to(torch.float32)
     d = _stack(doc_embeddings).to(torch.float32)
@@ -94,7 +99,7 @@ def late_interaction_score(query_embeddings, doc_embeddings):
     if q.numel() == 0 or d.numel() == 0:
         return 0.0
     sim = q @ d.T  # (n, m); dot product == cosine because inputs are normalized.
-    return sim.max(dim=1).values.sum().item()
+    return sim.max(dim=1).values.mean().item()
 
 
 def _stack(embeddings):
