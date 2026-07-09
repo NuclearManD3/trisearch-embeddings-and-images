@@ -41,6 +41,16 @@ for the full multi-stage plan.
   (implemented in `trisearch_models.inference`: `load_siglip_backbone`,
   `load_qwen_backbone`).
 - Demos and runners must be executed, not just described.
+- **UI / Gradio tools must be smoke-tested after any change** — not only
+  imported. At minimum:
+  - Launch (or call `get_api_info()` / first-request path) and confirm no
+    traceback; for long-running servers, start them, hit the app once if
+    practical, then stop.
+  - Dataset tools: run against a real on-disk path when present
+    (e.g. `python3 view_dataset.py --dataset-dir models/data/trisearch-v1`
+    after a preview export exists).
+  - Unit tests alone are not enough for Gradio event wiring (State/Number
+    handlers can pass imports and still crash in the browser).
 - If GPUs are unavailable, say so explicitly and run what you can (imports,
   dataset parsing, CPU-only paths).
 
@@ -62,6 +72,9 @@ Keep shared code in modules, not duplicated in scripts:
 |--------|----------------|
 | `trisearch_models/` | Model constants, inference embedders, 8-bit loading, training losses, `Stage1AlignmentModel`, checkpoint I/O, optimizer helpers |
 | `trisearch_dataset.py` | HF/JSONL loading, mixing, `ImageCaptionDataset`, sampling for eval/index |
+| `trisearch_data_format.py` | Curated TriSearch dataset schema, 512px resize, HF export/load |
+| `generate_datasets.py` | Build curated Stage-1 dataset (COCO + SkyScript/RSICD, queries) |
+| `view_dataset.py` | Gradio browser for curated dataset |
 | `train_stage1.py` | Stage-1 CLI only — argparse + `main()` |
 | `run_*.py` | Thin smoke/runner scripts |
 | `demo_image_search.py` | Gradio retrieval UI over a real HF dataset sample |
@@ -129,12 +142,19 @@ python3 train_stage1.py --max-steps 20000
 # Fresh run from seeds
 python3 train_stage1.py --fresh --max-steps 10000
 
-# Image search demo (Flickr8k sample)
+# Image search demo (curated mix or Flickr/COCO)
 python3 demo_image_search.py --phase 1 --count 100 --rebuild-index
+
+# Curated dataset (preview then inspect)
+python3 generate_datasets.py --preview --skip-query-generation --allow-rsicd-fallback
+python3 view_dataset.py --dataset-dir models/data/trisearch-v1
 
 # Runner smoke tests
 python3 run_siglip.py --phase 1
 python3 run_qwen3.py --phase 1
+
+# Dataset pipeline unit tests
+python3 -m unittest tests.test_dataset_pipeline -v
 ```
 
 ## Checklist before submitting work
@@ -144,6 +164,8 @@ python3 run_qwen3.py --phase 1
 - [ ] Shared logic in `trisearch_models` or `trisearch_dataset`, not copy-pasted
 - [ ] 8-bit load path uses seed shell + `load_state_dict` for trained weights
 - [ ] Training or inference actually run and output captured
+- [ ] Gradio UIs smoke-tested (`get_api_info` + launch/HTTP if applicable)
+- [ ] `view_dataset.py` exercised on a real dataset dir when one exists
 - [ ] Checkpoint verification passes (finite loss, no load warnings)
 - [ ] Imports work: `python3 -c "from trisearch_models import ...; from trisearch_dataset import ..."`
 
