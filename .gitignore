@@ -1,5 +1,14 @@
 
+# Models and weights and such
+models/
+checkpoints/
+unsloth_compiled_cache/
+
+# Coding
 __pycache__
-models
 .idea
 config.yml
+
+# Misc
+.DS_Store
+
