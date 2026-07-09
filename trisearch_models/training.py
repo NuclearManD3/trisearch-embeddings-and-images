@@ -376,13 +376,21 @@ def resolve_training_dtype(bf16: bool) -> torch.dtype:
     return torch.float16
 
 
-def gpu_device(index: int) -> torch.device:
+def gpu_device(index: int, *, fallback: bool = True) -> torch.device:
+    """Map a logical GPU index to a torch device.
+
+    When ``fallback`` is True (default) and the requested index is out of range,
+    clamp to the last available GPU instead of failing — useful on 1-GPU hosts
+    where the CLI defaults are vision=0 / text=1.
+    """
     if torch.cuda.is_available():
-        if index >= torch.cuda.device_count():
-            raise ValueError(
-                f"Requested GPU {index}, but only "
-                f"{torch.cuda.device_count()} GPU(s) are available."
-            )
+        n = torch.cuda.device_count()
+        if index >= n:
+            if not fallback:
+                raise ValueError(
+                    f"Requested GPU {index}, but only {n} GPU(s) are available."
+                )
+            index = max(0, n - 1)
         return torch.device(f"cuda:{index}")
     return torch.device("cpu")
 
@@ -527,11 +535,24 @@ def resolve_model_dirs(
     return Path(seed_vision_dir), Path(seed_text_dir), None
 
 
+def _torch_load(path: Path | str, map_location="cpu", *, weights_only: bool | None = None):
+    """torch.load wrapper with weights_only when supported (PyTorch 2.0+)."""
+    kwargs: dict[str, Any] = {"map_location": map_location}
+    if weights_only is not None:
+        try:
+            return torch.load(path, weights_only=weights_only, **kwargs)
+        except TypeError:
+            pass
+    return torch.load(path, **kwargs)
+
+
 def load_projection_heads(
     alignment_model: Stage1AlignmentModel,
     checkpoint_root: Path,
 ):
-    state = torch.load(checkpoint_root / PROJECTION_FILE, map_location="cpu")
+    state = _torch_load(
+        checkpoint_root / PROJECTION_FILE, map_location="cpu", weights_only=True
+    )
     alignment_model.vision_projection.load_state_dict(state["vision_projection"])
     alignment_model.text_projection.load_state_dict(state["text_projection"])
     alignment_model.vision_projection.to(
@@ -564,7 +585,8 @@ def load_training_state(
     if not path.is_file():
         print(f"No training state at {path}; starting from step 0.")
         return 0
-    state = torch.load(path, map_location="cpu")
+    # Optimizer state is not pure tensors; must allow full unpickle.
+    state = _torch_load(path, map_location="cpu", weights_only=False)
     optimizer.load_state_dict(state["optimizer"])
     step = int(state.get("global_step", 0))
     print(f"Resumed optimizer state from step {step}")
@@ -594,16 +616,142 @@ def _config_source_dir(component_dir: Path, seed_dir: str) -> str:
     )
 
 
-def _copy_config_json(config_source_dir: str, output_dir: Path):
-    src = Path(config_source_dir) / "config.json"
-    dst = output_dir / "config.json"
-    if not _valid_config_path(src):
-        raise FileNotFoundError(f"Missing or invalid config.json at {src}")
-    if src.resolve() == dst.resolve():
-        return
-    shutil.copy2(src, dst)
-    if not _valid_config_path(dst):
-        raise RuntimeError(f"config.json copy failed at {dst}")
+def _json_safe(value: Any) -> Any:
+    """Convert config values to JSON-serializable forms (HF / Unsloth tolerant)."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.dtype):
+        return str(value).removeprefix("torch.")
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        try:
+            return _json_safe(value.to_dict())
+        except Exception:
+            pass
+    if hasattr(value, "value") and not callable(value):
+        try:
+            return _json_safe(value.value)
+        except Exception:
+            pass
+    if callable(value):
+        return None
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
+def _quantization_config_dict(model: nn.Module) -> dict[str, Any] | None:
+    """Plain-dict BitsAndBytes config for HF-compatible config.json."""
+    config = getattr(model, "config", None)
+    if config is None:
+        return None
+    qc = getattr(config, "quantization_config", None)
+    if qc is None:
+        # Detect 8-bit weights from the live state dict as a fallback.
+        for key in model.state_dict():
+            if key.endswith(".SCB"):
+                return {
+                    "quant_method": "bitsandbytes",
+                    "load_in_8bit": True,
+                    "load_in_4bit": False,
+                    "_load_in_8bit": True,
+                    "_load_in_4bit": False,
+                    "llm_int8_threshold": 6.0,
+                    "llm_int8_has_fp16_weight": False,
+                    "llm_int8_enable_fp32_cpu_offload": False,
+                    "llm_int8_skip_modules": None,
+                    "bnb_4bit_quant_type": "fp4",
+                    "bnb_4bit_use_double_quant": False,
+                    "bnb_4bit_compute_dtype": "float32",
+                    "bnb_4bit_quant_storage": "uint8",
+                }
+        return None
+    if hasattr(qc, "to_dict"):
+        raw = qc.to_dict()
+    elif isinstance(qc, dict):
+        raw = dict(qc)
+    else:
+        return None
+    cleaned = _json_safe(raw)
+    if not isinstance(cleaned, dict):
+        return None
+    # Unsloth injects a non-serializable lambda as get_loading_attributes.
+    cleaned.pop("get_loading_attributes", None)
+    cleaned = {k: v for k, v in cleaned.items() if v is not None or k.startswith("_")}
+    if "quant_method" not in cleaned:
+        cleaned["quant_method"] = "bitsandbytes"
+    if cleaned.get("load_in_8bit") or cleaned.get("_load_in_8bit"):
+        cleaned["load_in_8bit"] = True
+        cleaned["_load_in_8bit"] = True
+    return cleaned
+
+
+def _load_base_config_dict(config_source_dir: str) -> dict[str, Any]:
+    path = Path(config_source_dir) / "config.json"
+    if not _valid_config_path(path):
+        raise FileNotFoundError(f"Missing or invalid config.json at {path}")
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"config.json at {path} is not a JSON object")
+    return data
+
+
+def _write_hf_config_json(
+    model: nn.Module,
+    output_dir: Path,
+    config_source_dir: str,
+) -> None:
+    """Write a HuggingFace-readable config.json (with quantization_config when 8-bit)."""
+    config_dict: dict[str, Any]
+    model_config = getattr(model, "config", None)
+    if model_config is not None and hasattr(model_config, "to_dict"):
+        try:
+            config_dict = _json_safe(model_config.to_dict())
+            if not isinstance(config_dict, dict):
+                raise TypeError("config.to_dict() did not return a dict")
+        except Exception:
+            config_dict = _load_base_config_dict(config_source_dir)
+    else:
+        config_dict = _load_base_config_dict(config_source_dir)
+
+    # Drop non-serializable / internal Unsloth patches.
+    config_dict = {
+        k: v for k, v in config_dict.items()
+        if v is not None and not callable(v)
+    }
+
+    qc = _quantization_config_dict(model)
+    if qc is not None:
+        config_dict["quantization_config"] = qc
+        # Reflect actual stored precision for external loaders.
+        if "dtype" not in config_dict or config_dict.get("dtype") == "float32":
+            config_dict["dtype"] = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    else:
+        config_dict.pop("quantization_config", None)
+
+    out = output_dir / "config.json"
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(config_dict, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    if not _valid_config_path(out):
+        raise RuntimeError(f"Failed to write valid config.json at {out}")
+
+
+def _state_dict_for_safetensors(model: nn.Module) -> dict[str, torch.Tensor]:
+    """CPU-contiguous state dict safe for ``safetensors.torch.save_file``."""
+    state: dict[str, torch.Tensor] = {}
+    for key, value in model.state_dict().items():
+        tensor = value.detach().contiguous().cpu()
+        state[key] = tensor
+    return state
 
 
 def _save_component_checkpoint(
@@ -611,14 +759,57 @@ def _save_component_checkpoint(
     output_dir: Path,
     config_source_dir: str,
 ):
+    """Save weights + HF config.json for a single tower.
+
+    Uses safetensors + an explicitly written config so 8-bit BitsAndBytes
+    checkpoints include ``quantization_config`` (required by HuggingFace and
+    tools like Unsloth Studio). Unsloth's live config can contain non-JSON
+    callables, so we never rely on ``model.save_pretrained`` alone.
+    """
     import safetensors.torch
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    safetensors.torch.save_file(
-        {k: v.detach().cpu() for k, v in model.state_dict().items()},
-        output_dir / "model.safetensors",
-    )
-    _copy_config_json(config_source_dir, output_dir)
+    state = _state_dict_for_safetensors(model)
+    safetensors.torch.save_file(state, output_dir / "model.safetensors")
+    _write_hf_config_json(model, output_dir, config_source_dir)
+
+
+def _save_tokenizer_files(tokenizer: Any, output_dir: Path) -> None:
+    if tokenizer is None:
+        return
+    if not hasattr(tokenizer, "save_pretrained"):
+        return
+    tokenizer.save_pretrained(str(output_dir))
+
+
+def _save_image_processor_files(
+    image_processor: Any,
+    output_dir: Path,
+    *,
+    image_size: int | None = None,
+) -> None:
+    if image_processor is None:
+        return
+    if image_size is not None and hasattr(image_processor, "size"):
+        image_processor.size = {"height": image_size, "width": image_size}
+    if hasattr(image_processor, "save_pretrained"):
+        image_processor.save_pretrained(str(output_dir))
+
+
+def _save_generation_config(model: nn.Module, output_dir: Path) -> None:
+    gen = getattr(model, "generation_config", None)
+    if gen is None or not hasattr(gen, "to_dict"):
+        return
+    try:
+        data = _json_safe(gen.to_dict())
+        if not isinstance(data, dict):
+            return
+        path = output_dir / "generation_config.json"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+    except Exception:
+        return
 
 
 def save_stage1_checkpoint(
@@ -627,7 +818,21 @@ def save_stage1_checkpoint(
     args: Any,
     global_step: int,
     optimizer: torch.optim.Optimizer,
+    *,
+    tokenizer: Any = None,
+    image_processor: Any = None,
 ):
+    """Save Stage-1 towers in a HuggingFace-layout checkpoint directory.
+
+    Layout (per tower)::
+
+        trained_dir/
+          vision_model/{config.json, model.safetensors, preprocessor_config.json}
+          text_model/{config.json, model.safetensors, tokenizer files, ...}
+          projection_heads.pt
+          training_state.pt
+          stage1_config.json
+    """
     trained_dir.mkdir(parents=True, exist_ok=True)
 
     vision_dir = trained_dir / VISION_COMPONENT
@@ -642,6 +847,15 @@ def save_stage1_checkpoint(
         text_dir,
         _config_source_dir(text_dir, args.seed_text_dir),
     )
+
+    vision_image_size = getattr(
+        getattr(alignment_model.vision_model, "config", None), "image_size", None
+    )
+    _save_image_processor_files(
+        image_processor, vision_dir, image_size=vision_image_size
+    )
+    _save_tokenizer_files(tokenizer, text_dir)
+    _save_generation_config(alignment_model.text_model, text_dir)
 
     torch.save(
         {
@@ -803,13 +1017,19 @@ def run_training(
     optimizer: torch.optim.Optimizer,
     args: Any,
     start_step: int = 0,
+    *,
+    tokenizer: Any = None,
+    image_processor: Any = None,
 ) -> int:
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    max_steps = args.max_steps + start_step if args.max_steps > 0 else None
-    total_steps = max_steps or (
-        len(dataloader) * args.num_epochs // args.gradient_accumulation_steps
+    # --max-steps is a total global-step budget (HF Trainer convention), not
+    # "additional steps after resume".
+    max_steps = args.max_steps if args.max_steps > 0 else None
+    total_steps = max_steps or max(
+        1,
+        int(len(dataloader) * args.num_epochs // max(args.gradient_accumulation_steps, 1)),
     )
     warmup_steps = int(total_steps * args.warmup_ratio)
 
@@ -892,12 +1112,18 @@ def run_training(
                 msg += f" | grad_norm {float(grad_norm):.4f} | lr {text_lr:.2e}"
                 print(msg)
                 log_loss = log_contrastive = log_matryoshka = 0.0
-                log_text_text = log_text_matryoshka = 0.0
+                log_text_text = log_text_text_matryoshka = 0.0
                 log_batches = 0
 
             if global_step % args.save_steps == 0:
                 save_stage1_checkpoint(
-                    Path(args.trained_dir), model, args, global_step, optimizer
+                    Path(args.trained_dir),
+                    model,
+                    args,
+                    global_step,
+                    optimizer,
+                    tokenizer=tokenizer,
+                    image_processor=image_processor,
                 )
 
             if max_steps is not None and global_step >= max_steps:

@@ -128,6 +128,27 @@ def trained_dir_for_phase(phase):
     return Path(TRAINED_ROOT) / f"stage{phase}"
 
 
+def _component_has_weights(component_dir) -> bool:
+    """True when a HF/transformers or Diffusers weight file is present."""
+    from pathlib import Path
+
+    component_dir = Path(component_dir)
+    for name in (
+        "model.safetensors",
+        "pytorch_model.bin",
+        "diffusion_pytorch_model.safetensors",
+        "diffusion_pytorch_model.bin",
+    ):
+        if (component_dir / name).is_file():
+            return True
+    # Sharded HF checkpoints.
+    if (component_dir / "model.safetensors.index.json").is_file():
+        return True
+    if (component_dir / "pytorch_model.bin.index.json").is_file():
+        return True
+    return False
+
+
 def phase_checkpoint_available(phase, component=None):
     """True when the requested training-phase checkpoint exists on disk."""
     from pathlib import Path
@@ -141,19 +162,20 @@ def phase_checkpoint_available(phase, component=None):
     if component is None:
         for key in ("siglip", "qwen"):
             comp = root / _COMPONENT_KEYS[key]
-            weights = comp / "model.safetensors"
-            if not weights.is_file() or not _valid_config_path(comp / "config.json"):
+            if not _component_has_weights(comp) or not _valid_config_path(comp / "config.json"):
                 return False
         projection = root / "projection_heads.pt"
         return projection.is_file()
 
     if component == "mmdit":
         mmdit_dir = root / _COMPONENT_KEYS["mmdit"]
-        return _valid_config_path(mmdit_dir / "config.json")
+        return (
+            _valid_config_path(mmdit_dir / "config.json")
+            and _component_has_weights(mmdit_dir)
+        )
 
     comp = root / _COMPONENT_KEYS[component]
-    weights = comp / "model.safetensors"
-    if not weights.is_file() or not _valid_config_path(comp / "config.json"):
+    if not _component_has_weights(comp) or not _valid_config_path(comp / "config.json"):
         return False
     if component in _PROJECTION_STATE_KEYS:
         return (root / "projection_heads.pt").is_file()
@@ -179,10 +201,12 @@ def resolve_model_dir(phase, component, *, require_trained=False):
         return _SEED_DIRS[component]
 
     trained_component = trained_dir_for_phase(phase) / _COMPONENT_KEYS[component]
-    if trained_component.is_dir() and _valid_config_path(trained_component / "config.json"):
-        weights = trained_component / "model.safetensors"
-        if weights.is_file():
-            return str(trained_component)
+    if (
+        trained_component.is_dir()
+        and _valid_config_path(trained_component / "config.json")
+        and _component_has_weights(trained_component)
+    ):
+        return str(trained_component)
 
     if require_trained or component in _PROJECTION_STATE_KEYS:
         raise FileNotFoundError(
@@ -236,7 +260,10 @@ def describe_phase(phase, component):
 
 
 def _load_projection_head(projection, path, state_key, device):
-    state = torch.load(path, map_location=device)
+    try:
+        state = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        state = torch.load(path, map_location=device)
     if state_key not in state:
         raise KeyError(
             f"{path} is missing {state_key!r}; expected keys "
@@ -339,7 +366,9 @@ def load_siglip_backbone(
         _load_trained_8bit_state(model, model_dir, "SigLIP")
         if for_training:
             model.gradient_checkpointing_enable()
-        model.eval()
+            model.train()
+        else:
+            model.eval()
         return model
 
     if load_in_8bit:
@@ -353,13 +382,18 @@ def load_siglip_backbone(
         )
         if for_training:
             model.gradient_checkpointing_enable()
-        model.eval()
+            model.train()
+        else:
+            model.eval()
         return model
 
     model = SiglipVisionModel.from_pretrained(model_dir)
-    model = model.to(device).eval()
+    model = model.to(device)
     if for_training:
         model.gradient_checkpointing_enable()
+        model.train()
+    else:
+        model.eval()
     return model
 
 
@@ -398,12 +432,12 @@ def load_qwen_backbone(
             from_pretrained_kwargs["use_gradient_checkpointing"] = "unsloth"
         model, _ = FastLanguageModel.from_pretrained(**from_pretrained_kwargs)
         _load_trained_8bit_state(model, model_dir, "Qwen3-MoE")
-        model = (
-            FastLanguageModel.for_training(model)
-            if for_training
-            else FastLanguageModel.for_inference(model)
-        )
-        model.eval()
+        if for_training:
+            model = FastLanguageModel.for_training(model)
+            model.train()
+        else:
+            model = FastLanguageModel.for_inference(model)
+            model.eval()
         return model
 
     if load_in_8bit:
@@ -428,19 +462,31 @@ def load_qwen_backbone(
         if for_training:
             from_pretrained_kwargs["use_gradient_checkpointing"] = "unsloth"
         model, _ = FastLanguageModel.from_pretrained(**from_pretrained_kwargs)
-        model = (
-            FastLanguageModel.for_training(model)
-            if for_training
-            else FastLanguageModel.for_inference(model)
-        )
-        model.eval()
+        if for_training:
+            model = FastLanguageModel.for_training(model)
+            model.train()
+        else:
+            model = FastLanguageModel.for_inference(model)
+            model.eval()
         return model
 
     from transformers import AutoModel
 
     model = AutoModel.from_pretrained(model_dir)
-    model = model.to(device).eval()
+    model = model.to(device)
+    if for_training:
+        model.train()
+    else:
+        model.eval()
     return model
+
+
+def default_inference_device(prefer_index: int = 0) -> str:
+    """Pick a CUDA device when available (required for bitsandbytes 8-bit)."""
+    if torch.cuda.is_available():
+        index = prefer_index if prefer_index < torch.cuda.device_count() else 0
+        return f"cuda:{index}"
+    return "cpu"
 
 
 def _text_backbone(model: nn.Module) -> nn.Module:
@@ -480,8 +526,13 @@ class SiglipEmbedder:
             seed_dir=SIGLIP_DIR if load_in_8bit else None,
         )
         self.device = _model_device(self.model)
-        self.processor = AutoImageProcessor.from_pretrained(processor_id)
-        # The processor comes from the 384px baseline, but our resized tower
+        # Prefer a colocated preprocessor (HF layout); fall back to baseline id.
+        from pathlib import Path
+
+        local_proc = Path(model_dir) / "preprocessor_config.json"
+        proc_source = str(model_dir) if local_proc.is_file() else processor_id
+        self.processor = AutoImageProcessor.from_pretrained(proc_source)
+        # The processor may come from the 384px baseline; our resized tower
         # expects `image_size` px (e.g. 540) -> keep the patch grid consistent
         # with the model's learned position embeddings.
         target = self.model.config.image_size
@@ -536,16 +587,21 @@ class Qwen3MoeEmbedder:
         self.embed_dim = embed_dim
         self.phase = phase
         self.model_dir = model_dir
+        # Prefer a colocated tokenizer (HF layout) when the checkpoint ships one.
+        from pathlib import Path
+
+        local_tok = Path(model_dir) / "tokenizer_config.json"
+        effective_tokenizer_id = str(model_dir) if local_tok.is_file() else tokenizer_id
         self.model = load_qwen_backbone(
             model_dir,
             device,
             load_in_8bit=load_in_8bit,
             seed_dir=QWEN_DIR if load_in_8bit else None,
-            tokenizer_id=tokenizer_id,
+            tokenizer_id=effective_tokenizer_id,
             max_seq_length=max_seq_length,
         )
         self.device = _model_device(self.model)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(effective_tokenizer_id)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         hidden = self.model.config.hidden_size
@@ -622,6 +678,7 @@ class MMDiTGenerator:
         if model_dir is None:
             model_dir = resolve_model_dir(phase, "mmdit")
 
+        device = _torch_device(device)
         self.device = device
         self.embed_dim = embed_dim
         self.phase = phase

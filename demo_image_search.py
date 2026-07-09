@@ -171,7 +171,11 @@ class ImageSearchIndex:
 
     @classmethod
     def load(cls, path: Path) -> tuple[ImageSearchIndex, dict[str, Any]]:
-        payload = torch.load(path, map_location="cpu")
+        # Cache holds PIL JPEG bytes + tensors; not a pure weights-only payload.
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
         if payload.get("version") != CACHE_VERSION:
             raise ValueError(f"Unsupported cache version in {path}")
         entries = []
@@ -399,16 +403,12 @@ def parse_args() -> argparse.Namespace:
 def _resolve_demo_devices(args: argparse.Namespace) -> tuple[str, str]:
     if args.device:
         return args.device, args.device
-    vision = (
-        f"cuda:{args.vision_gpu}"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-    text_gpu = args.text_gpu
-    if torch.cuda.is_available() and text_gpu >= torch.cuda.device_count():
-        text_gpu = args.vision_gpu
-    text = f"cuda:{text_gpu}" if torch.cuda.is_available() else "cpu"
-    return vision, text
+    if not torch.cuda.is_available():
+        return "cpu", "cpu"
+    n = torch.cuda.device_count()
+    vision_gpu = args.vision_gpu if args.vision_gpu < n else 0
+    text_gpu = args.text_gpu if args.text_gpu < n else vision_gpu
+    return f"cuda:{vision_gpu}", f"cuda:{text_gpu}"
 
 
 def main():

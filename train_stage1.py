@@ -42,6 +42,8 @@ from trisearch_dataset import (
     DEFAULT_GENERAL_SPLIT,
     DEFAULT_OPENROUTER_CONFIG,
     DEFAULT_QUERY_CACHE_PATH,
+    OPENROUTER_QUERY_BATCH_SIZE,
+    OPENROUTER_QUERY_PARALLELISM,
     DEFAULT_SATELLITE_DATASET,
     DEFAULT_SATELLITE_SPLIT,
     ImageCaptionDataset,
@@ -129,6 +131,12 @@ def parse_args() -> argparse.Namespace:
                         help="JSONL cache for LLM-generated related/unrelated queries.")
     parser.add_argument("--max-query-gen", type=int, default=None,
                         help="Cap new OpenRouter calls (useful for smoke tests).")
+    parser.add_argument("--query-batch-size", type=int,
+                        default=OPENROUTER_QUERY_BATCH_SIZE,
+                        help="Captions per OpenRouter API request.")
+    parser.add_argument("--query-parallelism", type=int,
+                        default=OPENROUTER_QUERY_PARALLELISM,
+                        help="Concurrent OpenRouter API requests during query gen.")
     parser.add_argument("--skip-query-generation", action="store_true",
                         help="Require all queries in --query-cache; do not call API.")
 
@@ -203,6 +211,8 @@ def main():
             max_new_queries=args.max_query_gen,
             skip_generation=args.skip_query_generation,
             caption_column=caption_column,
+            query_batch_size=args.query_batch_size,
+            query_parallelism=args.query_parallelism,
         )
 
     vision_load_dir, text_load_dir, checkpoint_root = resolve_model_dirs(
@@ -309,6 +319,10 @@ def main():
         print(f"  text-text w    : {args.text_text_weight}")
         print(f"  text-text m w  : {args.text_text_matryoshka_weight}")
         print(f"  query cache    : {args.query_cache}")
+        print(
+            f"  query parallel : {args.query_parallelism} "
+            f"x batch {args.query_batch_size}"
+        )
     print(f"  compute dtype  : {compute_dtype}")
     print(f"  vision GPU     : {vision_device}")
     print(f"  text GPU       : {text_device}")
@@ -319,10 +333,22 @@ def main():
 
     trained_path = Path(args.trained_dir)
     final_step = run_training(
-        alignment_model, dataloader, optimizer, args, start_step=start_step
+        alignment_model,
+        dataloader,
+        optimizer,
+        args,
+        start_step=start_step,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
     )
     save_stage1_checkpoint(
-        trained_path, alignment_model, args, final_step, optimizer
+        trained_path,
+        alignment_model,
+        args,
+        final_step,
+        optimizer,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
     )
     verify_trained_checkpoint(
         trained_path,

@@ -20,6 +20,7 @@ from trisearch_models import (
     MAX_TRAINING_PHASE,
     MIN_TRAINING_PHASE,
     MMDiTGenerator,
+    default_inference_device,
     describe_phase,
 )
 
@@ -53,14 +54,19 @@ def main():
                              "must be a multiple of 16).")
     parser.add_argument("--steps", type=int, default=4,
                         help="Number of denoising steps (default 4).")
+    parser.add_argument("--device", default=None,
+                        help="Device for the generator (default: cuda:0 if "
+                             "available, else cpu).")
     args = parser.parse_args()
 
+    device = args.device or default_inference_device(0)
     print("Loading MMDiT generator (this may take a moment) ...")
     if args.model_dir:
         print(f"  model override: {args.model_dir}")
     else:
         print(f"  {describe_phase(args.phase, 'mmdit')}")
-    kwargs = {"phase": args.phase}
+    print(f"  device: {device}")
+    kwargs = {"phase": args.phase, "device": device}
     if args.model_dir:
         kwargs["model_dir"] = args.model_dir
     generator = MMDiTGenerator(**kwargs)

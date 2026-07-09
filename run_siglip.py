@@ -28,6 +28,7 @@ from trisearch_models import (
     MIN_TRAINING_PHASE,
     LateInteractionStore,
     SiglipEmbedder,
+    default_inference_device,
     describe_phase,
 )
 
@@ -57,14 +58,19 @@ def main():
     parser.add_argument("--model-dir", default=None,
                         help="Override the model directory (ignores --phase "
                              "for backbone weights).")
+    parser.add_argument("--device", default=None,
+                        help="Device for the embedder (default: cuda:0 if "
+                             "available, else cpu). 8-bit phase>=1 needs CUDA.")
     args = parser.parse_args()
 
+    device = args.device or default_inference_device(0)
     print("Loading SigLIP vision embedder (this may take a moment) ...")
     if args.model_dir:
         print(f"  model override: {args.model_dir}")
     else:
         print(f"  {describe_phase(args.phase, 'siglip')}")
-    kwargs = {"phase": args.phase}
+    print(f"  device: {device}")
+    kwargs = {"phase": args.phase, "device": device}
     if args.model_dir:
         kwargs["model_dir"] = args.model_dir
     embedder = SiglipEmbedder(**kwargs)

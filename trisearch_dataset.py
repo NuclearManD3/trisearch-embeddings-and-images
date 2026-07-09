@@ -11,6 +11,10 @@ from __future__ import annotations
 import io
 import json
 import random
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -44,6 +48,9 @@ DEFAULT_QUERY_CACHE_PATH = Path("models/data/stage1_query_cache.jsonl")
 QUERY_CACHE_CAPTION_KEY = "caption"
 QUERY_CACHE_RELATED_KEY = "related_query"
 QUERY_CACHE_UNRELATED_KEY = "unrelated_query"
+OPENROUTER_QUERY_BATCH_SIZE = 8
+OPENROUTER_QUERY_PARALLELISM = 32
+OPENROUTER_MAX_ATTEMPTS = 4
 
 
 def is_image_path_reference(value: Any) -> bool:
@@ -512,55 +519,95 @@ def load_openrouter_config(config_path: str | Path = DEFAULT_OPENROUTER_CONFIG) 
     return {"api_key": api_key, "model": model}
 
 
-def _parse_query_json(content: str) -> dict[str, str]:
-    text = content.strip()
-    if "```" in text:
-        parts = text.split("```")
-        for part in parts:
-            chunk = part.strip()
-            if chunk.startswith("json"):
-                chunk = chunk[4:].strip()
-            if chunk.startswith("{"):
-                text = chunk
+def _strip_code_fences(text: str) -> str:
+    if "```" not in text:
+        return text.strip()
+    for part in text.split("```"):
+        chunk = part.strip()
+        if chunk.startswith("json"):
+            chunk = chunk[4:].strip()
+        if chunk.startswith("{") or chunk.startswith("["):
+            return chunk
+    return text.strip()
+
+
+def _extract_json_value(text: str) -> Any:
+    text = _strip_code_fences(text)
+    decoder = json.JSONDecoder()
+    for opener in ("[", "{"):
+        start = 0
+        while start < len(text):
+            idx = text.find(opener, start)
+            if idx < 0:
                 break
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError(f"No JSON object in model response: {content[:200]!r}")
-    payload = json.loads(text[start : end + 1])
+            try:
+                value, _end = decoder.raw_decode(text[idx:])
+                return value
+            except json.JSONDecodeError:
+                start = idx + 1
+    match = re.search(
+        r'\{[^{}]*"related_query"\s*:\s*"[^"]*"[^{}]*"unrelated_query"\s*:\s*"[^"]*"[^{}]*\}',
+        text,
+        flags=re.DOTALL,
+    )
+    if match:
+        return json.loads(match.group(0))
+    raise ValueError(f"No parseable JSON in model response: {text[:300]!r}")
+
+
+def _normalize_query_entry(payload: Any) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected object, got {type(payload)!r}")
     related = str(payload.get("related_query", "")).strip()
     unrelated = str(payload.get("unrelated_query", "")).strip()
     if not related or not unrelated:
         raise ValueError(f"Missing query fields in {payload!r}")
-    return {"related_query": related, "unrelated_query": unrelated}
+    return {
+        QUERY_CACHE_RELATED_KEY: related,
+        QUERY_CACHE_UNRELATED_KEY: unrelated,
+    }
 
 
-def openrouter_generate_queries(
-    caption: str,
+def _parse_query_json(content: str) -> dict[str, str]:
+    payload = _extract_json_value(content)
+    if isinstance(payload, list):
+        if len(payload) != 1:
+            raise ValueError(
+                f"Expected one query object, got array of length {len(payload)}"
+            )
+        payload = payload[0]
+    return _normalize_query_entry(payload)
+
+
+def _parse_query_batch_json(content: str, expected_count: int) -> list[dict[str, str]]:
+    payload = _extract_json_value(content)
+    if isinstance(payload, dict):
+        payload = [payload]
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected JSON array, got {type(payload)!r}")
+    if len(payload) != expected_count:
+        raise ValueError(
+            f"Expected {expected_count} query objects, got {len(payload)}"
+        )
+    return [_normalize_query_entry(item) for item in payload]
+
+
+def _openrouter_chat_completion(
     *,
     api_key: str,
     model: str,
-    timeout: float = 60.0,
-) -> dict[str, str]:
-    """Ask OpenRouter for a related search query and an unrelated distractor."""
+    prompt: str,
+    max_tokens: int,
+    timeout: float = 120.0,
+) -> str:
     import urllib.error
     import urllib.request
 
-    prompt = (
-        "You help train a text embedding model.\n"
-        "Given an image caption, return JSON only with two short English search "
-        "queries (2-8 words each):\n"
-        '{"related_query": "...", "unrelated_query": "..."}\n'
-        "related_query: what someone would type to find an image matching the caption.\n"
-        "unrelated_query: a query on a completely different topic; it must not "
-        "describe or relate to the caption.\n"
-        f"Caption: {caption}"
-    )
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 128,
+        "temperature": 0.5,
+        "max_tokens": max_tokens,
     }).encode("utf-8")
     request = urllib.request.Request(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -582,8 +629,94 @@ def openrouter_generate_queries(
     choices = payload.get("choices") or []
     if not choices:
         raise RuntimeError(f"OpenRouter returned no choices: {payload!r}")
-    content = choices[0].get("message", {}).get("content", "")
-    return _parse_query_json(content)
+    return str(choices[0].get("message", {}).get("content", "")).strip()
+
+
+def openrouter_generate_queries(
+    caption: str,
+    *,
+    api_key: str,
+    model: str,
+    timeout: float = 120.0,
+    max_attempts: int = OPENROUTER_MAX_ATTEMPTS,
+) -> dict[str, str]:
+    """Ask OpenRouter for a related search query and an unrelated distractor."""
+    prompt = (
+        "You help train a text embedding model.\n"
+        "Return ONLY one JSON object and nothing else:\n"
+        '{"related_query": "...", "unrelated_query": "..."}\n'
+        "Use 2-8 English words per query.\n"
+        "related_query: what someone would type to find an image matching the caption.\n"
+        "unrelated_query: a completely different topic; must not relate to the caption.\n"
+        f"Caption: {caption}"
+    )
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            content = _openrouter_chat_completion(
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                max_tokens=128,
+                timeout=timeout,
+            )
+            return _parse_query_json(content)
+        except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+            if attempt + 1 < max_attempts:
+                time.sleep(0.75 * (attempt + 1))
+    raise RuntimeError(
+        f"Failed to generate queries for caption {caption[:80]!r} "
+        f"after {max_attempts} attempts"
+    ) from last_error
+
+
+def openrouter_generate_queries_batch(
+    captions: list[str],
+    *,
+    api_key: str,
+    model: str,
+    timeout: float = 180.0,
+    max_attempts: int = OPENROUTER_MAX_ATTEMPTS,
+) -> list[dict[str, str]]:
+    """Generate related/unrelated queries for multiple captions in one call."""
+    if not captions:
+        return []
+    if len(captions) == 1:
+        return [openrouter_generate_queries(
+            captions[0], api_key=api_key, model=model, timeout=timeout
+        )]
+
+    numbered = "\n".join(f"{i + 1}. {caption}" for i, caption in enumerate(captions))
+    prompt = (
+        "You help train a text embedding model.\n"
+        f"Return ONLY a JSON array of exactly {len(captions)} objects and nothing else.\n"
+        "Each object must be:\n"
+        '{"related_query": "...", "unrelated_query": "..."}\n'
+        "Use 2-8 English words per query. Keep the same order as the captions.\n"
+        "related_query: what someone would type to find an image matching the caption.\n"
+        "unrelated_query: a completely different image description; must not relate to that caption.\n"
+        f"Captions:\n{numbered}"
+    )
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            content = _openrouter_chat_completion(
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                max_tokens=max(256, 64 * len(captions)),
+                timeout=timeout,
+            )
+            return _parse_query_batch_json(content, len(captions))
+        except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+            if attempt + 1 < max_attempts:
+                time.sleep(0.75 * (attempt + 1))
+    raise RuntimeError(
+        f"Failed batch query generation for {len(captions)} captions "
+        f"after {max_attempts} attempts"
+    ) from last_error
 
 
 def load_query_cache(path: str | Path) -> dict[str, dict[str, str]]:
@@ -624,6 +757,44 @@ def save_query_cache(path: str | Path, cache: dict[str, dict[str, str]]) -> None
             }, ensure_ascii=False) + "\n")
 
 
+def _generate_query_batch_with_fallback(
+    captions: list[str],
+    *,
+    api_key: str,
+    model: str,
+) -> list[dict[str, str]]:
+    try:
+        return openrouter_generate_queries_batch(
+            captions,
+            api_key=api_key,
+            model=model,
+        )
+    except RuntimeError:
+        return [
+            openrouter_generate_queries(
+                caption,
+                api_key=api_key,
+                model=model,
+            )
+            for caption in captions
+        ]
+
+
+def append_query_cache_entry(
+    path: str | Path,
+    caption: str,
+    entry: dict[str, str],
+) -> None:
+    cache_path = Path(path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            QUERY_CACHE_CAPTION_KEY: caption,
+            QUERY_CACHE_RELATED_KEY: entry[QUERY_CACHE_RELATED_KEY],
+            QUERY_CACHE_UNRELATED_KEY: entry[QUERY_CACHE_UNRELATED_KEY],
+        }, ensure_ascii=False) + "\n")
+
+
 def enrich_rows_with_text_queries(
     rows: list[dict[str, Any]],
     *,
@@ -632,10 +803,11 @@ def enrich_rows_with_text_queries(
     max_new_queries: int | None = None,
     skip_generation: bool = False,
     caption_column: str = "caption",
+    query_batch_size: int = OPENROUTER_QUERY_BATCH_SIZE,
+    query_parallelism: int = OPENROUTER_QUERY_PARALLELISM,
 ) -> list[dict[str, Any]]:
     """Attach related/unrelated search queries to each row (cached on disk)."""
     cache = load_query_cache(cache_path)
-    config = load_openrouter_config(config_path)
 
     unique_captions: list[str] = []
     seen: set[str] = set()
@@ -656,22 +828,71 @@ def enrich_rows_with_text_queries(
         )
 
     if missing:
+        if query_batch_size < 1:
+            raise ValueError("--query-batch-size must be >= 1")
+        if query_parallelism < 1:
+            raise ValueError("--query-parallelism must be >= 1")
+
+        config = load_openrouter_config(config_path)
+        batches = [
+            missing[i : i + query_batch_size]
+            for i in range(0, len(missing), query_batch_size)
+        ]
         print(
             f"Generating text queries for {len(missing):,} captions via OpenRouter "
-            f"({config['model']}) ..."
+            f"({config['model']}, batch={query_batch_size}, "
+            f"parallel={query_parallelism}, {len(batches):,} API calls) ..."
         )
-        for i, caption in enumerate(missing, start=1):
-            cache[caption] = openrouter_generate_queries(
-                caption,
-                api_key=config["api_key"],
-                model=config["model"],
-            )
-            if i == 1 or i % 25 == 0 or i == len(missing):
-                print(f"  generated {i:,}/{len(missing):,}")
-            if i % 50 == 0:
-                save_query_cache(cache_path, cache)
-        save_query_cache(cache_path, cache)
-        print(f"Saved query cache to {cache_path}")
+
+        generated = 0
+        cache_lock = threading.Lock()
+        start_time = time.monotonic()
+
+        def _store_batch(batch: list[str], entries: list[dict[str, str]]) -> int:
+            nonlocal generated
+            with cache_lock:
+                for caption, entry in zip(batch, entries):
+                    cache[caption] = entry
+                    append_query_cache_entry(cache_path, caption, entry)
+                    generated += 1
+                    if (
+                        generated == 1
+                        or generated % 100 == 0
+                        or generated == len(missing)
+                    ):
+                        elapsed = time.monotonic() - start_time
+                        rate = generated / max(elapsed, 1e-6)
+                        print(
+                            f"  generated {generated:,}/{len(missing):,} "
+                            f"({rate:.1f} captions/s)"
+                        )
+                return generated
+
+        with ThreadPoolExecutor(max_workers=query_parallelism) as executor:
+            futures = {
+                executor.submit(
+                    _generate_query_batch_with_fallback,
+                    batch,
+                    api_key=config["api_key"],
+                    model=config["model"],
+                ): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                batch = futures[future]
+                entries = future.result()
+                if len(entries) != len(batch):
+                    raise RuntimeError(
+                        f"Query batch size mismatch for {len(batch)} captions "
+                        f"(got {len(entries)} entries)"
+                    )
+                _store_batch(batch, entries)
+
+        elapsed = time.monotonic() - start_time
+        print(
+            f"Saved query cache to {cache_path} ({generated:,} new entries, "
+            f"{elapsed:.1f}s)"
+        )
 
     enriched: list[dict[str, Any]] = []
     for row in rows:
