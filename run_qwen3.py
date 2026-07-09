@@ -11,19 +11,31 @@ The model is only resized (un-trained), so the scores are not yet meaningful --
 this just confirms the embedder "turns on and runs".
 
 Run:  python3 run_qwen3.py
+      python3 run_qwen3.py --phase 1
       python3 run_qwen3.py --merge-threshold 0.95
 Quit: type 'q', 'quit', 'exit', or send EOF (Ctrl-D).
 """
 
 import argparse
 
-from trisearch_models import LateInteractionStore, Qwen3MoeEmbedder
+from trisearch_models import (
+    MAX_TRAINING_PHASE,
+    MIN_TRAINING_PHASE,
+    LateInteractionStore,
+    Qwen3MoeEmbedder,
+    describe_phase,
+)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phase", type=int, default=0,
+                        choices=range(MIN_TRAINING_PHASE, MAX_TRAINING_PHASE + 1),
+                        help="Training phase to load: 0=untrained seed, "
+                             "1=stage-1 trained, 2-5=future stages.")
     parser.add_argument("--model-dir", default=None,
-                        help="Path to the Qwen3-MoE model directory.")
+                        help="Override the model directory (ignores --phase "
+                             "for backbone weights).")
     parser.add_argument("--merge-threshold", type=float, default=1.0,
                         help="Cosine-sim threshold to merge consecutive "
                              "embeddings (1.0 = merge only identical; lower "
@@ -31,7 +43,13 @@ def main():
     args = parser.parse_args()
 
     print("Loading Qwen3-MoE text embedder (this may take a moment) ...")
-    kwargs = {"model_dir": args.model_dir} if args.model_dir else {}
+    if args.model_dir:
+        print(f"  model override: {args.model_dir}")
+    else:
+        print(f"  {describe_phase(args.phase, 'qwen')}")
+    kwargs = {"phase": args.phase}
+    if args.model_dir:
+        kwargs["model_dir"] = args.model_dir
     embedder = Qwen3MoeEmbedder(**kwargs)
     store = LateInteractionStore()
     print(f"Ready (merge_threshold={args.merge_threshold}). Enter text to embed.\n")

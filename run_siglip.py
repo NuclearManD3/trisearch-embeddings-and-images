@@ -12,6 +12,7 @@ The model is only resized (un-trained), so the scores are not yet meaningful --
 this just confirms the embedder "turns on and runs".
 
 Run:  python3 run_siglip.py
+      python3 run_siglip.py --phase 1   # load stage-1 trained weights
 Quit: type 'q', 'quit', 'exit', or send EOF (Ctrl-D).
 """
 
@@ -22,7 +23,13 @@ import os
 
 from PIL import Image
 
-from trisearch_models import LateInteractionStore, SiglipEmbedder
+from trisearch_models import (
+    MAX_TRAINING_PHASE,
+    MIN_TRAINING_PHASE,
+    LateInteractionStore,
+    SiglipEmbedder,
+    describe_phase,
+)
 
 
 def load_image(user_input):
@@ -43,12 +50,23 @@ def load_image(user_input):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phase", type=int, default=0,
+                        choices=range(MIN_TRAINING_PHASE, MAX_TRAINING_PHASE + 1),
+                        help="Training phase to load: 0=untrained seed, "
+                             "1=stage-1 trained, 2-5=future stages.")
     parser.add_argument("--model-dir", default=None,
-                        help="Path to the SigLIP vision model directory.")
+                        help="Override the model directory (ignores --phase "
+                             "for backbone weights).")
     args = parser.parse_args()
 
     print("Loading SigLIP vision embedder (this may take a moment) ...")
-    kwargs = {"model_dir": args.model_dir} if args.model_dir else {}
+    if args.model_dir:
+        print(f"  model override: {args.model_dir}")
+    else:
+        print(f"  {describe_phase(args.phase, 'siglip')}")
+    kwargs = {"phase": args.phase}
+    if args.model_dir:
+        kwargs["model_dir"] = args.model_dir
     embedder = SiglipEmbedder(**kwargs)
     store = LateInteractionStore()
     print("Ready. Enter an image path or a base64-encoded image.\n")

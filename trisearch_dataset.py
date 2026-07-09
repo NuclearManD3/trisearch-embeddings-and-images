@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""
+Dataset loading and manipulation for TriSearch training and evaluation.
+
+All loaders require real image–caption data from HuggingFace datasets, local
+JSONL files, or on-disk image paths. There is no synthetic or placeholder data.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
+
+from PIL import Image
+from torch.utils.data import Dataset
+
+# Stage 1 defaults (training_plan.md §2–3)
+DEFAULT_SATELLITE_DATASET = "JessicaYuan/ChatEarthNet"
+DEFAULT_SATELLITE_SPLIT = "train"
+# Parquet/streaming-native general captions (HuggingFaceM4/COCO uses a deprecated script).
+DEFAULT_GENERAL_DATASET = "jxie/flickr8k"
+DEFAULT_GENERAL_SPLIT = "train"
+DEFAULT_GENERAL_CAPTION_COLUMN = "caption_0"
+
+# Evaluation / indexing defaults
+DEFAULT_FLICKR8K_DATASET = "jxie/flickr8k"
+DEFAULT_FLICKR8K_SPLIT = "train"
+
+VERIFICATION_DATASET = DEFAULT_FLICKR8K_DATASET
+VERIFICATION_SPLIT = DEFAULT_FLICKR8K_SPLIT
+VERIFICATION_SAMPLE_COUNT = 4
+
+CHATEARTHNET_HF_REPO = DEFAULT_SATELLITE_DATASET
+CHATEARTHNET_RGB_ZIP = "s2_rgb_images.zip"
+DEFAULT_CHATEARTHNET_CACHE_DIR = Path("models/data/ChatEarthNet")
+DEFAULT_CHATEARTHNET_IMAGE_ROOT = DEFAULT_CHATEARTHNET_CACHE_DIR / "s2_rgb_images"
+
+DEFAULT_OPENROUTER_CONFIG = Path("config.yml")
+DEFAULT_QUERY_CACHE_PATH = Path("models/data/stage1_query_cache.jsonl")
+QUERY_CACHE_CAPTION_KEY = "caption"
+QUERY_CACHE_RELATED_KEY = "related_query"
+QUERY_CACHE_UNRELATED_KEY = "unrelated_query"
+
+
+def is_image_path_reference(value: Any) -> bool:
+    """True when ``value`` is a filename/path string, not an embedded image."""
+    return isinstance(value, str) and not Path(value).is_file()
+
+
+def _find_png_directory(base: Path, sample_name: str) -> Path | None:
+    """Return a directory under ``base`` that contains ``sample_name``."""
+    direct = base / sample_name
+    if direct.is_file():
+        return base
+    matches = list(base.rglob(sample_name))
+    if matches:
+        return matches[0].parent
+    return None
+
+
+def download_chatearthnet_rgb_images(
+    cache_dir: Path | str | None = None,
+) -> Path:
+    """Download and extract ChatEarthNet RGB PNGs from the HF dataset repo."""
+    import zipfile
+
+    from huggingface_hub import hf_hub_download
+
+    cache_dir = Path(cache_dir or DEFAULT_CHATEARTHNET_CACHE_DIR)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    marker = cache_dir / ".s2_rgb_images_extracted"
+    if marker.is_file():
+        root = _find_png_directory(cache_dir, "2815_4942_patch00.png")
+        if root is not None:
+            return root
+
+    print(
+        f"Downloading {CHATEARTHNET_RGB_ZIP} from {CHATEARTHNET_HF_REPO} "
+        f"(~13 GB; one-time cache under {cache_dir}) ..."
+    )
+    zip_path = hf_hub_download(
+        repo_id=CHATEARTHNET_HF_REPO,
+        repo_type="dataset",
+        filename=CHATEARTHNET_RGB_ZIP,
+        local_dir=str(cache_dir),
+    )
+    print(f"Extracting {zip_path} ...")
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(cache_dir)
+    marker.write_text("ok\n", encoding="utf-8")
+
+    root = _find_png_directory(cache_dir, "2815_4942_patch00.png")
+    if root is None:
+        raise RuntimeError(
+            f"Extracted {CHATEARTHNET_RGB_ZIP} under {cache_dir} but could not "
+            "find PNG files. Check the archive layout."
+        )
+    print(f"ChatEarthNet images ready at {root}")
+    return root
+
+
+def resolve_chatearthnet_image_root(
+    rows: list[dict[str, Any]],
+    *,
+    explicit_root: str | None = None,
+    download_if_missing: bool = False,
+) -> str | None:
+    """Resolve PNG directory for path-based ChatEarthNet caption rows."""
+    if not rows or not is_image_path_reference(rows[0].get("image")):
+        return explicit_root
+
+    sample_name = Path(str(rows[0]["image"])).name
+    candidates: list[Path] = []
+    if explicit_root:
+        candidates.append(Path(explicit_root))
+    candidates.append(DEFAULT_CHATEARTHNET_IMAGE_ROOT)
+    candidates.append(DEFAULT_CHATEARTHNET_CACHE_DIR)
+
+    for base in candidates:
+        found = _find_png_directory(base, sample_name)
+        if found is not None:
+            print(f"Using ChatEarthNet image root: {found}")
+            return str(found)
+
+    if download_if_missing:
+        return str(download_chatearthnet_rgb_images())
+
+    tried = ", ".join(str(p) for p in candidates)
+    raise FileNotFoundError(
+        f"ChatEarthNet rows reference PNG filenames (e.g. {sample_name!r}) but no "
+        f"image files were found. Searched: {tried}. "
+        f"Pass --satellite-image-root /path/to/pngs, or "
+        f"--download-satellite-images to fetch {CHATEARTHNET_RGB_ZIP} from HuggingFace."
+    )
+
+
+def validate_image_rows(
+    rows: list[dict[str, Any]],
+    image_root: str | None,
+    image_column: str = "image",
+    *,
+    sample_count: int = 8,
+    label: str = "training",
+) -> None:
+    """Fail fast when image files cannot be loaded (before model init)."""
+    if not rows:
+        raise ValueError(f"No {label} rows to validate.")
+    indices = list(range(min(sample_count, len(rows))))
+    if len(rows) > sample_count:
+        rng = random.Random(0)
+        indices = sorted(rng.sample(range(len(rows)), sample_count))
+
+    failures: list[str] = []
+    for idx in indices:
+        row = rows[idx]
+        try:
+            load_pil_image(row[image_column], image_root=image_root)
+        except (FileNotFoundError, TypeError, OSError) as exc:
+            failures.append(f"  row {idx}: {exc}")
+    if failures:
+        root_hint = f" (image_root={image_root!r})" if image_root else ""
+        raise FileNotFoundError(
+            f"Cannot load {len(failures)}/{len(indices)} sample {label} images"
+            f"{root_hint}:\n" + "\n".join(failures)
+        )
+    print(
+        f"Validated {len(indices)} sample {label} images"
+        f"{f' under {image_root}' if image_root else ''}."
+    )
+
+
+def load_pil_image(value: Any, image_root: str | None = None) -> Image.Image:
+    """Load a PIL RGB image from a path, bytes, HF dict, or in-memory image."""
+    if isinstance(value, Image.Image):
+        return value.convert("RGB")
+    if isinstance(value, dict) and "bytes" in value:
+        return Image.open(io.BytesIO(value["bytes"])).convert("RGB")
+    if isinstance(value, (bytes, bytearray)):
+        return Image.open(io.BytesIO(value)).convert("RGB")
+    if isinstance(value, str):
+        path = Path(value)
+        if not path.is_file() and image_root:
+            path = Path(image_root) / value
+        if path.is_file():
+            return Image.open(path).convert("RGB")
+        raise FileNotFoundError(f"Image not found: {value}")
+    raise TypeError(f"Unsupported image value type: {type(value)}")
+
+
+def pick_caption(row: dict[str, Any], caption_column: str) -> str:
+    caption = row.get(caption_column, "")
+    if isinstance(caption, list):
+        caption = caption[0] if caption else ""
+    return str(caption).strip()
+
+
+def caption_from_row(row: dict[str, Any], caption_column: str | None) -> str:
+    if caption_column:
+        return pick_caption(row, caption_column)
+    for key in ("caption", "caption_0", "text", "sentence", "sentences"):
+        if key in row and row[key]:
+            value = row[key]
+            if isinstance(value, list) and value:
+                return str(value[0]).strip()
+            return str(value).strip()
+    return ""
+
+
+@dataclass
+class DataSourceConfig:
+    dataset: str
+    split: str = "train"
+    image_column: str = "image"
+    caption_column: str = "caption"
+    image_root: str | None = None
+    max_samples: int | None = None
+
+
+def stream_hf_rows(
+    dataset: str,
+    split: str = "train",
+    *,
+    max_samples: int | None = None,
+    seed: int = 42,
+) -> list[dict[str, Any]]:
+    """Load rows via HF streaming (no dataset scripts, no ``trust_remote_code``)."""
+    from datasets import load_dataset
+
+    print(
+        f"Loading dataset {dataset!r} (split={split}, streaming"
+        f"{f', max={max_samples}' if max_samples is not None else ''}) ..."
+    )
+    ds = load_dataset(dataset, split=split, streaming=True)
+    if max_samples is not None:
+        rows = reservoir_sample_stream(iter(ds), count=max_samples, seed=seed)
+    else:
+        rows = [dict(row) for row in ds]
+    print(f"  -> {len(rows):,} rows")
+    return rows
+
+
+def load_hf_rows(config: DataSourceConfig, *, seed: int = 42) -> list[dict[str, Any]]:
+    return stream_hf_rows(
+        config.dataset,
+        config.split,
+        max_samples=config.max_samples,
+        seed=seed,
+    )
+
+
+def load_jsonl_rows(path: str, max_samples: int | None = None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+            if max_samples is not None and len(rows) >= max_samples:
+                break
+    print(f"Loaded {len(rows):,} rows from {path}")
+    return rows
+
+
+def normalize_rows(
+    rows: list[dict[str, Any]],
+    image_column: str,
+    caption_column: str,
+) -> list[dict[str, Any]]:
+    """Map heterogeneous HF rows to unified ``image`` + ``caption`` keys."""
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        caption = pick_caption(row, caption_column)
+        if not caption:
+            raise ValueError(
+                f"Row missing caption in column {caption_column!r}: "
+                f"keys={sorted(row)}"
+            )
+        normalized.append({
+            "image": row[image_column],
+            "caption": caption,
+        })
+    return normalized
+
+
+def build_mixed_dataset(
+    satellite_rows: list[dict[str, Any]],
+    general_rows: list[dict[str, Any]],
+    satellite_fraction: float,
+    seed: int = 42,
+) -> list[dict[str, Any]]:
+    """Mix satellite and general rows per the stage-1 curriculum ratio."""
+    if not satellite_rows and not general_rows:
+        raise ValueError("No training rows available.")
+    if not satellite_rows or not general_rows:
+        return satellite_rows or general_rows
+
+    total = min(len(satellite_rows), len(general_rows)) * 2
+    n_sat = int(total * satellite_fraction)
+    n_gen = total - n_sat
+    rng = random.Random(seed)
+    sat = rng.sample(satellite_rows, min(n_sat, len(satellite_rows)))
+    gen = rng.sample(general_rows, min(n_gen, len(general_rows)))
+
+    mixed: list[dict[str, Any]] = []
+    sat_i = gen_i = 0
+    sat_every = max(1, round(1.0 / satellite_fraction)) if satellite_fraction > 0 else 10**9
+    while len(mixed) < total and (sat_i < len(sat) or gen_i < len(gen)):
+        if sat_i < len(sat) and (len(mixed) % sat_every == 0 or gen_i >= len(gen)):
+            mixed.append(sat[sat_i])
+            sat_i += 1
+        elif gen_i < len(gen):
+            mixed.append(gen[gen_i])
+            gen_i += 1
+        else:
+            break
+    rng.shuffle(mixed)
+    print(
+        f"Mixed dataset: {len(mixed):,} rows "
+        f"({satellite_fraction:.0%} satellite target)"
+    )
+    return mixed
+
+
+def load_stage1_training_rows(
+    *,
+    data_jsonl: str | None = None,
+    image_root: str | None = None,
+    satellite_dataset: str = DEFAULT_SATELLITE_DATASET,
+    satellite_split: str = DEFAULT_SATELLITE_SPLIT,
+    satellite_image_column: str = "image",
+    satellite_caption_column: str = "caption",
+    satellite_image_root: str | None = None,
+    general_dataset: str = DEFAULT_GENERAL_DATASET,
+    general_split: str = DEFAULT_GENERAL_SPLIT,
+    general_image_column: str = "image",
+    general_caption_column: str = DEFAULT_GENERAL_CAPTION_COLUMN,
+    satellite_fraction: float = 0.5,
+    max_satellite_samples: int | None = None,
+    max_general_samples: int | None = None,
+    seed: int = 42,
+    download_satellite_images: bool = False,
+) -> tuple[list[dict[str, Any]], str, str, str | None]:
+    """Return (rows, image_column, caption_column, image_root) for stage-1 training."""
+    if data_jsonl:
+        rows = load_jsonl_rows(data_jsonl, max_samples=None)
+        effective_root = image_root or satellite_image_root
+        validate_image_rows(rows, effective_root, label="JSONL")
+        return rows, "image", "caption", effective_root
+
+    explicit_sat_root = satellite_image_root or image_root
+    satellite_rows = normalize_rows(
+        load_hf_rows(
+            DataSourceConfig(
+                dataset=satellite_dataset,
+                split=satellite_split,
+                image_column=satellite_image_column,
+                caption_column=satellite_caption_column,
+                image_root=explicit_sat_root,
+                max_samples=max_satellite_samples,
+            ),
+            seed=seed,
+        ),
+        image_column=satellite_image_column,
+        caption_column=satellite_caption_column,
+    )
+    if satellite_dataset == DEFAULT_SATELLITE_DATASET and satellite_rows:
+        explicit_sat_root = resolve_chatearthnet_image_root(
+            satellite_rows,
+            explicit_root=explicit_sat_root,
+            download_if_missing=download_satellite_images,
+        )
+        validate_image_rows(
+            satellite_rows,
+            explicit_sat_root,
+            label="satellite",
+        )
+
+    general_rows = normalize_rows(
+        load_hf_rows(
+            DataSourceConfig(
+                dataset=general_dataset,
+                split=general_split,
+                image_column=general_image_column,
+                caption_column=general_caption_column,
+                max_samples=max_general_samples,
+            ),
+            seed=seed,
+        ),
+        image_column=general_image_column,
+        caption_column=general_caption_column,
+    )
+    validate_image_rows(general_rows, image_root=None, label="general")
+
+    mixed = build_mixed_dataset(
+        satellite_rows, general_rows, satellite_fraction, seed=seed
+    )
+    return mixed, "image", "caption", explicit_sat_root
+
+
+def reservoir_sample_stream(
+    dataset_iter: Iterator[dict[str, Any]],
+    count: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    rng = random.Random(seed)
+    reservoir: list[dict[str, Any]] = []
+    for i, row in enumerate(dataset_iter):
+        row = dict(row)
+        if i < count:
+            reservoir.append(row)
+        else:
+            j = rng.randint(0, i)
+            if j < count:
+                reservoir[j] = row
+    return reservoir
+
+
+def load_dataset_samples(
+    dataset: str,
+    split: str,
+    count: int,
+    seed: int,
+    image_column: str = "image",
+    caption_column: str | None = None,
+    image_root: str | None = None,
+) -> list[dict[str, Any]]:
+    """Sample ``count`` real image–caption pairs from a HuggingFace dataset."""
+    from datasets import load_dataset
+
+    print(f"Sampling {count:,} rows from {dataset!r} (split={split}) ...")
+    ds = load_dataset(dataset, split=split, streaming=True)
+    raw_rows = reservoir_sample_stream(iter(ds), count=count, seed=seed)
+    print(f"  -> collected {len(raw_rows):,} rows")
+
+    samples: list[dict[str, Any]] = []
+    skipped = 0
+    for row in raw_rows:
+        try:
+            image = load_pil_image(row[image_column], image_root=image_root)
+            caption = caption_from_row(row, caption_column)
+            if not caption:
+                raise ValueError(f"row has no caption (column={caption_column!r})")
+            samples.append({"image": image, "caption": caption})
+        except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+            skipped += 1
+            if skipped <= 3:
+                print(f"  skipped row: {exc}")
+    if skipped:
+        print(f"  skipped {skipped:,} rows without loadable image/caption pairs")
+    if not samples:
+        raise RuntimeError(
+            f"No images could be loaded from {dataset!r}. "
+            "For ChatEarthNet, pass --image-root to the directory of PNG files."
+        )
+    return samples
+
+
+def _load_yaml_mapping(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml
+
+        data = yaml.safe_load(text)
+    except ImportError:
+        data: dict[str, Any] = {}
+        section: str | None = None
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.endswith(":") and ":" not in line[:-1]:
+                section = line[:-1]
+                data.setdefault(section, {})
+                continue
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if section:
+                data[section][key] = value
+            else:
+                data[key] = value
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected mapping in {path}")
+    return data
+
+
+def load_openrouter_config(config_path: str | Path = DEFAULT_OPENROUTER_CONFIG) -> dict[str, str]:
+    """Load OpenRouter API settings from ``config.yml``."""
+    path = Path(config_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"OpenRouter config not found at {path}. "
+            "Create config.yml with openrouter.api_key and openrouter.model."
+        )
+    data = _load_yaml_mapping(path)
+    section = data.get("openrouter", data)
+    if not isinstance(section, dict):
+        raise ValueError(f"Missing openrouter section in {path}")
+    api_key = str(section.get("api_key", "")).strip()
+    model = str(section.get("model", "")).strip()
+    if not api_key or not model:
+        raise ValueError(
+            f"openrouter.api_key and openrouter.model are required in {path}"
+        )
+    return {"api_key": api_key, "model": model}
+
+
+def _parse_query_json(content: str) -> dict[str, str]:
+    text = content.strip()
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            chunk = part.strip()
+            if chunk.startswith("json"):
+                chunk = chunk[4:].strip()
+            if chunk.startswith("{"):
+                text = chunk
+                break
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError(f"No JSON object in model response: {content[:200]!r}")
+    payload = json.loads(text[start : end + 1])
+    related = str(payload.get("related_query", "")).strip()
+    unrelated = str(payload.get("unrelated_query", "")).strip()
+    if not related or not unrelated:
+        raise ValueError(f"Missing query fields in {payload!r}")
+    return {"related_query": related, "unrelated_query": unrelated}
+
+
+def openrouter_generate_queries(
+    caption: str,
+    *,
+    api_key: str,
+    model: str,
+    timeout: float = 60.0,
+) -> dict[str, str]:
+    """Ask OpenRouter for a related search query and an unrelated distractor."""
+    import urllib.error
+    import urllib.request
+
+    prompt = (
+        "You help train a text embedding model.\n"
+        "Given an image caption, return JSON only with two short English search "
+        "queries (2-8 words each):\n"
+        '{"related_query": "...", "unrelated_query": "..."}\n'
+        "related_query: what someone would type to find an image matching the caption.\n"
+        "unrelated_query: a query on a completely different topic; it must not "
+        "describe or relate to the caption.\n"
+        f"Caption: {caption}"
+    )
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 128,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"OpenRouter HTTP {exc.code}: {detail[:500]}"
+        ) from exc
+    choices = payload.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {payload!r}")
+    content = choices[0].get("message", {}).get("content", "")
+    return _parse_query_json(content)
+
+
+def load_query_cache(path: str | Path) -> dict[str, dict[str, str]]:
+    cache_path = Path(path)
+    cache: dict[str, dict[str, str]] = {}
+    if not cache_path.is_file():
+        return cache
+    with open(cache_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            caption = str(row.get(QUERY_CACHE_CAPTION_KEY, "")).strip()
+            if not caption:
+                continue
+            cache[caption] = {
+                QUERY_CACHE_RELATED_KEY: str(
+                    row.get(QUERY_CACHE_RELATED_KEY, "")
+                ).strip(),
+                QUERY_CACHE_UNRELATED_KEY: str(
+                    row.get(QUERY_CACHE_UNRELATED_KEY, "")
+                ).strip(),
+            }
+    return cache
+
+
+def save_query_cache(path: str | Path, cache: dict[str, dict[str, str]]) -> None:
+    cache_path = Path(path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as fh:
+        for caption in sorted(cache):
+            entry = cache[caption]
+            fh.write(json.dumps({
+                QUERY_CACHE_CAPTION_KEY: caption,
+                QUERY_CACHE_RELATED_KEY: entry[QUERY_CACHE_RELATED_KEY],
+                QUERY_CACHE_UNRELATED_KEY: entry[QUERY_CACHE_UNRELATED_KEY],
+            }, ensure_ascii=False) + "\n")
+
+
+def enrich_rows_with_text_queries(
+    rows: list[dict[str, Any]],
+    *,
+    config_path: str | Path = DEFAULT_OPENROUTER_CONFIG,
+    cache_path: str | Path = DEFAULT_QUERY_CACHE_PATH,
+    max_new_queries: int | None = None,
+    skip_generation: bool = False,
+    caption_column: str = "caption",
+) -> list[dict[str, Any]]:
+    """Attach related/unrelated search queries to each row (cached on disk)."""
+    cache = load_query_cache(cache_path)
+    config = load_openrouter_config(config_path)
+
+    unique_captions: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        caption = pick_caption(row, caption_column)
+        if caption and caption not in seen:
+            seen.add(caption)
+            unique_captions.append(caption)
+
+    missing = [c for c in unique_captions if c not in cache]
+    if max_new_queries is not None:
+        missing = missing[: max_new_queries]
+
+    if missing and skip_generation:
+        raise RuntimeError(
+            f"{len(missing)} captions lack cached queries at {cache_path}. "
+            "Run without --skip-query-generation or pre-fill the cache."
+        )
+
+    if missing:
+        print(
+            f"Generating text queries for {len(missing):,} captions via OpenRouter "
+            f"({config['model']}) ..."
+        )
+        for i, caption in enumerate(missing, start=1):
+            cache[caption] = openrouter_generate_queries(
+                caption,
+                api_key=config["api_key"],
+                model=config["model"],
+            )
+            if i == 1 or i % 25 == 0 or i == len(missing):
+                print(f"  generated {i:,}/{len(missing):,}")
+            if i % 50 == 0:
+                save_query_cache(cache_path, cache)
+        save_query_cache(cache_path, cache)
+        print(f"Saved query cache to {cache_path}")
+
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        caption = pick_caption(row, caption_column)
+        if caption not in cache:
+            raise KeyError(
+                f"No cached queries for caption {caption!r}. "
+                f"Cache at {cache_path} may be incomplete."
+            )
+        entry = cache[caption]
+        enriched.append({
+            **row,
+            QUERY_CACHE_RELATED_KEY: entry[QUERY_CACHE_RELATED_KEY],
+            QUERY_CACHE_UNRELATED_KEY: entry[QUERY_CACHE_UNRELATED_KEY],
+        })
+    print(
+        f"Attached text queries to {len(enriched):,} rows "
+        f"({len(unique_captions):,} unique captions)."
+    )
+    return enriched
+
+
+def load_verification_samples(
+    count: int = VERIFICATION_SAMPLE_COUNT,
+    seed: int = 42,
+    dataset: str = VERIFICATION_DATASET,
+    split: str = VERIFICATION_SPLIT,
+) -> list[dict[str, Any]]:
+    """Small real dataset slice for post-training checkpoint verification."""
+    return load_dataset_samples(
+        dataset=dataset,
+        split=split,
+        count=count,
+        seed=seed,
+        image_column="image",
+        caption_column=None,
+    )
+
+
+def _tokenize_text(tokenizer, text: str, max_text_length: int) -> dict[str, Any]:
+    return tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_text_length,
+        padding="max_length",
+    )
+
+
+class ImageCaptionDataset(Dataset):
+    """PyTorch dataset over pre-loaded image–caption rows."""
+
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        image_processor,
+        tokenizer,
+        image_column: str = "image",
+        caption_column: str = "caption",
+        image_root: str | None = None,
+        max_text_length: int = 512,
+        with_text_queries: bool = False,
+        related_query_column: str = QUERY_CACHE_RELATED_KEY,
+        unrelated_query_column: str = QUERY_CACHE_UNRELATED_KEY,
+    ):
+        self.rows = rows
+        self.image_processor = image_processor
+        self.tokenizer = tokenizer
+        self.image_column = image_column
+        self.caption_column = caption_column
+        self.image_root = image_root
+        self.max_text_length = max_text_length
+        self.with_text_queries = with_text_queries
+        self.related_query_column = related_query_column
+        self.unrelated_query_column = unrelated_query_column
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        row = self.rows[idx]
+        image = load_pil_image(row[self.image_column], self.image_root)
+        caption = pick_caption(row, self.caption_column)
+
+        pixel_values = self.image_processor(
+            images=image, return_tensors="pt"
+        )["pixel_values"][0]
+        text = _tokenize_text(self.tokenizer, caption, self.max_text_length)
+        sample = {
+            "pixel_values": pixel_values,
+            "input_ids": text["input_ids"][0],
+            "attention_mask": text["attention_mask"][0],
+        }
+        if self.with_text_queries:
+            related = str(row[self.related_query_column]).strip()
+            unrelated = str(row[self.unrelated_query_column]).strip()
+            if not related or not unrelated:
+                raise ValueError(
+                    f"Row {idx} is missing text queries "
+                    f"({self.related_query_column!r}, "
+                    f"{self.unrelated_query_column!r})."
+                )
+            related_text = _tokenize_text(
+                self.tokenizer, related, self.max_text_length
+            )
+            unrelated_text = _tokenize_text(
+                self.tokenizer, unrelated, self.max_text_length
+            )
+            sample["query_input_ids"] = related_text["input_ids"][0]
+            sample["query_attention_mask"] = related_text["attention_mask"][0]
+            sample["unrelated_input_ids"] = unrelated_text["input_ids"][0]
+            sample["unrelated_attention_mask"] = unrelated_text["attention_mask"][0]
+        return sample
+
+
+class Stage1Collator:
+    def __init__(self, pad_token_id: int, with_text_queries: bool = False):
+        self.pad_token_id = pad_token_id
+        self.with_text_queries = with_text_queries
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        import torch
+
+        batch = {
+            "pixel_values": torch.stack([f["pixel_values"] for f in features]),
+            "input_ids": torch.stack([f["input_ids"] for f in features]),
+            "attention_mask": torch.stack([f["attention_mask"] for f in features]),
+        }
+        if self.with_text_queries:
+            batch["query_input_ids"] = torch.stack(
+                [f["query_input_ids"] for f in features]
+            )
+            batch["query_attention_mask"] = torch.stack(
+                [f["query_attention_mask"] for f in features]
+            )
+            batch["unrelated_input_ids"] = torch.stack(
+                [f["unrelated_input_ids"] for f in features]
+            )
+            batch["unrelated_attention_mask"] = torch.stack(
+                [f["unrelated_attention_mask"] for f in features]
+            )
+        return batch

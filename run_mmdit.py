@@ -9,13 +9,19 @@ The model is only resized (un-trained), so the image is essentially noise --
 this just confirms the generator "turns on and runs".
 
 Run: python3 run_mmdit.py
+      python3 run_mmdit.py --phase 2   # once stage-2 generator weights exist
 Quit: type 'q', 'quit', 'exit', or send EOF (Ctrl-D).
 """
 
 import argparse
 import tempfile
 
-from trisearch_models import MMDiTGenerator
+from trisearch_models import (
+    MAX_TRAINING_PHASE,
+    MIN_TRAINING_PHASE,
+    MMDiTGenerator,
+    describe_phase,
+)
 
 
 def show_image(image):
@@ -32,8 +38,13 @@ def show_image(image):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phase", type=int, default=0,
+                        choices=range(MIN_TRAINING_PHASE, MAX_TRAINING_PHASE + 1),
+                        help="Training phase to load: 0=untrained seed, "
+                             "1-5=future trained generator stages.")
     parser.add_argument("--model-dir", default=None,
-                        help="Path to the MMDiT model directory.")
+                        help="Override the model directory (ignores --phase "
+                             "for backbone weights).")
     parser.add_argument("--height", type=int, default=640,
                         help="Output image height in pixels (default 640; "
                              "must be a multiple of 16).")
@@ -45,7 +56,13 @@ def main():
     args = parser.parse_args()
 
     print("Loading MMDiT generator (this may take a moment) ...")
-    kwargs = {"model_dir": args.model_dir} if args.model_dir else {}
+    if args.model_dir:
+        print(f"  model override: {args.model_dir}")
+    else:
+        print(f"  {describe_phase(args.phase, 'mmdit')}")
+    kwargs = {"phase": args.phase}
+    if args.model_dir:
+        kwargs["model_dir"] = args.model_dir
     generator = MMDiTGenerator(**kwargs)
     print("Ready. Enter a text prompt to generate an image.\n")
 
