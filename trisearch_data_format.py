@@ -36,10 +36,14 @@ Load with::
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import re
+import shutil
 import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -51,6 +55,8 @@ DEFAULT_DATASET_ROOT = Path("models/data/trisearch-v1")
 DOMAIN_GENERAL = "general"
 DOMAIN_SATELLITE = "satellite"
 VALID_DOMAINS = frozenset({DOMAIN_GENERAL, DOMAIN_SATELLITE})
+DEFAULT_WRITE_CHUNK = 256  # rows per parquet flush
+DEFAULT_EXPORT_WORKERS = 16  # parallel image/sidecar I/O during export
 
 REQUIRED_FIELDS = (
     "id",
@@ -217,9 +223,6 @@ def features_spec():
     })
 
 
-DEFAULT_WRITE_CHUNK = 64  # rows per parquet flush (keeps peak RAM bounded)
-
-
 def records_to_dataset(records: Iterable[dict[str, Any]]):
     """Build a HuggingFace ``Dataset`` from in-memory records (small batches only)."""
     from datasets import Dataset
@@ -257,6 +260,102 @@ def _write_info_and_card(
     )
 
 
+def _prepare_export_row(
+    row: dict[str, Any],
+    *,
+    write_sidecar_jpegs: bool,
+    images_root: Path,
+    jpeg_quality: int,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Materialize one row for parquet (+ optional sidecar). Thread-safe.
+
+    Prefers raw staged JPEG bytes (no PIL decode/re-encode) when
+    ``image_path`` points at a ``.jpg`` already produced by staging.
+    """
+    rid = str(row["id"])
+    domain = str(row["domain"])
+    source = str(row["source"])
+    captions = list(row["captions"])
+    query = str(row["query"])
+    unrelated = str(row["unrelated_query"])
+
+    if domain not in VALID_DOMAINS:
+        raise ValueError(
+            f"domain must be one of {sorted(VALID_DOMAINS)}, got {domain!r}"
+        )
+    if not isinstance(captions, list) or len(captions) < 2:
+        raise ValueError(f"captions must be a list of ≥2 strings for {rid}")
+    if not query.strip() or not unrelated.strip() or not source.strip():
+        raise ValueError(f"empty text field for {rid}")
+
+    jpeg_bytes: bytes | None = None
+    src_path = row.get("image_path")
+    pil = row.get("image")
+
+    if isinstance(pil, Image.Image):
+        if pil.size != (image_size, image_size):
+            pil = resize_square_rgb(pil, image_size)
+        buf = io.BytesIO()
+        pil.save(buf, format="JPEG", quality=jpeg_quality)
+        jpeg_bytes = buf.getvalue()
+        image_field: Any = {"bytes": jpeg_bytes, "path": f"{rid}.jpg"}
+    elif src_path:
+        path = Path(str(src_path))
+        if not path.is_file():
+            raise FileNotFoundError(f"{rid}: missing image {path}")
+        suffix = path.suffix.lower()
+        if suffix in {".jpg", ".jpeg"}:
+            # Staging already wrote correct-size JPEGs — copy bytes as-is.
+            jpeg_bytes = path.read_bytes()
+            if len(jpeg_bytes) < 512:
+                raise ValueError(f"{rid}: image too small ({len(jpeg_bytes)} B)")
+            image_field = {"bytes": jpeg_bytes, "path": path.name}
+        else:
+            pil_img = Image.open(path).convert("RGB")
+            if pil_img.size != (image_size, image_size):
+                pil_img = resize_square_rgb(pil_img, image_size)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=jpeg_quality)
+            jpeg_bytes = buf.getvalue()
+            image_field = {"bytes": jpeg_bytes, "path": f"{rid}.jpg"}
+    else:
+        raise ValueError(f"Row {rid} missing image/image_path")
+
+    rec = {
+        "id": rid,
+        "domain": domain,
+        "source": source,
+        "captions": captions,
+        "query": query,
+        "unrelated_query": unrelated,
+        "image": image_field,
+    }
+
+    meta: dict[str, Any] | None = None
+    if write_sidecar_jpegs:
+        side = images_root / domain / f"{rid}.jpg"
+        if src_path and Path(str(src_path)).is_file() and Path(str(src_path)).suffix.lower() in {
+            ".jpg",
+            ".jpeg",
+        }:
+            # copyfile is faster than copy2 (no metadata syscalls).
+            shutil.copyfile(str(src_path), side)
+        else:
+            assert jpeg_bytes is not None
+            side.write_bytes(jpeg_bytes)
+        meta = {
+            "file_name": f"images/{domain}/{rid}.jpg",
+            "id": rid,
+            "domain": domain,
+            "source": source,
+            "captions": captions,
+            "query": query,
+            "unrelated_query": unrelated,
+        }
+    return rec, meta
+
+
 def save_dataset_streaming(
     staged_rows: Sequence[dict[str, Any]],
     output_dir: str | Path,
@@ -265,6 +364,7 @@ def save_dataset_streaming(
     write_sidecar_jpegs: bool = True,
     jpeg_quality: int = 92,
     write_hf_arrow: bool = True,
+    workers: int = DEFAULT_EXPORT_WORKERS,
 ) -> Path:
     """Write dataset from staged rows without loading all images at once.
 
@@ -272,17 +372,17 @@ def save_dataset_streaming(
       - ``image``: PIL.Image, or
       - ``image_path``: path to a JPEG/PNG on disk (preferred; low RAM)
 
-    Images are opened, written into parquet shards of ``chunk_size``, then
-    released. Peak memory is O(chunk_size) images, not O(N).
+    Row prep + sidecar copies run in a thread pool (``workers``, default 16).
+    Staged JPEGs are embedded as raw bytes (no PIL re-encode). Peak memory is
+    O(chunk_size) rows, not O(N).
     """
     import gc
-    import shutil
 
     from datasets import Dataset
 
     output_dir = Path(output_dir)
     if output_dir.exists():
-        # Remove previous export contents carefully (keep parent).
+        # Remove previous export contents carefully (keep parent / progress cache).
         for name in ("data", "hf", "images", "metadata.jsonl",
                      "dataset_info.json", "README.md"):
             p = output_dir / name
@@ -299,51 +399,31 @@ def save_dataset_streaming(
         raise ValueError("No records to export")
     if chunk_size < 1:
         raise ValueError("chunk_size must be >= 1")
+    n_workers = max(1, min(int(workers), 16))
 
     domains: dict[str, int] = {"general": 0, "satellite": 0}
     sources: dict[str, int] = {}
     meta_path = output_dir / "metadata.jsonl"
     parquet_paths: list[Path] = []
-    chunk: list[dict[str, Any]] = []
     total = 0
     shard_i = 0
 
-    def _materialize(row: dict[str, Any]) -> dict[str, Any]:
-        image = row.get("image")
-        if image is None:
-            path = row.get("image_path")
-            if not path:
-                raise ValueError(f"Row {row.get('id')} missing image/image_path")
-            image = Image.open(path).convert("RGB")
-        if image.size != (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE):
-            image = resize_square_rgb(image, DEFAULT_IMAGE_SIZE)
-        rec = {
-            "id": str(row["id"]),
-            "domain": str(row["domain"]),
-            "source": str(row["source"]),
-            "captions": list(row["captions"]),
-            "query": str(row["query"]),
-            "unrelated_query": str(row["unrelated_query"]),
-            "image": image,
-        }
-        validate_record(rec, require_image=True)
-        return rec
+    if write_sidecar_jpegs:
+        (images_root / DOMAIN_GENERAL).mkdir(parents=True, exist_ok=True)
+        (images_root / DOMAIN_SATELLITE).mkdir(parents=True, exist_ok=True)
 
-    def _flush() -> None:
-        nonlocal chunk, shard_i, total
+    def _flush(chunk: list[dict[str, Any]]) -> None:
+        nonlocal shard_i, total
         if not chunk:
             return
         ds = Dataset.from_list(chunk, features=features_spec())
-        # Unknown final shard count: write provisional names, rename later.
         out = data_dir / f"train-part-{shard_i:05d}.parquet"
         ds.to_parquet(str(out))
         parquet_paths.append(out)
         shard_i += 1
         total += len(chunk)
-        # Drop PIL refs
         for r in chunk:
             r["image"] = None
-        chunk = []
         del ds
         gc.collect()
 
@@ -351,131 +431,88 @@ def save_dataset_streaming(
     t0 = time.monotonic()
     print(
         f"  export: writing {n_total:,} rows (chunk={chunk_size}, "
-        f"sidecars={write_sidecar_jpegs}) ...",
+        f"sidecars={write_sidecar_jpegs}, workers={n_workers}) ...",
         flush=True,
     )
-    with open(meta_path, "w", encoding="utf-8") as meta_fh:
-        for row_i, row in enumerate(staged_rows):
-            rec = _materialize(row)
-            domains[rec["domain"]] = domains.get(rec["domain"], 0) + 1
-            sources[rec["source"]] = sources.get(rec["source"], 0) + 1
 
-            if write_sidecar_jpegs:
-                side = images_root / rec["domain"] / f"{rec['id']}.jpg"
-                side.parent.mkdir(parents=True, exist_ok=True)
-                # Prefer already-staged jpeg copy when present.
-                src_path = row.get("image_path")
-                if src_path and Path(src_path).is_file():
-                    shutil.copy2(src_path, side)
-                else:
-                    rec["image"].save(side, format="JPEG", quality=jpeg_quality)
-                meta_fh.write(json.dumps({
-                    "file_name": f"images/{rec['domain']}/{rec['id']}.jpg",
-                    "id": rec["id"],
-                    "domain": rec["domain"],
-                    "source": rec["source"],
-                    "captions": rec["captions"],
-                    "query": rec["query"],
-                    "unrelated_query": rec["unrelated_query"],
-                }, ensure_ascii=False) + "\n")
+    def _prep(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        return _prepare_export_row(
+            row,
+            write_sidecar_jpegs=write_sidecar_jpegs,
+            images_root=images_root,
+            jpeg_quality=jpeg_quality,
+        )
 
-            chunk.append(rec)
-            if len(chunk) >= chunk_size:
-                _flush()
-                # Log every flush (chunk_size rows) with rate/ETA.
-                elapsed = max(time.monotonic() - t0, 1e-6)
-                rate = total / elapsed
-                eta = (n_total - total) / rate if rate > 0 else 0
-                print(
-                    f"  wrote {total:,}/{n_total:,} rows "
-                    f"({rate:.1f}/s, ETA {eta / 60:.1f} min, "
-                    f"shard {shard_i})",
-                    flush=True,
-                )
+    with open(meta_path, "w", encoding="utf-8") as meta_fh, ThreadPoolExecutor(
+        max_workers=n_workers
+    ) as pool:
+        for start in range(0, n_total, chunk_size):
+            batch_rows = staged_rows[start : start + chunk_size]
+            # Parallel I/O: read staged JPEGs + write sidecars.
+            prepared = list(pool.map(_prep, batch_rows))
+            chunk: list[dict[str, Any]] = []
+            for rec, meta in prepared:
+                domains[rec["domain"]] = domains.get(rec["domain"], 0) + 1
+                sources[rec["source"]] = sources.get(rec["source"], 0) + 1
+                if meta is not None:
+                    meta_fh.write(
+                        json.dumps(meta, ensure_ascii=False) + "\n"
+                    )
+                chunk.append(rec)
+            _flush(chunk)
+            elapsed = max(time.monotonic() - t0, 1e-6)
+            rate = total / elapsed
+            eta = (n_total - total) / rate if rate > 0 else 0
+            print(
+                f"  wrote {total:,}/{n_total:,} rows "
+                f"({rate:.1f}/s, ETA {eta / 60:.1f} min, "
+                f"shard {shard_i})",
+                flush=True,
+            )
 
-        _flush()
-        print(f"  parquet pass complete: {total:,} rows", flush=True)
+    print(f"  parquet pass complete: {total:,} rows", flush=True)
 
     # Rename parts to train-XXXXX-of-YYYYY.parquet
     n_shards = len(parquet_paths)
+    final_paths: list[Path] = []
     for i, path in enumerate(parquet_paths):
         final = data_dir / f"train-{i:05d}-of-{n_shards:05d}.parquet"
         path.rename(final)
+        final_paths.append(final)
 
-    # Optional Arrow export for load_from_disk. Prefer parquet + metadata.jsonl
-    # for large sets (loaders already support both).
+    # Optional Arrow export for load_from_disk. Build from parquet (already
+    # has embedded JPEG bytes) — do NOT re-decode sidecars row-by-row.
     hf_dir = output_dir / "hf"
     if hf_dir.exists():
         shutil.rmtree(hf_dir)
 
-    if write_hf_arrow and write_sidecar_jpegs and meta_path.is_file():
+    if write_hf_arrow and final_paths:
         print(
-            f"  building hf/ Arrow export from sidecars ({total:,} images) ...",
+            f"  building hf/ from {n_shards} parquet shard(s) ...",
             flush=True,
         )
         t_hf = time.monotonic()
-        progress = {"n": 0}
+        from datasets import concatenate_datasets
 
-        def _gen():
-            with open(meta_path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    meta = json.loads(line)
-                    img = Image.open(output_dir / meta["file_name"]).convert("RGB")
-                    progress["n"] += 1
-                    if progress["n"] == 1 or progress["n"] % 500 == 0:
-                        elapsed = max(time.monotonic() - t_hf, 1e-6)
-                        rate = progress["n"] / elapsed
-                        eta = (total - progress["n"]) / rate if rate > 0 else 0
-                        print(
-                            f"    hf arrow {progress['n']:,}/{total:,} "
-                            f"({rate:.1f}/s, ETA {eta / 60:.1f} min)",
-                            flush=True,
-                        )
-                    yield {
-                        "id": meta["id"],
-                        "domain": meta["domain"],
-                        "source": meta["source"],
-                        "captions": meta["captions"],
-                        "query": meta["query"],
-                        "unrelated_query": meta["unrelated_query"],
-                        "image": img,
-                    }
+        # Load shards (images stay as encoded bytes; no PIL re-encode).
+        if n_shards == 1:
+            ds = Dataset.from_parquet(str(final_paths[0]))
+        else:
+            # Parallel shard loads are I/O bound; cap like export workers.
+            def _load_shard(p: Path):
+                return Dataset.from_parquet(str(p))
 
-        ds = Dataset.from_generator(_gen, features=features_spec())
+            with ThreadPoolExecutor(max_workers=min(n_workers, n_shards)) as pool:
+                shards = list(pool.map(_load_shard, final_paths))
+            ds = concatenate_datasets(shards)
+            del shards
         print("  saving hf/ to disk ...", flush=True)
         ds.save_to_disk(str(hf_dir))
         del ds
         gc.collect()
-        print(
-            f"  hf/ done in {time.monotonic() - t_hf:.1f}s",
-            flush=True,
-        )
-    elif write_hf_arrow:
-        print("  building hf/ from parquet shards ...", flush=True)
-        t_hf = time.monotonic()
-        progress = {"n": 0}
-
-        def _gen_pq():
-            for i in range(n_shards):
-                p = data_dir / f"train-{i:05d}-of-{n_shards:05d}.parquet"
-                print(f"    reading shard {i + 1}/{n_shards}: {p.name}", flush=True)
-                shard = Dataset.from_parquet(str(p))
-                for ex in shard:
-                    progress["n"] += 1
-                    if progress["n"] % 500 == 0:
-                        print(f"    hf arrow {progress['n']:,}/{total:,}", flush=True)
-                    yield ex
-                del shard
-                gc.collect()
-
-        ds = Dataset.from_generator(_gen_pq, features=features_spec())
-        ds.save_to_disk(str(hf_dir))
-        del ds
-        gc.collect()
         print(f"  hf/ done in {time.monotonic() - t_hf:.1f}s", flush=True)
+    elif write_hf_arrow:
+        print("  warning: no parquet shards; skipping hf/", flush=True)
 
     _write_info_and_card(
         output_dir, num_rows=total, domains=domains, sources=sources
@@ -496,6 +533,7 @@ def save_dataset(
     write_sidecar_jpegs: bool = True,
     chunk_size: int = DEFAULT_WRITE_CHUNK,
     write_hf_arrow: bool = True,
+    workers: int = DEFAULT_EXPORT_WORKERS,
 ) -> Path:
     """Write HF dataset. Delegates to streaming saver (bounded RAM)."""
     del max_shard_size  # kept for call-site compatibility
@@ -505,6 +543,185 @@ def save_dataset(
         chunk_size=chunk_size,
         write_sidecar_jpegs=write_sidecar_jpegs,
         write_hf_arrow=write_hf_arrow,
+        workers=workers,
+    )
+
+
+DEFAULT_IMAGE_CACHE_SIZE = 64
+
+
+def _meta_fields_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Text fields shared by sidecar metadata and parquet/HF rows."""
+    return {
+        "id": str(row["id"]),
+        "domain": str(row["domain"]),
+        "source": str(row["source"]),
+        "captions": list(row["captions"]),
+        "query": str(row["query"]),
+        "unrelated_query": str(row["unrelated_query"]),
+    }
+
+
+def _load_meta_lines(
+    meta_path: Path,
+    *,
+    max_samples: int | None = None,
+) -> list[dict[str, Any]]:
+    """Parse ``metadata.jsonl`` without touching image files."""
+    metas: list[dict[str, Any]] = []
+    with open(meta_path, encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            if max_samples is not None and i >= max_samples:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            metas.append(json.loads(line))
+    return metas
+
+
+def _as_rgb_image(image: Any) -> Image.Image:
+    if isinstance(image, Image.Image):
+        return image.convert("RGB")
+    from trisearch_dataset import load_pil_image
+
+    return load_pil_image(image).convert("RGB")
+
+
+class LazyTriSearchDataset:
+    """Random-access curated dataset: metadata in RAM, images on demand.
+
+    Prefer ``metadata.jsonl`` + ``images/`` sidecars (fast path). Falls back to
+    HF Arrow disk or parquet shards with random indexing. Recently viewed
+    images are kept in a small LRU cache so paging does not re-decode every time.
+    """
+
+    def __init__(
+        self,
+        dataset_dir: str | Path,
+        *,
+        max_samples: int | None = None,
+        image_cache_size: int = DEFAULT_IMAGE_CACHE_SIZE,
+    ) -> None:
+        root = Path(dataset_dir)
+        if not root.exists():
+            raise FileNotFoundError(f"Dataset not found at {root}")
+        if image_cache_size < 0:
+            raise ValueError(f"image_cache_size must be >= 0, got {image_cache_size}")
+
+        self.root = root
+        self._image_cache_size = image_cache_size
+        self._image_cache: OrderedDict[int, Image.Image] = OrderedDict()
+        self._backend: str
+        self._metas: list[dict[str, Any]] = []
+        self._hf_ds: Any = None
+
+        meta_path = root / "metadata.jsonl"
+        if meta_path.is_file() and (root / "images").is_dir():
+            self._backend = "sidecar"
+            self._metas = _load_meta_lines(meta_path, max_samples=max_samples)
+            if not self._metas:
+                raise ValueError(f"Empty metadata at {meta_path}")
+            return
+
+        from datasets import load_from_disk, load_dataset
+
+        if (root / "hf").is_dir():
+            self._backend = "hf"
+            self._hf_ds = load_from_disk(str(root / "hf"))
+        elif (root / "data").is_dir() and any((root / "data").glob("*.parquet")):
+            self._backend = "parquet"
+            self._hf_ds = load_dataset(
+                "parquet",
+                data_files=str(root / "data" / "*.parquet"),
+                split="train",
+            )
+        else:
+            raise FileNotFoundError(
+                f"No TriSearch dataset at {root} "
+                f"(expected metadata.jsonl+images/, hf/, or data/*.parquet)"
+            )
+
+        n = len(self._hf_ds)
+        if max_samples is not None:
+            n = min(n, max_samples)
+        # Text columns only — never touch the image column during open.
+        text_cols = [
+            c
+            for c in (
+                "id",
+                "domain",
+                "source",
+                "captions",
+                "query",
+                "unrelated_query",
+            )
+            if c in self._hf_ds.column_names
+        ]
+        meta_view = self._hf_ds.select(range(n)).select_columns(text_cols)
+        self._metas = [_meta_fields_from_row(row) for row in meta_view]
+        if not self._metas:
+            raise ValueError(f"Empty dataset at {root}")
+
+    def __len__(self) -> int:
+        return len(self._metas)
+
+    def meta(self, index: int) -> dict[str, Any]:
+        """Return text fields only (no image I/O)."""
+        if index < 0 or index >= len(self._metas):
+            raise IndexError(index)
+        m = self._metas[index]
+        if self._backend == "sidecar":
+            return _meta_fields_from_row(m)
+        return dict(m)
+
+    def _decode_image(self, index: int) -> Image.Image:
+        if self._backend == "sidecar":
+            m = self._metas[index]
+            img_path = self.root / m["file_name"]
+            # load() forces pixels into RAM then closes the file handle.
+            with Image.open(img_path) as im:
+                return im.convert("RGB")
+        row = self._hf_ds[index]
+        return _as_rgb_image(row["image"])
+
+    def get_image(self, index: int) -> Image.Image:
+        """Load (or return cached) RGB image for ``index``."""
+        if index < 0 or index >= len(self._metas):
+            raise IndexError(index)
+        if index in self._image_cache:
+            self._image_cache.move_to_end(index)
+            return self._image_cache[index]
+
+        image = self._decode_image(index)
+        if self._image_cache_size > 0:
+            self._image_cache[index] = image
+            while len(self._image_cache) > self._image_cache_size:
+                self._image_cache.popitem(last=False)
+        return image
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Full record including image (lazy decode + LRU cache)."""
+        rec = self.meta(index)
+        rec["image"] = self.get_image(index)
+        validate_record(rec, require_image=True)
+        return rec
+
+    def clear_image_cache(self) -> None:
+        self._image_cache.clear()
+
+
+def open_lazy_dataset(
+    dataset_dir: str | Path,
+    *,
+    max_samples: int | None = None,
+    image_cache_size: int = DEFAULT_IMAGE_CACHE_SIZE,
+) -> LazyTriSearchDataset:
+    """Open a curated dataset for random access without loading all images."""
+    return LazyTriSearchDataset(
+        dataset_dir,
+        max_samples=max_samples,
+        image_cache_size=image_cache_size,
     )
 
 
@@ -513,74 +730,18 @@ def load_dataset_records(
     *,
     max_samples: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Load curated TriSearch dataset from ``save_dataset`` output.
+    """Load curated TriSearch dataset fully into memory (images decoded).
 
-    Prefer ``metadata.jsonl`` + sidecar JPEGs when present (random access,
-    lower overhead than decoding every parquet row). ``max_samples`` stops early.
+    Prefer :class:`LazyTriSearchDataset` / :func:`open_lazy_dataset` for
+    browsing large exports. This helper materializes every row (used by
+    tests and training loaders that need the full list).
     """
-    from datasets import load_from_disk, load_dataset
-
-    root = Path(dataset_dir)
-    meta_path = root / "metadata.jsonl"
-    records: list[dict[str, Any]] = []
-
-    if meta_path.is_file() and (root / "images").is_dir():
-        with open(meta_path, encoding="utf-8") as fh:
-            for i, line in enumerate(fh):
-                if max_samples is not None and i >= max_samples:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                meta = json.loads(line)
-                img_path = root / meta["file_name"]
-                image = Image.open(img_path).convert("RGB")
-                rec = {
-                    "id": str(meta["id"]),
-                    "domain": str(meta["domain"]),
-                    "source": str(meta["source"]),
-                    "captions": list(meta["captions"]),
-                    "query": str(meta["query"]),
-                    "unrelated_query": str(meta["unrelated_query"]),
-                    "image": image,
-                }
-                validate_record(rec, require_image=True)
-                records.append(rec)
-        return records
-
-    if (root / "hf").is_dir():
-        ds = load_from_disk(str(root / "hf"))
-    elif (root / "data").is_dir() and any((root / "data").glob("*.parquet")):
-        ds = load_dataset(
-            "parquet",
-            data_files=str(root / "data" / "*.parquet"),
-            split="train",
-        )
-    else:
-        raise FileNotFoundError(
-            f"No TriSearch dataset at {root} (expected hf/ or data/*.parquet)"
-        )
-
-    for i, row in enumerate(ds):
-        if max_samples is not None and i >= max_samples:
-            break
-        image = row["image"]
-        if not isinstance(image, Image.Image):
-            from trisearch_dataset import load_pil_image
-
-            image = load_pil_image(image)
-        rec = {
-            "id": str(row["id"]),
-            "domain": str(row["domain"]),
-            "source": str(row["source"]),
-            "captions": list(row["captions"]),
-            "query": str(row["query"]),
-            "unrelated_query": str(row["unrelated_query"]),
-            "image": image.convert("RGB"),
-        }
-        validate_record(rec, require_image=True)
-        records.append(rec)
-    return records
+    lazy = open_lazy_dataset(
+        dataset_dir,
+        max_samples=max_samples,
+        image_cache_size=0,  # no cache; we keep every image on the record list
+    )
+    return [lazy[i] for i in range(len(lazy))]
 
 
 def _dataset_card_markdown(info: dict[str, Any]) -> str:

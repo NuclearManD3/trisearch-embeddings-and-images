@@ -29,9 +29,12 @@ import csv
 import gc
 import io
 import json
+import os
 import random
 import shutil
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -41,6 +44,7 @@ from PIL import Image
 
 from trisearch_data_format import (
     DEFAULT_DATASET_ROOT,
+    DEFAULT_EXPORT_WORKERS,
     DEFAULT_IMAGE_SIZE,
     DEFAULT_WRITE_CHUNK,
     DOMAIN_GENERAL,
@@ -104,13 +108,16 @@ def record_stable_key(rec: dict[str, Any]) -> str:
 class ProgressStore:
     """JSON progress file: captions + queries per staged image.
 
-    Written atomically; safe to resume after Ctrl-C or a failed API batch.
+    Thread-safe. Writes use unique temp files + ``os.replace`` so concurrent
+    flushes (main thread + worker fallbacks) cannot race on a shared ``.tmp``.
+    Safe to resume after Ctrl-C or a failed API batch.
     """
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.data: dict[str, dict[str, Any]] = {}
         self._dirty = 0
+        self._lock = threading.RLock()
         if self.path.is_file():
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -122,8 +129,9 @@ class ProgressStore:
                 self.data = {}
 
     def get(self, key: str) -> dict[str, Any] | None:
-        ent = self.data.get(key)
-        return ent if isinstance(ent, dict) else None
+        with self._lock:
+            ent = self.data.get(key)
+            return ent if isinstance(ent, dict) else None
 
     def captions_done(self, key: str) -> bool:
         ent = self.get(key)
@@ -138,13 +146,14 @@ class ProgressStore:
             and str(ent.get("unrelated_query", "")).strip()
         )
 
-    def set_captions(self, key: str, captions: list[str], *, flush_every: int = 25) -> None:
-        ent = self.data.setdefault(key, {})
-        ent["captions"] = list(captions)
-        ent["captions_done"] = True
-        self._dirty += 1
-        if self._dirty >= flush_every:
-            self.save()
+    def set_captions(self, key: str, captions: list[str], *, flush_every: int = 50) -> None:
+        with self._lock:
+            ent = self.data.setdefault(key, {})
+            ent["captions"] = list(captions)
+            ent["captions_done"] = True
+            self._dirty += 1
+            if self._dirty >= flush_every:
+                self._save_unlocked()
 
     def set_queries(
         self,
@@ -152,48 +161,66 @@ class ProgressStore:
         query: str,
         unrelated_query: str,
         *,
-        flush_every: int = 25,
+        flush_every: int = 50,
     ) -> None:
-        ent = self.data.setdefault(key, {})
-        ent["query"] = query
-        ent["unrelated_query"] = unrelated_query
-        ent["queries_done"] = True
-        self._dirty += 1
-        if self._dirty >= flush_every:
-            self.save()
+        with self._lock:
+            ent = self.data.setdefault(key, {})
+            ent["query"] = query
+            ent["unrelated_query"] = unrelated_query
+            ent["queries_done"] = True
+            self._dirty += 1
+            if self._dirty >= flush_every:
+                self._save_unlocked()
 
     def save(self) -> None:
+        with self._lock:
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
+        """Caller must hold ``self._lock``. Unique tmp avoids multi-thread clobber."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(self.data, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
+        # Snapshot under the lock so a concurrent set_* cannot mutate mid-dump.
+        payload = json.dumps(self.data, ensure_ascii=False, separators=(",", ":"))
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=str(self.path.parent),
         )
-        tmp.replace(self.path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         self._dirty = 0
 
     def apply_to_records(self, records: list[dict[str, Any]]) -> tuple[int, int]:
         """Merge cache into records. Returns (n_captions_restored, n_queries_restored)."""
         n_cap = n_q = 0
-        for rec in records:
-            key = record_stable_key(rec)
-            rec["_key"] = key
-            ent = self.get(key)
-            if not ent:
-                continue
-            if ent.get("captions_done") and ent.get("captions"):
-                rec["captions"] = list(ent["captions"])
-                rec["_captions_done"] = True
-                n_cap += 1
-            if (
-                ent.get("queries_done")
-                and str(ent.get("query", "")).strip()
-                and str(ent.get("unrelated_query", "")).strip()
-            ):
-                rec["query"] = str(ent["query"])
-                rec["unrelated_query"] = str(ent["unrelated_query"])
-                rec["_queries_done"] = True
-                n_q += 1
+        with self._lock:
+            for rec in records:
+                key = record_stable_key(rec)
+                rec["_key"] = key
+                ent = self.data.get(key)
+                if not isinstance(ent, dict):
+                    continue
+                if ent.get("captions_done") and ent.get("captions"):
+                    rec["captions"] = list(ent["captions"])
+                    rec["_captions_done"] = True
+                    n_cap += 1
+                if (
+                    ent.get("queries_done")
+                    and str(ent.get("query", "")).strip()
+                    and str(ent.get("unrelated_query", "")).strip()
+                ):
+                    rec["query"] = str(ent["query"])
+                    rec["unrelated_query"] = str(ent["unrelated_query"])
+                    rec["_queries_done"] = True
+                    n_q += 1
         return n_cap, n_q
 
 
@@ -1019,15 +1046,18 @@ def attach_queries(
     )
 
     def _offline_query(item: dict[str, Any]) -> None:
+        """Fill item fields only — progress is persisted on the main thread."""
         caps = item["captions"]
         item["query"] = caps[1] if len(caps) > 1 else caps[0]
         item["unrelated_query"] = "red sports car on a racetrack at night"
         item["_queries_done"] = True
-        if progress is not None:
-            progress.set_queries(item["_key"], item["query"], item["unrelated_query"])
 
     def work(batch: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
-        """Return (updated batch items, error or None). Never raises."""
+        """Return (updated batch items, error or None). Never raises.
+
+        Does not touch ProgressStore (thread safety + avoid double-write races);
+        the main-thread consumer persists after ``fut.result()``.
+        """
         captions = [b["captions"][0] for b in batch]
         try:
             if len(captions) == 1:
@@ -1247,7 +1277,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE,
                    help=f"Output square size (default {DEFAULT_IMAGE_SIZE}).")
     p.add_argument("--write-chunk", type=int, default=DEFAULT_WRITE_CHUNK,
-                   help="Rows per parquet flush (default 64; lower = less RAM).")
+                   help=f"Rows per parquet flush (default {DEFAULT_WRITE_CHUNK}).")
+    p.add_argument(
+        "--export-workers",
+        type=int,
+        default=DEFAULT_EXPORT_WORKERS,
+        help=f"Parallel workers for export I/O (sidecar copy + JPEG bytes; "
+             f"default {DEFAULT_EXPORT_WORKERS}, max 16).",
+    )
     p.add_argument("--stage-workers", type=int, default=DEFAULT_STAGE_WORKERS,
                    help="Parallel workers for image resize/JPEG staging.")
     p.add_argument(
@@ -1409,6 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
         chunk_size=args.write_chunk,
         write_sidecar_jpegs=not args.no_sidecar_jpegs,
         write_hf_arrow=not args.no_hf_arrow,
+        workers=args.export_workers,
     )
     _phase_done(t_exp, "EXPORT")
 

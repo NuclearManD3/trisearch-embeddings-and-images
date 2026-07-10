@@ -6,6 +6,9 @@ Browse a curated TriSearch dataset (from generate_datasets.py).
   python3 view_dataset.py --dataset-dir models/data/trisearch-v1 --port 7861
 
 Shows image, domain tag, captions, query, and unrelated_query with paging.
+
+Images and parquet rows are loaded on demand (metadata is indexed once;
+recent images stay in a small LRU cache).
 """
 
 from __future__ import annotations
@@ -13,15 +16,35 @@ from __future__ import annotations
 import argparse
 import html
 from pathlib import Path
+from typing import Any, Protocol, Sequence
 
-from trisearch_data_format import DEFAULT_DATASET_ROOT, load_dataset_records
+from trisearch_data_format import (
+    DEFAULT_DATASET_ROOT,
+    DEFAULT_IMAGE_CACHE_SIZE,
+    open_lazy_dataset,
+)
+
+
+class _RecordSequence(Protocol):
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> dict[str, Any]: ...
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_ROOT)
-    p.add_argument("--max-load", type=int, default=None,
-                   help="Only load first N rows into memory (default: all).")
+    p.add_argument(
+        "--max-load",
+        type=int,
+        default=None,
+        help="Only index first N rows (default: all). Images still load on demand.",
+    )
+    p.add_argument(
+        "--image-cache-size",
+        type=int,
+        default=DEFAULT_IMAGE_CACHE_SIZE,
+        help=f"LRU cache of decoded images (default: {DEFAULT_IMAGE_CACHE_SIZE}).",
+    )
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7861)
     p.add_argument("--share", action="store_true")
@@ -56,8 +79,12 @@ def _card_html(rec: dict, index: int, total: int) -> str:
     """
 
 
-def build_viewer(records: list[dict]):
-    """Build Gradio Blocks UI. Avoid gr.State constants as event inputs (Gradio 5 bug)."""
+def build_viewer(records: Sequence[dict] | _RecordSequence):
+    """Build Gradio Blocks UI. Avoid gr.State constants as event inputs (Gradio 5 bug).
+
+    ``records`` may be a plain list or a :class:`LazyTriSearchDataset` — only
+    ``records[index]`` is accessed, so images decode on demand.
+    """
     import gradio as gr
 
     n = len(records)
@@ -88,7 +115,7 @@ def build_viewer(records: list[dict]):
     with gr.Blocks(title="TriSearch dataset viewer") as demo:
         gr.Markdown(
             f"## TriSearch dataset viewer\n"
-            f"**{n:,}** items loaded"
+            f"**{n:,}** items (images load on demand)"
         )
         with gr.Row():
             prev_btn = gr.Button("← Prev")
@@ -136,11 +163,19 @@ def main() -> None:
             f"Run: python3 generate_datasets.py --preview --skip-query-generation"
         )
 
-    print(f"Loading {args.dataset_dir} ...", flush=True)
-    records = load_dataset_records(args.dataset_dir, max_samples=args.max_load)
-    if not records:
+    print(f"Indexing {args.dataset_dir} (metadata only) ...", flush=True)
+    records = open_lazy_dataset(
+        args.dataset_dir,
+        max_samples=args.max_load,
+        image_cache_size=args.image_cache_size,
+    )
+    if not len(records):
         raise SystemExit("Dataset is empty.")
-    print(f"  {len(records):,} records", flush=True)
+    print(
+        f"  {len(records):,} records indexed "
+        f"(image cache size={args.image_cache_size})",
+        flush=True,
+    )
 
     demo = build_viewer(records)
 

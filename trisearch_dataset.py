@@ -957,6 +957,65 @@ def openrouter_generate_queries(
     ) from last_error
 
 
+def openrouter_repair_related_query(
+    captions: list[str],
+    *,
+    api_key: str,
+    model: str,
+    domain: str = "general",
+    bad_query: str = "",
+    timeout: float = 45.0,
+    max_attempts: int = OPENROUTER_MAX_ATTEMPTS,
+) -> str:
+    """Rewrite only the related search query (cheap single-field repair)."""
+    joined = " | ".join(str(c).strip() for c in captions if str(c).strip())
+    prompt = (
+        "You help clean a multimodal retrieval training set.\n"
+        "Return ONLY one JSON object: {\"related_query\": \"...\"}\n"
+        "Write a short image-search query (3–10 words) a human would type.\n"
+        "Rules:\n"
+        "- MUST use different wording than the captions (synonyms / paraphrase).\n"
+        "- At most 2 content words may overlap with any single caption.\n"
+        "- No leading 'image of' / 'photo of' / 'picture of'.\n"
+        "- Prefer concrete nouns and scene cues; no full sentences.\n"
+        f"- Domain: {domain} "
+        f"({'use aerial/overhead language when natural' if domain == 'satellite' else 'ground-level photo'}).\n"
+        f"Captions: {joined}\n"
+        f"Bad query to replace: {bad_query}\n"
+    )
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            content = _openrouter_chat_completion(
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                max_tokens=80,
+                timeout=timeout,
+            )
+            payload = _extract_json_value(content)
+            if isinstance(payload, dict):
+                q = str(
+                    payload.get("related_query")
+                    or payload.get("query")
+                    or ""
+                ).strip()
+            elif isinstance(payload, str):
+                q = payload.strip()
+            else:
+                raise ValueError(f"Unexpected payload type {type(payload)}")
+            if len(q) < 4:
+                raise ValueError(f"query too short: {q!r}")
+            return q.rstrip(".")
+        except (ValueError, json.JSONDecodeError, RuntimeError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt + 1 < max_attempts:
+                time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(
+        f"Failed to repair query for {joined[:80]!r} after {max_attempts} attempts"
+    ) from last_error
+
+
 def openrouter_generate_queries_batch(
     captions: list[str],
     *,

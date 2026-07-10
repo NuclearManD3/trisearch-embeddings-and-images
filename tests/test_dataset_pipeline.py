@@ -23,6 +23,7 @@ from trisearch_data_format import (  # noqa: E402
     captions_are_near_duplicate,
     load_dataset_records,
     normalize_captions,
+    open_lazy_dataset,
     resize_square_rgb,
     save_dataset,
     validate_record,
@@ -145,6 +146,23 @@ class TestSaveLoadRoundtrip(unittest.TestCase):
             )
             self.assertGreaterEqual(len(loaded[0]["captions"]), 2)
 
+            lazy = open_lazy_dataset(out, image_cache_size=2)
+            self.assertEqual(len(lazy), 4)
+            # meta-only path must not require image decode
+            m0 = lazy.meta(0)
+            self.assertNotIn("image", m0)
+            self.assertEqual(m0["id"], loaded[0]["id"])
+            rec0 = lazy[0]
+            self.assertEqual(
+                rec0["image"].size, (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)
+            )
+            # LRU: re-fetch same index hits cache; overflow drops oldest
+            _ = lazy[1]
+            _ = lazy[2]
+            self.assertEqual(len(lazy._image_cache), 2)
+            _ = lazy[0]
+            self.assertIn(0, lazy._image_cache)
+
             train_rows = load_curated_training_rows(out, seed=0)
             self.assertEqual(len(train_rows), 4)
             self.assertIn(QUERY_CACHE_RELATED_KEY, train_rows[0])
@@ -240,6 +258,54 @@ class TestGenerateHelpers(unittest.TestCase):
             caption_set_is_diverse(items[0]["captions"], min_count=2),
             items[0]["captions"],
         )
+
+    def test_progress_store_concurrent_saves(self):
+        """Reproduce the FileNotFoundError race on shared .tmp under many writers."""
+        import tempfile
+        import threading
+        from pathlib import Path
+
+        from generate_datasets import ProgressStore
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / ".generate_progress.json"
+            store = ProgressStore(path)
+            errors: list[BaseException] = []
+            n_threads = 16
+            n_each = 40
+
+            def worker(tid: int) -> None:
+                try:
+                    for i in range(n_each):
+                        key = f"general/coco_{tid}_{i}.jpg"
+                        store.set_queries(
+                            key,
+                            f"query {tid} {i}",
+                            f"unrelated {tid} {i}",
+                            flush_every=3,  # force frequent concurrent saves
+                        )
+                        if i % 7 == 0:
+                            store.save()
+                except BaseException as exc:  # noqa: BLE001 — collect for assert
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=worker, args=(t,)) for t in range(n_threads)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [], f"concurrent save failures: {errors!r}")
+            store.save()
+            self.assertTrue(path.is_file())
+            reloaded = ProgressStore(path)
+            self.assertEqual(len(reloaded.data), n_threads * n_each)
+            for tid in range(n_threads):
+                for i in range(n_each):
+                    key = f"general/coco_{tid}_{i}.jpg"
+                    self.assertTrue(reloaded.queries_done(key), key)
 
     def test_progress_resume_skips_diversify_and_queries(self):
         """Second run must not re-LLM items already cached after a mid-run crash."""
@@ -354,6 +420,145 @@ class TestGenerateHelpers(unittest.TestCase):
             )
             self.assertTrue(items_run2[1]["query"])
             self.assertTrue(prog2.queries_done(items_run2[1]["_key"]))
+
+
+class TestQualityAudit(unittest.TestCase):
+    def test_flag_row_offline_and_query_eq_caption(self):
+        from trisearch_quality import OFFLINE_UNRELATED, flag_row
+
+        row = {
+            "id": "general-0",
+            "domain": DOMAIN_GENERAL,
+            "source": "unit",
+            "captions": [
+                "a red barn in a green field under blue sky",
+                "farm building with silo in countryside landscape",
+            ],
+            "query": "a red barn in a green field under blue sky",
+            "unrelated_query": OFFLINE_UNRELATED,
+        }
+        codes = {f["code"] for f in flag_row(row)}
+        self.assertIn("query_eq_caption", codes)
+        self.assertIn("offline_unrelated", codes)
+
+    def test_audit_rows_writes_repair_estimate(self):
+        from trisearch_quality import audit_rows
+
+        rows = [
+            {
+                "id": f"general-{i}",
+                "domain": DOMAIN_GENERAL,
+                "source": "unit",
+                "captions": [f"scene alpha {i} unique", f"scene beta {i} different objects"],
+                "query": "same query for many images",
+                "unrelated_query": "underwater sea creatures",
+            }
+            for i in range(20)
+        ]
+        flags, summary = audit_rows(
+            rows, query_freq_threshold=10, unrelated_freq_threshold=10
+        )
+        self.assertGreater(summary["num_flagged"], 0)
+        self.assertIn("repair_estimate", summary)
+        self.assertTrue(any("duplicate_query_frequent" in r["codes"] for r in flags))
+
+    def test_local_unrelated_and_query_repair(self):
+        from trisearch_quality import (
+            OFFLINE_UNRELATED,
+            assign_unrelated_from_bank,
+            build_distractor_bank,
+            is_generic_unrelated,
+            local_query_repair,
+            write_metadata_jsonl,
+        )
+
+        bank = build_distractor_bank(500)
+        self.assertGreater(len(bank), 100)
+        used: set[str] = set()
+        cursor = [0]
+        row = {
+            "id": "general-1",
+            "domain": DOMAIN_GENERAL,
+            "source": "unit",
+            "captions": [
+                "a pizza with vegetables and lemon wedge on a plate",
+                "quiche style dish with greens beside a fork",
+            ],
+            "query": "Image of a pizza with vegetables and lemon wedge on a plate",
+            "unrelated_query": OFFLINE_UNRELATED,
+        }
+        uq = assign_unrelated_from_bank(
+            row, bank=bank, used=used, bank_index=cursor
+        )
+        self.assertIsNotNone(uq)
+        self.assertFalse(is_generic_unrelated(uq))
+        q = local_query_repair(
+            row,
+            codes=["query_boilerplate", "query_near_caption"],
+            query_caption_overlap=0.85,
+        )
+        self.assertIsNotNone(q)
+        self.assertFalse(str(q).lower().startswith("image of"))
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "metadata.jsonl"
+            row2 = dict(row)
+            row2["query"] = q
+            row2["unrelated_query"] = uq
+            row2["file_name"] = "images/general/general-1.jpg"
+            write_metadata_jsonl(path, [row2])
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(q, text)
+            self.assertIn(uq, text)
+
+
+class TestDatasetCard(unittest.TestCase):
+    def test_render_card_has_front_matter_and_sections(self):
+        from trisearch_dataset_card import render_dataset_card
+
+        stats = {
+            "dataset_name": "TriSearch-v1",
+            "dataset_version": "0.1.0-preliminary",
+            "format_version": 1,
+            "image_size": 1024,
+            "num_rows": 100,
+            "domains": {"general": 50, "satellite": 50},
+            "sources": {"bitmind/MS-COCO": 50, "SkyScript": 50},
+            "captions_per_image": {"min": 2, "max": 4, "mean": 3.0},
+            "caption_char_len": {"mean": 40.0, "p10": 20, "p90": 60},
+            "query_char_len": {"mean": 25.0, "p10": 12, "p90": 40},
+            "unique_queries": 90,
+            "unique_unrelated": 80,
+            "query_collision_rate": 0.1,
+            "unrelated_collision_rate": 0.2,
+            "generic_unrelated_count": 0,
+            "quality": {"num_flagged": 5, "num_rows": 100, "pct_flagged": 5.0},
+            "layout": {
+                "metadata_jsonl": True,
+                "parquet_shards": 2,
+                "sidecar_images": True,
+                "hf_arrow": False,
+            },
+            "examples": [
+                {
+                    "id": "general-0",
+                    "domain": "general",
+                    "source": "unit",
+                    "captions": ["a", "b"],
+                    "query": "q",
+                    "unrelated_query": "u",
+                }
+            ],
+            "generated_on": "2026-07-09",
+        }
+        card = render_dataset_card(stats, repo_id="org/trisearch-v1")
+        self.assertTrue(card.startswith("---"))
+        self.assertIn("pretty_name:", card)
+        self.assertIn("load_dataset", card)
+        self.assertIn("Preliminary", card)
+        self.assertIn("SkyScript", card)
+        self.assertIn("unrelated_query", card)
+        self.assertIn("composite", card.lower())
 
 
 class TestViewDataset(unittest.TestCase):
