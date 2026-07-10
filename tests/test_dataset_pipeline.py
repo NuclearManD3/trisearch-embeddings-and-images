@@ -241,6 +241,120 @@ class TestGenerateHelpers(unittest.TestCase):
             items[0]["captions"],
         )
 
+    def test_progress_resume_skips_diversify_and_queries(self):
+        """Second run must not re-LLM items already cached after a mid-run crash."""
+        import tempfile
+        from pathlib import Path
+
+        from generate_datasets import (
+            ProgressStore,
+            attach_queries,
+            diversify_record_captions,
+            record_stable_key,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            progress_path = Path(td) / ".generate_progress.json"
+            # Simulate run 1: diversify finished, queries partially done, then crash.
+            prog1 = ProgressStore(progress_path)
+            items_run1 = [
+                {
+                    "id": "general-0",
+                    "domain": DOMAIN_GENERAL,
+                    "image_path": str(Path(td) / "general" / "coco_1.jpg"),
+                    "captions": [
+                        "a red barn in a green field under blue sky",
+                        "farm building with silo in countryside landscape",
+                    ],
+                    "query": "",
+                    "unrelated_query": "",
+                },
+                {
+                    "id": "satellite-0",
+                    "domain": DOMAIN_SATELLITE,
+                    "image_path": str(Path(td) / "satellite" / "sky_000001.jpg"),
+                    "captions": [
+                        "aerial view of airport runway with parked aircraft",
+                        "satellite image of terminal buildings and taxiways",
+                    ],
+                    "query": "",
+                    "unrelated_query": "",
+                },
+            ]
+            for it in items_run1:
+                it["_key"] = record_stable_key(it)
+            prog1.set_captions(
+                items_run1[0]["_key"], items_run1[0]["captions"]
+            )
+            prog1.set_captions(
+                items_run1[1]["_key"], items_run1[1]["captions"]
+            )
+            prog1.set_queries(
+                items_run1[0]["_key"],
+                "red barn countryside photo",
+                "underwater coral reef fish",
+            )
+            prog1.save()
+
+            # Run 2: reload progress, apply, skip cached work.
+            prog2 = ProgressStore(progress_path)
+            items_run2 = [
+                {
+                    "id": "general-0",
+                    "domain": DOMAIN_GENERAL,
+                    "image_path": str(Path(td) / "general" / "coco_1.jpg"),
+                    # Near-dup source captions — would trigger diversify without cache.
+                    "captions": [
+                        "some planes are parked in an airport.",
+                        "Some planes are parked at an airport.",
+                    ],
+                    "query": "",
+                    "unrelated_query": "",
+                },
+                {
+                    "id": "satellite-0",
+                    "domain": DOMAIN_SATELLITE,
+                    "image_path": str(Path(td) / "satellite" / "sky_000001.jpg"),
+                    "captions": [
+                        "some planes are parked in an airport.",
+                        "Some planes are parked at an airport.",
+                    ],
+                    "query": "",
+                    "unrelated_query": "",
+                },
+            ]
+            n_cap, n_q = prog2.apply_to_records(items_run2)
+            self.assertEqual(n_cap, 2)
+            self.assertEqual(n_q, 1)
+            # Cached diverse captions restored (not the near-dup seeds above).
+            self.assertIn("red barn", items_run2[0]["captions"][0])
+            self.assertIn("aerial view", items_run2[1]["captions"][0])
+            self.assertEqual(items_run2[0]["query"], "red barn countryside photo")
+
+            diversify_record_captions(
+                items_run2,
+                skip_api=True,
+                config_path="missing.yml",
+                progress=prog2,
+            )
+            # Must keep restored captions, not offline-rewrite the near-dups.
+            self.assertIn("red barn", items_run2[0]["captions"][0])
+            self.assertIn("aerial view", items_run2[1]["captions"][0])
+
+            attach_queries(
+                items_run2,
+                skip_generation=True,
+                config_path="missing.yml",
+                progress=prog2,
+            )
+            # Item 0 was cached; item 1 gets offline fill.
+            self.assertEqual(items_run2[0]["query"], "red barn countryside photo")
+            self.assertEqual(
+                items_run2[0]["unrelated_query"], "underwater coral reef fish"
+            )
+            self.assertTrue(items_run2[1]["query"])
+            self.assertTrue(prog2.queries_done(items_run2[1]["_key"]))
+
 
 class TestViewDataset(unittest.TestCase):
     def test_build_viewer_api_info(self):

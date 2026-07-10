@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -346,8 +347,15 @@ def save_dataset_streaming(
         del ds
         gc.collect()
 
+    n_total = len(staged_rows)
+    t0 = time.monotonic()
+    print(
+        f"  export: writing {n_total:,} rows (chunk={chunk_size}, "
+        f"sidecars={write_sidecar_jpegs}) ...",
+        flush=True,
+    )
     with open(meta_path, "w", encoding="utf-8") as meta_fh:
-        for row in staged_rows:
+        for row_i, row in enumerate(staged_rows):
             rec = _materialize(row)
             domains[rec["domain"]] = domains.get(rec["domain"], 0) + 1
             sources[rec["source"]] = sources.get(rec["source"], 0) + 1
@@ -374,10 +382,19 @@ def save_dataset_streaming(
             chunk.append(rec)
             if len(chunk) >= chunk_size:
                 _flush()
-                if total % (chunk_size * 10) == 0:
-                    print(f"  wrote {total:,} rows ...", flush=True)
+                # Log every flush (chunk_size rows) with rate/ETA.
+                elapsed = max(time.monotonic() - t0, 1e-6)
+                rate = total / elapsed
+                eta = (n_total - total) / rate if rate > 0 else 0
+                print(
+                    f"  wrote {total:,}/{n_total:,} rows "
+                    f"({rate:.1f}/s, ETA {eta / 60:.1f} min, "
+                    f"shard {shard_i})",
+                    flush=True,
+                )
 
         _flush()
+        print(f"  parquet pass complete: {total:,} rows", flush=True)
 
     # Rename parts to train-XXXXX-of-YYYYY.parquet
     n_shards = len(parquet_paths)
@@ -392,6 +409,13 @@ def save_dataset_streaming(
         shutil.rmtree(hf_dir)
 
     if write_hf_arrow and write_sidecar_jpegs and meta_path.is_file():
+        print(
+            f"  building hf/ Arrow export from sidecars ({total:,} images) ...",
+            flush=True,
+        )
+        t_hf = time.monotonic()
+        progress = {"n": 0}
+
         def _gen():
             with open(meta_path, encoding="utf-8") as fh:
                 for line in fh:
@@ -400,6 +424,16 @@ def save_dataset_streaming(
                         continue
                     meta = json.loads(line)
                     img = Image.open(output_dir / meta["file_name"]).convert("RGB")
+                    progress["n"] += 1
+                    if progress["n"] == 1 or progress["n"] % 500 == 0:
+                        elapsed = max(time.monotonic() - t_hf, 1e-6)
+                        rate = progress["n"] / elapsed
+                        eta = (total - progress["n"]) / rate if rate > 0 else 0
+                        print(
+                            f"    hf arrow {progress['n']:,}/{total:,} "
+                            f"({rate:.1f}/s, ETA {eta / 60:.1f} min)",
+                            flush=True,
+                        )
                     yield {
                         "id": meta["id"],
                         "domain": meta["domain"],
@@ -411,15 +445,28 @@ def save_dataset_streaming(
                     }
 
         ds = Dataset.from_generator(_gen, features=features_spec())
+        print("  saving hf/ to disk ...", flush=True)
         ds.save_to_disk(str(hf_dir))
         del ds
         gc.collect()
+        print(
+            f"  hf/ done in {time.monotonic() - t_hf:.1f}s",
+            flush=True,
+        )
     elif write_hf_arrow:
+        print("  building hf/ from parquet shards ...", flush=True)
+        t_hf = time.monotonic()
+        progress = {"n": 0}
+
         def _gen_pq():
             for i in range(n_shards):
                 p = data_dir / f"train-{i:05d}-of-{n_shards:05d}.parquet"
+                print(f"    reading shard {i + 1}/{n_shards}: {p.name}", flush=True)
                 shard = Dataset.from_parquet(str(p))
                 for ex in shard:
+                    progress["n"] += 1
+                    if progress["n"] % 500 == 0:
+                        print(f"    hf arrow {progress['n']:,}/{total:,}", flush=True)
                     yield ex
                 del shard
                 gc.collect()
@@ -428,11 +475,16 @@ def save_dataset_streaming(
         ds.save_to_disk(str(hf_dir))
         del ds
         gc.collect()
+        print(f"  hf/ done in {time.monotonic() - t_hf:.1f}s", flush=True)
 
     _write_info_and_card(
         output_dir, num_rows=total, domains=domains, sources=sources
     )
-    print(f"  export complete: {total:,} rows, {n_shards} parquet shard(s)", flush=True)
+    print(
+        f"  export complete: {total:,} rows, {n_shards} parquet shard(s), "
+        f"{time.monotonic() - t0:.1f}s total",
+        flush=True,
+    )
     return output_dir
 
 

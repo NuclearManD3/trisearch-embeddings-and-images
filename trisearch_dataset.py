@@ -700,9 +700,16 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
     return data
 
 
+_OPENROUTER_CONFIG_CACHE: dict[str, dict[str, str]] = {}
+
+
 def load_openrouter_config(config_path: str | Path = DEFAULT_OPENROUTER_CONFIG) -> dict[str, str]:
-    """Load OpenRouter API settings from ``config.yml``."""
-    path = Path(config_path)
+    """Load OpenRouter API settings from ``config.yml`` (cached per path)."""
+    path = Path(config_path).resolve()
+    key = str(path)
+    cached = _OPENROUTER_CONFIG_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
     if not path.is_file():
         raise FileNotFoundError(
             f"OpenRouter config not found at {path}. "
@@ -718,7 +725,9 @@ def load_openrouter_config(config_path: str | Path = DEFAULT_OPENROUTER_CONFIG) 
         raise ValueError(
             f"openrouter.api_key and openrouter.model are required in {path}"
         )
-    return {"api_key": api_key, "model": model}
+    result = {"api_key": api_key, "model": model}
+    _OPENROUTER_CONFIG_CACHE[key] = result
+    return dict(result)
 
 
 def _strip_code_fences(text: str) -> str:
@@ -878,7 +887,7 @@ def openrouter_diversify_captions(
     api_key: str,
     model: str,
     domain: str = "general",
-    timeout: float = 120.0,
+    timeout: float = 45.0,
     max_attempts: int = OPENROUTER_MAX_ATTEMPTS,
     min_count: int = 2,
 ) -> list[str]:
@@ -902,10 +911,10 @@ def openrouter_diversify_captions(
                 timeout=timeout,
             )
             return _parse_caption_list(content, min_count=min_count)
-        except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+        except (ValueError, json.JSONDecodeError, RuntimeError, TimeoutError, OSError) as exc:
             last_error = exc
             if attempt + 1 < max_attempts:
-                time.sleep(0.75 * (attempt + 1))
+                time.sleep(0.5 * (attempt + 1))
     raise RuntimeError(
         f"Failed to diversify captions for {joined[:100]!r} "
         f"after {max_attempts} attempts"
