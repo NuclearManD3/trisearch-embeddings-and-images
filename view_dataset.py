@@ -24,10 +24,7 @@ from trisearch_data_format import (
     DEFAULT_IMAGE_CACHE_SIZE,
     open_lazy_dataset,
 )
-from trisearch_dataset import (
-    DEFAULT_TRISEARCH_HF_DATASET,
-    load_trisearch_hub_rows,
-)
+from trisearch_dataset import DEFAULT_TRISEARCH_HF_DATASET
 
 
 class _RecordSequence(Protocol):
@@ -192,31 +189,46 @@ def main() -> None:
             image_cache_size=args.image_cache_size,
         )
     else:
-        max_load = args.max_load if args.max_load is not None else 256
+        # Lazy Hub map dataset — only decode the image for the visible index.
+        from trisearch_dataset import open_trisearch_map_dataset
+
+        max_load = args.max_load  # None = full train split, still lazy
         print(
-            f"Loading Hub sample from {args.hf_dataset!r} "
-            f"(split={args.split}, n={max_load}) ...",
+            f"Opening Hub map dataset {args.hf_dataset!r} "
+            f"(split={args.split}, max_samples={max_load}) — lazy ...",
             flush=True,
         )
-        rows = load_trisearch_hub_rows(
-            args.hf_dataset,
+        map_ds = open_trisearch_map_dataset(
+            hf_dataset=args.hf_dataset,
+            prefer_local=False,
             split=args.split,
             max_samples=max_load,
             seed=0,
             satellite_fraction=0.5,
         )
-        # Viewer expects query / unrelated_query field names
-        records = []
-        for r in rows:
-            records.append({
-                "id": r.get("id", ""),
-                "domain": r.get("domain", ""),
-                "source": r.get("source", ""),
-                "captions": r.get("captions") or [r.get("caption", "")],
-                "query": r.get("related_query") or r.get("query", ""),
-                "unrelated_query": r.get("unrelated_query", ""),
-                "image": r["image"],
-            })
+
+        class _HubViewerAdapter:
+            """Present map rows with viewer field names; decode on access."""
+
+            def __init__(self, src):
+                self._src = src
+
+            def __len__(self):
+                return len(self._src)
+
+            def __getitem__(self, i):
+                r = self._src[i]
+                return {
+                    "id": r.get("id", ""),
+                    "domain": r.get("domain", ""),
+                    "source": r.get("source", ""),
+                    "captions": r.get("captions") or [r.get("caption", "")],
+                    "query": r.get("related_query") or r.get("query", ""),
+                    "unrelated_query": r.get("unrelated_query", ""),
+                    "image": r["image"],
+                }
+
+        records = _HubViewerAdapter(map_ds)
 
     if not len(records):
         raise SystemExit("Dataset is empty.")

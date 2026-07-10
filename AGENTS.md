@@ -10,15 +10,32 @@ for the full multi-stage plan.
 
 ## Non-negotiable rules
 
+### 0. Never load a full multi‑gig dataset into RAM
+
+**Etched in stone. Do not violate.**
+
+- **Never** materialize an entire multi‑GB image corpus as a Python `list` of
+  PIL images (or equivalent).
+- **Never** invent a second on-disk cache of training images/models when the
+  Hugging Face Hub / `datasets` / transformers cache already holds them.
+- Training and demos must use **map-style / lazy** access: `ds[i]` decodes
+  **one** example on demand (HF Arrow/parquet mmap or local sidecars).
+- Small samples only (`max_samples` / demo `count` ≪ full size) may be held as
+  short lists. Full `train` (~10 GB class) must stay on disk via HF cache.
+- Prefer `load_dataset("org/name", split=...)` + index select; do **not**
+  `for row in ds: rows.append(decode(row))` over the full split.
+
 ### 1. No dataset scripts or remote code
 
 - **Never** pass `trust_remote_code=True` to `load_dataset` or model loaders.
 - **Never** rely on HuggingFace **dataset loading scripts** (removed in current
   `datasets` — they fail with “Dataset scripts are no longer supported”).
-- Load HF data with **`streaming=True`** and materialize rows in
-  `trisearch_dataset.stream_hf_rows()`.
-- Prefer Parquet-native dataset repos. Defaults: ChatEarthNet (satellite,
-  path-based images — requires `--satellite-image-root`), Flickr8k (general).
+- Prefer Parquet-native Hub repos and the official curated dataset
+  (`NuclearManD/trisearch-dataset-64k-v0.0.1`). Streaming is for **bounded**
+  samples only — not a full-pass over 60k+ rows into a list.
+- **Runtime data is TriSearch curated only** (train / demo / view / verify).
+  COCO, SkyScript, Flickr, ChatEarthNet appear **only** in
+  `generate_datasets.py` (and optional `--no-curated-dataset` emergency path).
 
 ### 2. No fake data
 
@@ -146,10 +163,12 @@ python3 train_stage1.py --max-steps 20000
 # Fresh run from seeds
 python3 train_stage1.py --fresh --max-steps 10000
 
-# Image search demo (Hub curated sample)
-python3 demo_image_search.py --phase 1 --count 100 --rebuild-index
+# Image search demo (TriSearch curated only; lazy map — batch_size caps image RAM)
+python3 demo_image_search.py --phase 1 --count 1000 --batch-size 4 --rebuild-index
+# Use newest history/step-* training snapshot instead of completed stage1/
+python3 demo_image_search.py --latest-checkpoint --count 200 --rebuild-index
 
-# Dataset viewer (Hub sample by default; local optional)
+# Dataset viewer (Hub curated; optional local export)
 python3 view_dataset.py --max-load 64
 python3 view_dataset.py --prefer-local --dataset-dir models/data/trisearch-v1
 

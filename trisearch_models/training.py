@@ -694,20 +694,92 @@ def checkpoint_is_valid(root: Path) -> bool:
     )
 
 
-def _checkpoint_candidates() -> list[Path]:
+def _checkpoint_step_key(path: Path) -> tuple[int, float]:
+    """Sort key: prefer higher step-N, then mtime. Stage root counts as step=10**12."""
+    name = path.name
+    mtime = (path / PROJECTION_FILE).stat().st_mtime if (path / PROJECTION_FILE).is_file() else path.stat().st_mtime
+    if name.startswith("step-"):
+        try:
+            return (int(name.split("-", 1)[1]), mtime)
+        except ValueError:
+            return (0, mtime)
+    # Completed / live stage root (models/trained/stage1) — treat as "current head"
+    return (10**12, mtime)
+
+
+def list_stage1_checkpoints(*, include_stage_root: bool = True) -> list[Path]:
+    """Valid Stage-1 checkpoint roots (history/step-* and optional stage root)."""
     trained = Path(DEFAULT_TRAINED_DIR)
-    candidates = [trained, Path(LEGACY_CHECKPOINT_DIR)]
+    candidates: list[Path] = []
+    if include_stage_root:
+        candidates.append(trained)
+        candidates.append(Path(LEGACY_CHECKPOINT_DIR))
     history = trained / "history"
     if history.is_dir():
-        candidates.extend(sorted(history.glob("step-*")))
-    return candidates
+        candidates.extend(history.glob("step-*"))
+    return [p for p in candidates if checkpoint_is_valid(p)]
+
+
+def _checkpoint_candidates() -> list[Path]:
+    return list_stage1_checkpoints(include_stage_root=True)
 
 
 def find_latest_checkpoint() -> Path | None:
-    valid = [p for p in _checkpoint_candidates() if checkpoint_is_valid(p)]
+    """Most recent valid Stage-1 root among stage dir + history/step-* (by mtime)."""
+    valid = list_stage1_checkpoints(include_stage_root=True)
     if not valid:
         return None
     return max(valid, key=lambda p: (p / PROJECTION_FILE).stat().st_mtime)
+
+
+def find_latest_history_checkpoint() -> Path | None:
+    """Latest mid-training snapshot under ``models/trained/stage1/history/step-*``.
+
+    Ignores the completed/live stage root so demos can load the newest
+    intermediate save even when ``stage1/`` itself is older or incomplete.
+    """
+    valid = list_stage1_checkpoints(include_stage_root=False)
+    if not valid:
+        return None
+    return max(valid, key=_checkpoint_step_key)
+
+
+def resolve_inference_checkpoint(
+    *,
+    phase: int = 1,
+    checkpoint_dir: str | Path | None = None,
+    latest_history: bool = False,
+    latest_any: bool = False,
+) -> Path | None:
+    """Resolve a Stage-1 checkpoint root for inference/demos.
+
+    Priority:
+      1. Explicit ``checkpoint_dir``
+      2. ``latest_history`` → newest ``history/step-*``
+      3. ``latest_any`` → newest among stage root + history (mtime)
+      4. ``None`` → caller uses phase-based ``models/trained/stage{N}/``
+    """
+    if checkpoint_dir:
+        root = Path(checkpoint_dir)
+        if not checkpoint_is_valid(root):
+            raise FileNotFoundError(f"No valid Stage-1 checkpoint at {root}")
+        return root
+    if latest_history:
+        root = find_latest_history_checkpoint()
+        if root is None:
+            raise FileNotFoundError(
+                f"No history/step-* checkpoints under {DEFAULT_TRAINED_DIR}/history. "
+                "Train longer with periodic saves, or omit --latest-checkpoint."
+            )
+        return root
+    if latest_any:
+        return find_latest_checkpoint()
+    # Default: completed/live stage dir for phase (not history)
+    if phase >= 1:
+        root = Path(DEFAULT_TRAINED_DIR) if phase == 1 else Path(f"models/trained/stage{phase}")
+        if checkpoint_is_valid(root):
+            return root
+    return None
 
 
 def resolve_checkpoint_root(
@@ -1133,7 +1205,8 @@ def verify_trained_checkpoint(
     )
     load_projection_heads(model, trained_dir)
 
-    rows = load_verification_samples()
+    # Project dataset only (curated Hub); queries already present — no Flickr/OpenRouter.
+    rows = load_verification_samples(count=4)
     processor = AutoImageProcessor.from_pretrained(vision_processor_id)
     target_size = vision_model.config.image_size
     processor.size = {"height": target_size, "width": target_size}
@@ -1141,10 +1214,11 @@ def verify_trained_checkpoint(
     if with_text_queries:
         from trisearch_dataset import enrich_rows_with_text_queries
 
+        # Curated rows already have queries; this is a no-op / no API.
         verify_rows = enrich_rows_with_text_queries(
             rows,
-            max_new_queries=8,
-            skip_generation=False,
+            max_new_queries=0,
+            skip_generation=True,
         )
     dataset = ImageCaptionDataset(
         rows=verify_rows,

@@ -119,7 +119,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-curated-dataset",
         action="store_true",
-        help="Ignore curated Hub/local dataset; use legacy HF satellite/general mix.",
+        help="EMERGENCY ONLY: ignore TriSearch curated Hub set and use legacy "
+             "COCO/SkyScript mix (not for normal training).",
     )
     parser.add_argument("--image-root", default=None,
                         help="Base directory for relative image paths in JSONL.")

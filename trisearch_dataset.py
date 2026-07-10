@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from PIL import Image
 from torch.utils.data import Dataset
@@ -33,12 +33,7 @@ DEFAULT_GENERAL_DATASET = "bitmind/MS-COCO"
 DEFAULT_GENERAL_SPLIT = "train"
 DEFAULT_GENERAL_CAPTION_COLUMN = "caption_0"
 
-# Evaluation / indexing defaults
-DEFAULT_FLICKR8K_DATASET = "jxie/flickr8k"
-DEFAULT_FLICKR8K_SPLIT = "train"
-
-VERIFICATION_DATASET = DEFAULT_FLICKR8K_DATASET
-VERIFICATION_SPLIT = DEFAULT_FLICKR8K_SPLIT
+# Evaluation / indexing defaults — same curated corpus as training (not Flickr/COCO).
 VERIFICATION_SAMPLE_COUNT = 4
 
 CHATEARTHNET_HF_REPO = DEFAULT_SATELLITE_DATASET
@@ -350,26 +345,25 @@ def curated_dataset_available(path: str | Path | None = None) -> bool:
     return False
 
 
-def _row_from_trisearch_record(rec: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a curated record (local or Hub) into a training/demo row."""
+def _normalize_trisearch_fields(rec: dict[str, Any]) -> dict[str, Any]:
+    """Text fields only — **never** decode the image here (RAM rule)."""
     captions = list(rec.get("captions") or [])
+    if not captions and rec.get("caption"):
+        captions = [rec["caption"]]
     if not captions:
         raise ValueError(f"row {rec.get('id')!r} has no captions")
     primary = str(captions[0]).strip()
-    related = str(rec.get("query") or "").strip()
+    related = str(
+        rec.get(QUERY_CACHE_RELATED_KEY) or rec.get("query") or ""
+    ).strip()
     if not related and len(captions) > 1:
         related = str(captions[1]).strip()
-    unrelated = str(rec.get("unrelated_query") or "").strip()
-    image = rec.get("image")
-    if image is not None and not isinstance(image, Image.Image):
-        image = load_pil_image(image)
-    if isinstance(image, Image.Image):
-        # .copy() detaches from HF streaming/file handles (avoids exit crashes).
-        image = image.convert("RGB").copy()
-    elif image is None:
-        raise ValueError(f"row {rec.get('id')!r} missing image")
+    unrelated = str(
+        rec.get(QUERY_CACHE_UNRELATED_KEY) or rec.get("unrelated_query") or ""
+    ).strip()
     return {
-        "image": image,
+        # Keep raw image handle (path / HF Image / bytes dict); decode in getitem.
+        "image": rec.get("image"),
         "caption": primary,
         "captions": [str(c) for c in captions],
         "domain": str(rec.get("domain") or "general"),
@@ -380,17 +374,23 @@ def _row_from_trisearch_record(rec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _balance_domain_sample(
-    records: list[dict[str, Any]],
+def _domain_balanced_indices(
+    domains: Sequence[str],
     *,
     max_samples: int | None,
     seed: int,
     satellite_fraction: float | None,
-) -> list[dict[str, Any]]:
+) -> list[int] | None:
+    """Return subset indices or None to keep all. Never touches images."""
+    n = len(domains)
+    if max_samples is None and (
+        satellite_fraction is None or not (0.0 < float(satellite_fraction) < 1.0)
+    ):
+        return None
     rng = random.Random(seed)
     if satellite_fraction is not None and 0.0 < satellite_fraction < 1.0:
-        sat = [r for r in records if str(r.get("domain")) == "satellite"]
-        gen = [r for r in records if str(r.get("domain")) == "general"]
+        sat = [i for i, d in enumerate(domains) if str(d) == "satellite"]
+        gen = [i for i, d in enumerate(domains) if str(d) == "general"]
         if sat and gen:
             if max_samples is not None:
                 n_sat = int(round(max_samples * satellite_fraction))
@@ -402,9 +402,180 @@ def _balance_domain_sample(
             out = sat[:n_sat] + gen[:n_gen]
             rng.shuffle(out)
             return out
-    if max_samples is not None and len(records) > max_samples:
-        return rng.sample(records, max_samples)
-    return records
+    if max_samples is not None and max_samples < n:
+        return rng.sample(range(n), max_samples)
+    return None
+
+
+class TriSearchMapDataset(Dataset):
+    """Lazy curated TriSearch view: HF Arrow/parquet mmap or local sidecars.
+
+    **Never** holds a full list of decoded PIL images. ``__getitem__`` decodes
+    one example. Relies on the Hugging Face datasets cache on disk.
+    """
+
+    def __init__(
+        self,
+        source: Any,
+        *,
+        indices: list[int] | None = None,
+        image_root: str | None = None,
+        backend: str = "hf",
+        queries_ready: bool = True,
+        label: str = "trisearch",
+    ):
+        self._source = source
+        self._indices = indices
+        self.image_root = image_root
+        self.backend = backend  # "hf" | "local_lazy" | "list"
+        self.queries_ready = queries_ready
+        self.label = label
+
+    def __len__(self) -> int:
+        if self._indices is not None:
+            return len(self._indices)
+        return len(self._source)
+
+    def _raw_at(self, i: int) -> dict[str, Any]:
+        j = self._indices[i] if self._indices is not None else i
+        if self.backend == "local_lazy":
+            # LazyTriSearchDataset
+            return self._source[j]
+        if self.backend == "list":
+            return dict(self._source[j])
+        # HF datasets.Dataset row
+        row = self._source[int(j)]
+        return dict(row)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        rec = _normalize_trisearch_fields(self._raw_at(idx))
+        # Decode single image only now.
+        rec["image"] = load_pil_image(rec["image"], self.image_root)
+        if isinstance(rec["image"], Image.Image):
+            rec["image"] = rec["image"].convert("RGB").copy()
+        return rec
+
+    def meta(self, idx: int) -> dict[str, Any]:
+        """Text fields only (no image decode)."""
+        rec = _normalize_trisearch_fields(self._raw_at(idx))
+        rec.pop("image", None)
+        return rec
+
+
+def open_trisearch_map_dataset(
+    *,
+    hf_dataset: str | None = DEFAULT_TRISEARCH_HF_DATASET,
+    dataset_dir: str | Path | None = None,
+    prefer_local: bool = False,
+    split: str = "train",
+    max_samples: int | None = None,
+    seed: int = 42,
+    satellite_fraction: float | None = None,
+    revision: str | None = None,
+) -> TriSearchMapDataset:
+    """Open curated TriSearch as a **lazy** map dataset (Hub HF cache or local).
+
+    Full splits stay on disk. Optional ``max_samples`` only selects indices.
+    """
+    from datasets import load_dataset
+
+    if split not in ("train", "test", "all"):
+        raise ValueError(f"split must be train|test|all, got {split!r}")
+
+    root = Path(dataset_dir or DEFAULT_CURATED_DATASET_DIR)
+    if prefer_local and curated_dataset_available(root):
+        from trisearch_data_format import apply_official_splits, open_lazy_dataset
+        from trisearch_quality import load_metadata_rows
+
+        lazy = open_lazy_dataset(root, max_samples=None, image_cache_size=0)
+        indices: list[int] | None = None
+        domains: list[str]
+        try:
+            meta_rows = load_metadata_rows(root)
+            apply_official_splits(meta_rows, force=False)
+            if len(meta_rows) == len(lazy) and split in ("train", "test"):
+                indices = [
+                    i for i, r in enumerate(meta_rows) if r.get("split") == split
+                ]
+                domains = [str(meta_rows[i]["domain"]) for i in indices]
+            elif len(meta_rows) == len(lazy):
+                domains = [str(r.get("domain", "general")) for r in meta_rows]
+            else:
+                domains = [
+                    str(lazy.meta(i).get("domain", "general"))
+                    for i in range(len(lazy))
+                ]
+        except Exception:
+            domains = [
+                str(lazy.meta(i).get("domain", "general")) for i in range(len(lazy))
+            ]
+        sub = _domain_balanced_indices(
+            domains,
+            max_samples=max_samples,
+            seed=seed,
+            satellite_fraction=satellite_fraction,
+        )
+        if indices is not None and sub is not None:
+            indices = [indices[j] for j in sub]
+        elif sub is not None:
+            indices = sub
+
+        print(
+            f"Opened local curated map dataset {root} "
+            f"(n={len(indices) if indices is not None else len(lazy)}, split={split})",
+            flush=True,
+        )
+        return TriSearchMapDataset(
+            lazy,
+            indices=indices,
+            backend="local_lazy",
+            queries_ready=True,
+            label=str(root),
+        )
+
+    if not hf_dataset:
+        raise FileNotFoundError(
+            f"No local curated data at {root} and no hf_dataset id. "
+            f"Default Hub id: {DEFAULT_TRISEARCH_HF_DATASET}"
+        )
+
+    print(
+        f"Opening TriSearch Hub map dataset {hf_dataset!r} "
+        f"(split={split}, max_samples={max_samples}) — lazy, HF cache only",
+        flush=True,
+    )
+    if split == "all":
+        from datasets import concatenate_datasets
+
+        ds = concatenate_datasets(
+            [
+                load_dataset(hf_dataset, split=sp, revision=revision)
+                for sp in ("train", "test")
+            ]
+        )
+    else:
+        ds = load_dataset(hf_dataset, split=split, revision=revision)
+
+    # Domain column only (strings) — not images.
+    domains = list(ds["domain"]) if "domain" in ds.column_names else ["general"] * len(ds)
+    indices = _domain_balanced_indices(
+        domains,
+        max_samples=max_samples,
+        seed=seed,
+        satellite_fraction=satellite_fraction,
+    )
+    n = len(indices) if indices is not None else len(ds)
+    print(
+        f"  map dataset ready: {n:,} rows (images decode on access; disk=HF cache)",
+        flush=True,
+    )
+    return TriSearchMapDataset(
+        ds,
+        indices=indices,
+        backend="hf",
+        queries_ready=True,
+        label=hf_dataset,
+    )
 
 
 def load_trisearch_hub_rows(
@@ -415,104 +586,33 @@ def load_trisearch_hub_rows(
     seed: int = 42,
     satellite_fraction: float | None = None,
     revision: str | None = None,
-) -> list[dict[str, Any]]:
-    """Load curated TriSearch rows from the Hugging Face Hub.
+    materialize: bool | None = None,
+) -> TriSearchMapDataset | list[dict[str, Any]]:
+    """Open Hub curated data **lazily** (default).
 
-    Uses the datasets cache (no custom download scripts / trust_remote_code).
-    When ``max_samples`` is set, streams + reservoir-samples to avoid pulling
-    the full ~10 GB corpus into RAM for smoke tests / demos.
+    Set ``materialize=True`` only for tiny samples (demo/tests). Full splits
+    always return :class:`TriSearchMapDataset`.
     """
-    from datasets import load_dataset
-
-    if split not in ("train", "test", "all"):
-        raise ValueError(f"split must be train|test|all, got {split!r}")
-
-    print(
-        f"Loading TriSearch Hub dataset {dataset_id!r} "
-        f"(split={split}, max_samples={max_samples}) ...",
-        flush=True,
-    )
-
-    # Fast path for small samples: pull a bounded prefix from the stream
-    # (do NOT full-pass reservoir over 60k rows — that downloads everything).
-    if max_samples is not None and max_samples > 0:
-        from itertools import islice
-
-        # Oversample so domain balancing still has room.
-        stream_n = max(max_samples * 6, max_samples + 48)
-        raw: list[dict[str, Any]] = []
-        splits = ("train", "test") if split == "all" else (split,)
-        per = max(1, stream_n // len(splits))
-        for sp in splits:
-            ds_stream = load_dataset(
-                dataset_id, split=sp, streaming=True, revision=revision
-            )
-            raw.extend(list(islice(ds_stream, per)))
-        records: list[dict[str, Any]] = []
-        for row in raw:
-            try:
-                rec = {
-                    "id": row.get("id"),
-                    "domain": row.get("domain"),
-                    "source": row.get("source"),
-                    "captions": list(row.get("captions") or []),
-                    "query": row.get("query"),
-                    "unrelated_query": row.get("unrelated_query"),
-                    "image": row.get("image"),
-                }
-                records.append(_row_from_trisearch_record(rec))
-            except (TypeError, ValueError, OSError) as exc:
-                print(f"  skip hub row: {exc}", flush=True)
-        records = _balance_domain_sample(
-            records,
-            max_samples=max_samples,
-            seed=seed,
-            satellite_fraction=satellite_fraction,
-        )
-        print(
-            f"  Hub sample ready: {len(records):,} rows from {dataset_id}",
-            flush=True,
-        )
-        return records
-
-    # Full split (uses HF arrow/parquet cache on disk).
-    if split == "all":
-        from datasets import concatenate_datasets
-
-        parts = [
-            load_dataset(dataset_id, split=sp, revision=revision)
-            for sp in ("train", "test")
-        ]
-        ds = concatenate_datasets(parts)
-    else:
-        ds = load_dataset(dataset_id, split=split, revision=revision)
-
-    records = []
-    for row in ds:
-        try:
-            rec = {
-                "id": row.get("id"),
-                "domain": row.get("domain"),
-                "source": row.get("source"),
-                "captions": list(row.get("captions") or []),
-                "query": row.get("query"),
-                "unrelated_query": row.get("unrelated_query"),
-                "image": row.get("image"),
-            }
-            records.append(_row_from_trisearch_record(rec))
-        except (TypeError, ValueError, OSError) as exc:
-            print(f"  skip hub row: {exc}", flush=True)
-    records = _balance_domain_sample(
-        records,
+    ds = open_trisearch_map_dataset(
+        hf_dataset=dataset_id,
+        prefer_local=False,
+        split=split,
         max_samples=max_samples,
         seed=seed,
         satellite_fraction=satellite_fraction,
+        revision=revision,
     )
-    print(
-        f"  Loaded {len(records):,} rows from Hub {dataset_id} (split={split})",
-        flush=True,
-    )
-    return records
+    # Materialize only small samples explicitly requested.
+    if materialize is None:
+        materialize = max_samples is not None and max_samples <= 512
+    if materialize:
+        if max_samples is None or max_samples > 512:
+            raise RuntimeError(
+                "Refusing to materialize a large curated split into a Python list "
+                "(never load multi-GB datasets into RAM). Use the map dataset."
+            )
+        return [ds[i] for i in range(len(ds))]
+    return ds
 
 
 def load_curated_training_rows(
@@ -525,73 +625,32 @@ def load_curated_training_rows(
     split: str = "train",
     prefer_local: bool = False,
     revision: str | None = None,
-) -> list[dict[str, Any]]:
-    """Load curated TriSearch rows for Stage-1 training / demos.
+    materialize: bool | None = None,
+) -> TriSearchMapDataset | list[dict[str, Any]]:
+    """Open curated TriSearch for training (lazy map dataset by default).
 
-    Preference (default):
-      1. Hugging Face Hub ``hf_dataset`` (published 64k v0.0.1)
-      2. Local export at ``dataset_dir`` when ``prefer_local=True``
-
-    Each row has:
-      - image (PIL), caption, captions (list), domain, source, id
-      - related_query, unrelated_query
-
-    ``split`` defaults to ``\"train\"``. Pass ``test`` or ``all`` as needed.
+    Preference: Hub ``hf_dataset`` unless ``prefer_local`` and a local export exist.
     """
-    root = Path(dataset_dir or DEFAULT_CURATED_DATASET_DIR)
-    if prefer_local and curated_dataset_available(root):
-        from trisearch_data_format import apply_official_splits, load_dataset_records
-
-        try:
-            from trisearch_quality import load_metadata_rows
-
-            meta_rows = load_metadata_rows(root)
-            apply_official_splits(meta_rows, force=False)
-            if split in ("train", "test"):
-                allowed = {r["id"] for r in meta_rows if r.get("split") == split}
-            elif split == "all":
-                allowed = None
-            else:
-                raise ValueError(f"split must be train|test|all, got {split!r}")
-        except FileNotFoundError:
-            allowed = None
-
-        records_raw = load_dataset_records(root, max_samples=None)
-        if allowed is not None:
-            records_raw = [r for r in records_raw if str(r.get("id")) in allowed]
-        records = []
-        for rec in records_raw:
-            try:
-                records.append(_row_from_trisearch_record(rec))
-            except (TypeError, ValueError, OSError):
-                continue
-        records = _balance_domain_sample(
-            records,
-            max_samples=max_samples,
-            seed=seed,
-            satellite_fraction=satellite_fraction,
-        )
-        print(
-            f"Loaded curated TriSearch dataset from local {root}: "
-            f"{len(records):,} rows (split={split})",
-            flush=True,
-        )
-        return records
-
-    if hf_dataset:
-        return load_trisearch_hub_rows(
-            hf_dataset,
-            split=split,
-            max_samples=max_samples,
-            seed=seed,
-            satellite_fraction=satellite_fraction,
-            revision=revision,
-        )
-
-    raise FileNotFoundError(
-        f"No local curated dataset at {root} and no hf_dataset id provided. "
-        f"Pass hf_dataset={DEFAULT_TRISEARCH_HF_DATASET!r} or run generate_datasets.py."
+    ds = open_trisearch_map_dataset(
+        hf_dataset=hf_dataset,
+        dataset_dir=dataset_dir,
+        prefer_local=prefer_local,
+        split=split,
+        max_samples=max_samples,
+        seed=seed,
+        satellite_fraction=satellite_fraction,
+        revision=revision,
     )
+    if materialize is None:
+        materialize = max_samples is not None and max_samples <= 512
+    if materialize:
+        if max_samples is None or max_samples > 512:
+            raise RuntimeError(
+                "Refusing to materialize a large curated split into RAM. "
+                "Use the returned map dataset / ImageCaptionDataset directly."
+            )
+        return [ds[i] for i in range(len(ds))]
+    return ds
 
 
 def load_stage1_training_rows(
@@ -639,14 +698,14 @@ def load_stage1_training_rows(
             if max_total <= 0:
                 max_total = None
         try:
-            rows = load_curated_training_rows(
-                curated_path,
+            rows = open_trisearch_map_dataset(
                 hf_dataset=hf_dataset,
+                dataset_dir=curated_path,
+                prefer_local=prefer_local_curated,
+                split=curated_split,
                 max_samples=max_total,
                 seed=seed,
                 satellite_fraction=satellite_fraction,
-                split=curated_split,
-                prefer_local=prefer_local_curated,
             )
             return rows, "image", "caption", None
         except Exception as exc:  # noqa: BLE001
@@ -774,107 +833,28 @@ def load_stage1_demo_samples(
     count: int,
     seed: int = 42,
     *,
-    satellite_dataset: str = DEFAULT_SATELLITE_DATASET,
-    satellite_split: str = DEFAULT_SATELLITE_SPLIT,
-    satellite_image_column: str = "image",
-    satellite_caption_column: str = "caption",
-    satellite_image_root: str | None = None,
-    general_dataset: str = DEFAULT_GENERAL_DATASET,
-    general_split: str = DEFAULT_GENERAL_SPLIT,
-    general_image_column: str = "image",
-    general_caption_column: str = DEFAULT_GENERAL_CAPTION_COLUMN,
-    satellite_fraction: float = 0.5,
-    download_satellite_images: bool = False,
     curated_dataset_dir: str | Path | None = None,
     hf_dataset: str | None = DEFAULT_TRISEARCH_HF_DATASET,
     curated_split: str = "train",
     prefer_local_curated: bool = False,
-) -> list[dict[str, Any]]:
-    """Sample ``count`` images using the curated TriSearch corpus (Hub or local).
+    satellite_fraction: float | None = 0.5,
+) -> TriSearchMapDataset:
+    """Open a **lazy** TriSearch map over ``count`` indices (no full PIL list).
 
-    Returns a list of ``{"image": PIL.Image, "caption": str, "source": str}``
-    ready for the retrieval demo index. Falls back to legacy sat/general mix
-    only if curated load fails.
+    Prefer :func:`open_trisearch_map_dataset` / demo ``build_from_map`` — this
+    helper remains for callers that want a sized map sample.
     """
-    try:
-        rows = load_curated_training_rows(
-            curated_dataset_dir,
-            hf_dataset=hf_dataset,
-            max_samples=count,
-            seed=seed,
-            satellite_fraction=satellite_fraction,
-            split=curated_split,
-            prefer_local=prefer_local_curated,
-        )
-        return [
-            {
-                "image": r["image"],
-                "caption": r["caption"],
-                "source": r.get("source", "trisearch-curated"),
-                "id": r.get("id", ""),
-                "query": r.get(QUERY_CACHE_RELATED_KEY, ""),
-            }
-            for r in rows[:count]
-        ]
-    except Exception as exc:  # noqa: BLE001
-        print(f"Curated demo load failed ({exc}); using legacy mix.", flush=True)
-
-    # Over-sample each source so the mix can hit ``count`` after path failures.
-    per_source = max(1, (count + 1) // 2)
-    oversample = max(per_source + 8, int(per_source * 1.25))
-    rows, image_column, caption_column, image_root = load_stage1_training_rows(
-        prefer_curated=False,
-        satellite_dataset=satellite_dataset,
-        satellite_split=satellite_split,
-        satellite_image_column=satellite_image_column,
-        satellite_caption_column=satellite_caption_column,
-        satellite_image_root=satellite_image_root,
-        general_dataset=general_dataset,
-        general_split=general_split,
-        general_image_column=general_image_column,
-        general_caption_column=general_caption_column,
-        satellite_fraction=satellite_fraction,
-        max_satellite_samples=oversample,
-        max_general_samples=oversample,
+    if count < 1:
+        raise ValueError("count must be >= 1")
+    return open_trisearch_map_dataset(
+        hf_dataset=hf_dataset,
+        dataset_dir=curated_dataset_dir,
+        prefer_local=prefer_local_curated,
+        split=curated_split,
+        max_samples=count,
         seed=seed,
-        download_satellite_images=download_satellite_images,
+        satellite_fraction=satellite_fraction,
     )
-    rng = random.Random(seed)
-    if len(rows) > count:
-        rows = rng.sample(rows, count)
-
-    samples: list[dict[str, Any]] = []
-    skipped = 0
-    for row in rows:
-        try:
-            image = load_pil_image(row[image_column], image_root=image_root)
-            caption = pick_caption(row, caption_column)
-            if not caption:
-                raise ValueError("empty caption")
-            samples.append({
-                "image": image,
-                "caption": caption,
-                "source": "stage1_mix",
-            })
-        except (FileNotFoundError, KeyError, TypeError, ValueError, OSError) as exc:
-            skipped += 1
-            if skipped <= 3:
-                print(f"  skipped demo row: {exc}")
-        if len(samples) >= count:
-            break
-    if skipped:
-        print(f"  skipped {skipped:,} demo rows without loadable image/caption")
-    if not samples:
-        raise RuntimeError(
-            "No images could be loaded for the Stage-1 demo mix. "
-            "Pass --satellite-image-root / --download-satellite-images for ChatEarthNet, "
-            "or --dataset to index a single HuggingFace corpus instead."
-        )
-    print(
-        f"Stage-1 demo mix ready: {len(samples):,} images "
-        f"(target {count:,}, satellite_fraction={satellite_fraction:.0%})"
-    )
-    return samples
 
 
 def _load_yaml_mapping(path: Path) -> dict[str, Any]:
@@ -1346,7 +1326,7 @@ def append_query_cache_entry(
 
 
 def enrich_rows_with_text_queries(
-    rows: list[dict[str, Any]],
+    rows: list[dict[str, Any]] | TriSearchMapDataset | Dataset,
     *,
     config_path: str | Path = DEFAULT_OPENROUTER_CONFIG,
     cache_path: str | Path = DEFAULT_QUERY_CACHE_PATH,
@@ -1355,12 +1335,26 @@ def enrich_rows_with_text_queries(
     caption_column: str = "caption",
     query_batch_size: int = OPENROUTER_QUERY_BATCH_SIZE,
     query_parallelism: int = OPENROUTER_QUERY_PARALLELISM,
-) -> list[dict[str, Any]]:
-    """Attach related/unrelated search queries to each row (cached on disk).
+) -> list[dict[str, Any]] | TriSearchMapDataset | Dataset:
+    """Attach related/unrelated search queries (cached on disk).
 
-    Rows that already include both query fields (e.g. curated TriSearch export)
-    are left unchanged and do not require OpenRouter.
+    Curated map datasets already ship queries — returned unchanged (no full scan
+    of images). List rows without queries are enriched via OpenRouter/cache.
     """
+    if isinstance(rows, TriSearchMapDataset) and rows.queries_ready:
+        print(
+            f"All {len(rows):,} curated rows already have text queries "
+            f"({rows.label}); skipping OpenRouter (lazy map dataset)."
+        )
+        return rows
+
+    if not isinstance(rows, list):
+        # Unknown map-like source without query guarantee — refuse full materialize.
+        raise TypeError(
+            "enrich_rows_with_text_queries needs a list of rows or a "
+            "TriSearchMapDataset with queries_ready=True"
+        )
+
     already: list[dict[str, Any]] = []
     need: list[dict[str, Any]] = []
     for row in rows:
@@ -1375,7 +1369,7 @@ def enrich_rows_with_text_queries(
             f"All {len(already):,} rows already have text queries "
             f"(curated dataset); skipping OpenRouter."
         )
-        return list(rows)
+        return rows
 
     cache = load_query_cache(cache_path)
 
@@ -1524,18 +1518,31 @@ def enrich_rows_with_text_queries(
 def load_verification_samples(
     count: int = VERIFICATION_SAMPLE_COUNT,
     seed: int = 42,
-    dataset: str = VERIFICATION_DATASET,
-    split: str = VERIFICATION_SPLIT,
+    *,
+    hf_dataset: str = DEFAULT_TRISEARCH_HF_DATASET,
+    split: str = "train",
 ) -> list[dict[str, Any]]:
-    """Small real dataset slice for post-training checkpoint verification."""
-    return load_dataset_samples(
-        dataset=dataset,
-        split=split,
-        count=count,
+    """Small TriSearch curated slice for post-training checkpoint verification.
+
+    Uses the project dataset only (not Flickr/COCO). Bounded materialize.
+    """
+    if count > 64:
+        raise ValueError("verification sample count must be <= 64")
+    rows = load_curated_training_rows(
+        hf_dataset=hf_dataset,
+        max_samples=count,
         seed=seed,
-        image_column="image",
-        caption_column=None,
+        satellite_fraction=0.5,
+        split=split,
+        prefer_local=False,
+        materialize=True,
     )
+    assert isinstance(rows, list)
+    print(
+        f"Verification samples: {len(rows):,} from {hf_dataset} (split={split})",
+        flush=True,
+    )
+    return rows
 
 
 def _tokenize_text(tokenizer, text: str, max_text_length: int) -> dict[str, Any]:
@@ -1549,11 +1556,16 @@ def _tokenize_text(tokenizer, text: str, max_text_length: int) -> dict[str, Any]
 
 
 class ImageCaptionDataset(Dataset):
-    """PyTorch dataset over pre-loaded image–caption rows."""
+    """PyTorch dataset over **lazy** or small row sources.
+
+    ``rows`` may be a :class:`TriSearchMapDataset`, any Sequence with
+    ``__getitem__`` returning a record dict, or a short list. Images are
+    decoded only inside ``__getitem__`` (never preloaded for full corpora).
+    """
 
     def __init__(
         self,
-        rows: list[dict[str, Any]],
+        rows: Any,
         image_processor,
         tokenizer,
         image_column: str = "image",
@@ -1594,8 +1606,14 @@ class ImageCaptionDataset(Dataset):
                         return text
         return ""
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
+    def _fetch_row(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
+        if isinstance(row, dict):
+            return row
+        raise TypeError(f"Row {idx} is not a dict: {type(row)}")
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        row = self._fetch_row(idx)
         image = load_pil_image(row[self.image_column], self.image_root)
         caption = pick_caption(row, self.caption_column)
 

@@ -166,8 +166,14 @@ class TestSaveLoadRoundtrip(unittest.TestCase):
             self.assertIn(0, lazy._image_cache)
 
             train_rows = load_curated_training_rows(
-                out, seed=0, prefer_local=True, hf_dataset=None
+                out,
+                seed=0,
+                prefer_local=True,
+                hf_dataset=None,
+                materialize=True,
+                max_samples=4,
             )
+            self.assertIsInstance(train_rows, list)
             self.assertEqual(len(train_rows), 4)
             self.assertIn(QUERY_CACHE_RELATED_KEY, train_rows[0])
             self.assertTrue(train_rows[0][QUERY_CACHE_RELATED_KEY])
@@ -184,10 +190,11 @@ class TestSaveLoadRoundtrip(unittest.TestCase):
             self.assertIsNone(root)
             self.assertEqual(len(mixed), 4)
 
-            # enrich should no-op OpenRouter for pre-filled queries
+            # enrich should no-op OpenRouter for curated map (no full image scan)
             enriched = enrich_rows_with_text_queries(mixed, skip_generation=True)
             self.assertEqual(len(enriched), 4)
-            self.assertTrue(enriched[0][QUERY_CACHE_RELATED_KEY])
+            sample = enriched[0] if isinstance(enriched, list) else enriched[0]
+            self.assertTrue(sample[QUERY_CACHE_RELATED_KEY] or sample.get("caption"))
 
 
 class TestImageCaptionMultiCaption(unittest.TestCase):
@@ -521,10 +528,13 @@ class TestQualityAudit(unittest.TestCase):
 class TestHubCuratedLoad(unittest.TestCase):
     """Live Hub smoke (network + HF cache). Skips only if Hub is unreachable."""
 
-    def test_stream_sample_from_published_dataset(self):
+    def test_lazy_map_does_not_require_full_materialize(self):
+        from trisearch_dataset import TriSearchMapDataset, open_trisearch_map_dataset
+
         try:
-            rows = load_trisearch_hub_rows(
-                DEFAULT_TRISEARCH_HF_DATASET,
+            ds = open_trisearch_map_dataset(
+                hf_dataset=DEFAULT_TRISEARCH_HF_DATASET,
+                prefer_local=False,
                 split="train",
                 max_samples=4,
                 seed=0,
@@ -532,15 +542,32 @@ class TestHubCuratedLoad(unittest.TestCase):
             )
         except Exception as exc:  # noqa: BLE001
             self.skipTest(f"Hub unavailable: {exc}")
-        self.assertGreaterEqual(len(rows), 2)
-        self.assertLessEqual(len(rows), 4)
-        r0 = rows[0]
+        self.assertIsInstance(ds, TriSearchMapDataset)
+        self.assertGreaterEqual(len(ds), 2)
+        self.assertLessEqual(len(ds), 4)
+        # One-at-a-time decode
+        r0 = ds[0]
         self.assertIn("image", r0)
         self.assertTrue(r0["captions"])
         self.assertTrue(r0[QUERY_CACHE_RELATED_KEY])
         self.assertEqual(r0["image"].size[0], r0["image"].size[1])
+        # meta path without image
+        m0 = ds.meta(0)
+        self.assertNotIn("image", m0)
 
-    def test_stage1_loader_uses_hub_by_default(self):
+    def test_refuse_large_materialize(self):
+        from trisearch_dataset import load_trisearch_hub_rows
+
+        with self.assertRaises(RuntimeError):
+            load_trisearch_hub_rows(
+                DEFAULT_TRISEARCH_HF_DATASET,
+                max_samples=None,
+                materialize=True,
+            )
+
+    def test_stage1_loader_returns_lazy_map(self):
+        from trisearch_dataset import TriSearchMapDataset
+
         try:
             rows, col_i, col_c, root = load_stage1_training_rows(
                 prefer_curated=True,
@@ -555,8 +582,10 @@ class TestHubCuratedLoad(unittest.TestCase):
         self.assertEqual(col_i, "image")
         self.assertEqual(col_c, "caption")
         self.assertIsNone(root)
+        self.assertIsInstance(rows, TriSearchMapDataset)
         self.assertGreaterEqual(len(rows), 2)
-        self.assertTrue(rows[0].get(QUERY_CACHE_RELATED_KEY) or rows[0].get("caption"))
+        sample = rows[0]
+        self.assertTrue(sample.get(QUERY_CACHE_RELATED_KEY) or sample.get("caption"))
 
 
 class TestOfficialSplits(unittest.TestCase):
