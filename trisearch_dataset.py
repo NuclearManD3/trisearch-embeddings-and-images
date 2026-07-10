@@ -346,6 +346,7 @@ def load_curated_training_rows(
     max_samples: int | None = None,
     seed: int = 42,
     satellite_fraction: float | None = None,
+    split: str = "train",
 ) -> list[dict[str, Any]]:
     """Load generate_datasets.py output into Stage-1 training row dicts.
 
@@ -353,11 +354,31 @@ def load_curated_training_rows(
       - image (PIL), caption, captions (list), domain, source
       - related_query (search query), unrelated_query
     Extra captions beyond the primary are available as related text pairs.
+
+    ``split`` defaults to ``\"train\"`` so official test rows are not used for
+    fitting. Pass ``split=\"test\"`` or ``split=\"all\"`` when needed.
     """
-    from trisearch_data_format import load_dataset_records
+    from trisearch_data_format import apply_official_splits, load_dataset_records
 
     root = Path(dataset_dir or DEFAULT_CURATED_DATASET_DIR)
+    # Prefer metadata path for split filtering without decoding every image first.
+    try:
+        from trisearch_quality import load_metadata_rows
+
+        meta_rows = load_metadata_rows(root)
+        apply_official_splits(meta_rows, force=False)
+        if split in ("train", "test"):
+            allowed = {r["id"] for r in meta_rows if r.get("split") == split}
+        elif split == "all":
+            allowed = None
+        else:
+            raise ValueError(f"split must be train|test|all, got {split!r}")
+    except FileNotFoundError:
+        allowed = None
+
     records = load_dataset_records(root, max_samples=None)
+    if allowed is not None:
+        records = [r for r in records if str(r.get("id")) in allowed]
     rng = random.Random(seed)
 
     if satellite_fraction is not None and 0.0 < satellite_fraction < 1.0:
@@ -397,7 +418,10 @@ def load_curated_training_rows(
             QUERY_CACHE_RELATED_KEY: related,
             QUERY_CACHE_UNRELATED_KEY: unrelated,
         })
-    print(f"Loaded curated TriSearch dataset from {root}: {len(rows):,} rows")
+    print(
+        f"Loaded curated TriSearch dataset from {root}: {len(rows):,} rows "
+        f"(split={split})"
+    )
     return rows
 
 

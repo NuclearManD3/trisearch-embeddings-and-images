@@ -41,6 +41,9 @@ from trisearch_data_format import (
     DEFAULT_EXPORT_WORKERS,
     DEFAULT_IMAGE_SIZE,
     DATASET_FORMAT_VERSION,
+    OFFICIAL_SPLIT_SEED,
+    OFFICIAL_TEST_DENOM,
+    apply_official_splits,
     save_dataset_streaming,
 )
 from trisearch_dataset_card import (
@@ -50,7 +53,7 @@ from trisearch_dataset_card import (
     write_dataset_card,
     write_license_file,
 )
-from trisearch_quality import load_metadata_rows
+from trisearch_quality import load_metadata_rows, write_metadata_jsonl
 
 
 def _log(msg: str) -> None:
@@ -118,52 +121,114 @@ def validate_export(root: Path, *, check_images: int = 64) -> list[str]:
     return errors
 
 
+def ensure_official_splits(root: Path, *, force: bool = False) -> dict[str, int]:
+    """Assign train/test (test = 1/16 per domain), write metadata + splits.json."""
+    rows = load_metadata_rows(root)
+    counts = apply_official_splits(rows, force=force)
+    write_metadata_jsonl(root / "metadata.jsonl", rows)
+
+    train_ids = sorted(r["id"] for r in rows if r.get("split") == "train")
+    test_ids = sorted(r["id"] for r in rows if r.get("split") == "test")
+    manifest = {
+        "dataset_version": DATASET_VERSION,
+        "split_seed": OFFICIAL_SPLIT_SEED,
+        "test_denom": OFFICIAL_TEST_DENOM,
+        "test_fraction": 1.0 / OFFICIAL_TEST_DENOM,
+        "rule": (
+            f"Per domain: sort ids, shuffle with Random(f'{{seed}}:{{domain}}'), "
+            f"first len//{OFFICIAL_TEST_DENOM} → test, rest → train. "
+            f"seed={OFFICIAL_SPLIT_SEED}."
+        ),
+        "counts": counts,
+        "counts_by_domain": {},
+        "train_ids": train_ids,
+        "test_ids": test_ids,
+    }
+    by_dom: dict[str, dict[str, int]] = {}
+    for r in rows:
+        d = str(r["domain"])
+        sp = str(r["split"])
+        by_dom.setdefault(d, {"train": 0, "test": 0})
+        by_dom[d][sp] += 1
+    manifest["counts_by_domain"] = by_dom
+    (root / "splits.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    _log(
+        f"  official splits: train={counts['train']:,} test={counts['test']:,} "
+        f"(1/{OFFICIAL_TEST_DENOM} per domain, seed={OFFICIAL_SPLIT_SEED}) "
+        f"→ {root / 'splits.json'}"
+    )
+    return counts
+
+
 def sync_parquet_from_metadata(
     root: Path,
     *,
     workers: int = DEFAULT_EXPORT_WORKERS,
     write_hf: bool = False,
 ) -> None:
-    """Rebuild ``data/*.parquet`` from ``metadata.jsonl`` + sidecar JPEGs.
+    """Rebuild ``data/{{train,test}}-*.parquet`` from metadata + sidecars.
 
-    Keeps ``images/`` and ``metadata.jsonl`` in place (writes via temp dir).
+    Ensures official splits first. Keeps ``images/`` in place (temp dir export).
     """
     import shutil as sh
 
+    ensure_official_splits(root, force=False)
     rows = load_metadata_rows(root)
-    staged: list[dict[str, Any]] = []
-    for row in rows:
+
+    def _stage(row: dict[str, Any]) -> dict[str, Any]:
         rel = row.get("file_name") or f"images/{row['domain']}/{row['id']}.jpg"
         img_path = root / str(rel)
         if not img_path.is_file():
             raise FileNotFoundError(f"sidecar missing for {row['id']}: {img_path}")
-        staged.append(
-            {
-                "id": row["id"],
-                "domain": row["domain"],
-                "source": row.get("source", ""),
-                "captions": list(row["captions"]),
-                "query": row["query"],
-                "unrelated_query": row["unrelated_query"],
-                "image_path": str(img_path),
-            }
+        return {
+            "id": row["id"],
+            "domain": row["domain"],
+            "source": row.get("source", ""),
+            "captions": list(row["captions"]),
+            "query": row["query"],
+            "unrelated_query": row["unrelated_query"],
+            "split": row.get("split", "train"),
+            "image_path": str(img_path),
+        }
+
+    train_rows = [_stage(r) for r in rows if r.get("split") == "train"]
+    test_rows = [_stage(r) for r in rows if r.get("split") == "test"]
+    if not train_rows or not test_rows:
+        raise RuntimeError(
+            f"split export needs both sides; train={len(train_rows)} test={len(test_rows)}"
         )
 
     tmp = root / ".publish_sync_tmp"
     if tmp.exists():
         sh.rmtree(tmp)
     _log(
-        f"  sync parquet: {len(staged):,} rows → temp export "
+        f"  sync parquet: train={len(train_rows):,} test={len(test_rows):,} "
         f"(workers={workers}, hf={write_hf}) ..."
     )
     t0 = time.monotonic()
+    # Train first (clears temp), then test into same temp data/
     save_dataset_streaming(
-        staged,
+        train_rows,
+        tmp,
+        write_sidecar_jpegs=False,
+        write_hf_arrow=False,
+        workers=workers,
+        split_name="train",
+        clear_output=True,
+    )
+    save_dataset_streaming(
+        test_rows,
         tmp,
         write_sidecar_jpegs=False,
         write_hf_arrow=write_hf,
         workers=workers,
+        split_name="test",
+        clear_output=False,
     )
+    # Prefer full metadata with split from root (already written by ensure_*)
     data_src = tmp / "data"
     if not data_src.is_dir():
         raise RuntimeError("sync failed: no data/ in temp export")
@@ -178,13 +243,14 @@ def sync_parquet_from_metadata(
             if hf_dst.exists():
                 sh.rmtree(hf_dst)
             sh.move(str(hf_src), str(hf_dst))
-    for name in ("dataset_info.json",):
-        src = tmp / name
-        if src.is_file():
-            sh.copy2(src, root / name)
     sh.rmtree(tmp, ignore_errors=True)
-    _log(f"  sync parquet done in {time.monotonic() - t0:.1f}s "
-         f"({_dir_size_gb(root / 'data'):.2f} GB)")
+    n_train = len(list((root / "data").glob("train-*.parquet")))
+    n_test = len(list((root / "data").glob("test-*.parquet")))
+    _log(
+        f"  sync parquet done in {time.monotonic() - t0:.1f}s "
+        f"({_dir_size_gb(root / 'data'):.2f} GB, "
+        f"train_shards={n_train}, test_shards={n_test})"
+    )
 
 
 def update_dataset_info(root: Path, stats: dict[str, Any]) -> Path:
@@ -209,8 +275,14 @@ def update_dataset_info(root: Path, stats: dict[str, Any]) -> Path:
         "query_collision_rate": stats["query_collision_rate"],
         "unrelated_collision_rate": stats["unrelated_collision_rate"],
         "hf_disk_path": "hf",
-        "parquet_glob": "data/train-*.parquet",
-        "release": "preliminary",
+        "parquet_glob": "data/{train,test}-*.parquet",
+        "splits": stats.get("splits") or {
+            "train": "data/train-*.parquet",
+            "test": "data/test-*.parquet",
+            "test_fraction": 1.0 / OFFICIAL_TEST_DENOM,
+            "seed": OFFICIAL_SPLIT_SEED,
+        },
+        "release": DATASET_VERSION,
         "generated_on": stats.get("generated_on"),
     }
     path = root / "dataset_info.json"
@@ -245,8 +317,16 @@ def build_staging_dir(
             manifest["files"].append(str(dst.relative_to(staging)))
 
     # Required small files
-    for name in ("README.md", "LICENSE", "dataset_info.json", "metadata.jsonl"):
+    for name in (
+        "README.md",
+        "LICENSE",
+        "dataset_info.json",
+        "metadata.jsonl",
+        "splits.json",
+    ):
         src = root / name
+        if name == "splits.json" and not src.is_file():
+            continue
         if not src.is_file():
             raise FileNotFoundError(f"staging requires {src}")
         _link_or_copy(src, staging / name)
@@ -260,15 +340,24 @@ def build_staging_dir(
         if qr.is_file():
             _link_or_copy(qr, staging / "quality_report.json")
 
-    # Parquet shards
+    # Parquet shards (train + test)
     data_src = root / "data"
-    parquet = sorted(data_src.glob("train-*.parquet")) if data_src.is_dir() else []
-    if not parquet:
+    train_pq = sorted(data_src.glob("train-*.parquet")) if data_src.is_dir() else []
+    test_pq = sorted(data_src.glob("test-*.parquet")) if data_src.is_dir() else []
+    # Ignore incomplete part files
+    train_pq = [p for p in train_pq if "-part-" not in p.name]
+    test_pq = [p for p in test_pq if "-part-" not in p.name]
+    if not train_pq:
         raise FileNotFoundError(
-            f"No parquet shards under {data_src}; run with --sync-parquet first"
+            f"No train parquet shards under {data_src}; run with --sync-parquet first"
         )
-    for p in parquet:
+    if not test_pq:
+        raise FileNotFoundError(
+            f"No test parquet shards under {data_src}; run with --sync-parquet first"
+        )
+    for p in train_pq + test_pq:
         _link_or_copy(p, staging / "data" / p.name)
+    parquet = train_pq + test_pq
 
     if include_sidecars and (root / "images").is_dir():
         # Symlink whole tree is awkward; link domain dirs
@@ -493,9 +582,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _log("  OK")
 
-    # 2) Optional parquet sync (text repair → hub snapshot)
+    # 2) Official splits always; optional parquet sync (text repair → hub snapshot)
+    _log("\n[2/5] Official train/test splits + optional parquet sync")
+    try:
+        ensure_official_splits(root, force=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  split assign failed: {exc}", file=sys.stderr)
+        return 1
     if args.sync_parquet:
-        _log("\n[2/5] Sync parquet from metadata + sidecars")
         try:
             sync_parquet_from_metadata(
                 root,
@@ -506,7 +600,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  sync failed: {exc}", file=sys.stderr)
             return 1
     else:
-        _log("\n[2/5] Sync parquet — skipped (pass --sync-parquet after repairs)")
+        test_pq = list((root / "data").glob("test-*.parquet")) if (root / "data").is_dir() else []
+        if not test_pq:
+            _log(
+                "  WARNING: no data/test-*.parquet yet — Hub package needs "
+                "--sync-parquet before upload"
+            )
+        else:
+            _log("  parquet sync skipped (existing train/test shards present)")
 
     # 3) Card + license + info
     _log("\n[3/5] Write dataset card + LICENSE + dataset_info")

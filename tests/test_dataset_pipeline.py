@@ -512,13 +512,32 @@ class TestQualityAudit(unittest.TestCase):
             self.assertIn(uq, text)
 
 
+class TestOfficialSplits(unittest.TestCase):
+    def test_assign_one_sixteenth_stratified(self):
+        from trisearch_data_format import assign_official_splits, apply_official_splits
+
+        rows = []
+        for d, prefix, n in (("general", "g", 32), ("satellite", "s", 32)):
+            for i in range(n):
+                rows.append({"id": f"{prefix}-{i:04d}", "domain": d})
+        mapping = assign_official_splits(rows, seed=42, test_denom=16)
+        # 32//16 = 2 test per domain
+        self.assertEqual(sum(1 for v in mapping.values() if v == "test"), 4)
+        self.assertEqual(sum(1 for v in mapping.values() if v == "train"), 60)
+        # Deterministic
+        mapping2 = assign_official_splits(rows, seed=42, test_denom=16)
+        self.assertEqual(mapping, mapping2)
+        apply_official_splits(rows, force=True)
+        self.assertTrue(all(r["split"] in ("train", "test") for r in rows))
+
+
 class TestDatasetCard(unittest.TestCase):
     def test_render_card_has_front_matter_and_sections(self):
         from trisearch_dataset_card import render_dataset_card
 
         stats = {
             "dataset_name": "TriSearch-v1",
-            "dataset_version": "0.1.0-preliminary",
+            "dataset_version": "0.0.1",
             "format_version": 1,
             "image_size": 1024,
             "num_rows": 100,
@@ -533,9 +552,23 @@ class TestDatasetCard(unittest.TestCase):
             "unrelated_collision_rate": 0.2,
             "generic_unrelated_count": 0,
             "quality": {"num_flagged": 5, "num_rows": 100, "pct_flagged": 5.0},
+            "splits": {
+                "train": 94,
+                "test": 6,
+                "test_denom": 16,
+                "test_fraction": 1 / 16,
+                "seed": 42,
+                "by_domain": {
+                    "general": {"train": 47, "test": 3},
+                    "satellite": {"train": 47, "test": 3},
+                },
+            },
             "layout": {
                 "metadata_jsonl": True,
-                "parquet_shards": 2,
+                "splits_json": True,
+                "train_parquet_shards": 2,
+                "test_parquet_shards": 1,
+                "parquet_shards": 3,
                 "sidecar_images": True,
                 "hf_arrow": False,
             },
@@ -555,7 +588,10 @@ class TestDatasetCard(unittest.TestCase):
         self.assertTrue(card.startswith("---"))
         self.assertIn("pretty_name:", card)
         self.assertIn("load_dataset", card)
-        self.assertIn("Preliminary", card)
+        self.assertIn("0.0.1", card)
+        self.assertIn("split: test", card)
+        self.assertIn("Official splits", card)
+        self.assertNotIn("no official validation/test split", card.lower())
         self.assertIn("SkyScript", card)
         self.assertIn("unrelated_query", card)
         self.assertIn("composite", card.lower())

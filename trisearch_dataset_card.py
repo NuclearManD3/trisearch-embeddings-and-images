@@ -19,17 +19,19 @@ from trisearch_data_format import (
     DATASET_FORMAT_VERSION,
     DEFAULT_DATASET_ROOT,
     DEFAULT_IMAGE_SIZE,
+    OFFICIAL_SPLIT_SEED,
+    OFFICIAL_TEST_DENOM,
+    apply_official_splits,
 )
 from trisearch_quality import (
-    _norm,
     corpus_frequencies,
     is_generic_unrelated,
     load_metadata_rows,
 )
 
-# Preliminary public release identity
+# Public release identity
 DATASET_NAME = "TriSearch-v1"
-DATASET_VERSION = "0.1.0-preliminary"
+DATASET_VERSION = "0.0.1"
 DEFAULT_HF_REPO_HINT = "NuclearManD/trisearch-v1"
 
 
@@ -44,6 +46,15 @@ def collect_dataset_stats(
     rows = load_metadata_rows(root)
     if not rows:
         raise ValueError(f"No rows in {root / 'metadata.jsonl'}")
+
+    # Ensure split labels present for stats (does not rewrite disk here).
+    split_counts = apply_official_splits(rows, force=False)
+    split_by_domain: dict[str, dict[str, int]] = {}
+    for r in rows:
+        d = str(r["domain"])
+        sp = str(r.get("split") or "train")
+        split_by_domain.setdefault(d, {"train": 0, "test": 0})
+        split_by_domain[d][sp] = split_by_domain[d].get(sp, 0) + 1
 
     domains: Counter[str] = Counter()
     sources: Counter[str] = Counter()
@@ -81,10 +92,21 @@ def collect_dataset_stats(
         except (json.JSONDecodeError, OSError):
             info = {}
 
-    parquet_files = sorted((root / "data").glob("train-*.parquet")) if (root / "data").is_dir() else []
+    data_dir = root / "data"
+    train_parquet = (
+        sorted(p for p in data_dir.glob("train-*.parquet") if "-part-" not in p.name)
+        if data_dir.is_dir()
+        else []
+    )
+    test_parquet = (
+        sorted(p for p in data_dir.glob("test-*.parquet") if "-part-" not in p.name)
+        if data_dir.is_dir()
+        else []
+    )
     has_images = (root / "images").is_dir()
     has_hf = (root / "hf").is_dir()
     has_meta = (root / "metadata.jsonl").is_file()
+    has_splits_json = (root / "splits.json").is_file()
 
     rng = random.Random(sample_seed)
     # Stratified-ish: prefer one general + one satellite when possible
@@ -143,9 +165,24 @@ def collect_dataset_stats(
         "unrelated_collision_rate": round(1.0 - len(u_freq) / n, 4) if n else 0.0,
         "generic_unrelated_count": generic_uq,
         "quality": quality,
+        "splits": {
+            "train": split_counts.get("train", 0),
+            "test": split_counts.get("test", 0),
+            "test_denom": OFFICIAL_TEST_DENOM,
+            "test_fraction": 1.0 / OFFICIAL_TEST_DENOM,
+            "seed": OFFICIAL_SPLIT_SEED,
+            "by_domain": split_by_domain,
+            "rule": (
+                f"Per domain: sort ids, shuffle with Random(f'{{seed}}:{{domain}}'), "
+                f"first floor(n/{OFFICIAL_TEST_DENOM}) → test; seed={OFFICIAL_SPLIT_SEED}."
+            ),
+        },
         "layout": {
             "metadata_jsonl": has_meta,
-            "parquet_shards": len(parquet_files),
+            "splits_json": has_splits_json,
+            "train_parquet_shards": len(train_parquet),
+            "test_parquet_shards": len(test_parquet),
+            "parquet_shards": len(train_parquet) + len(test_parquet),
             "sidecar_images": has_images,
             "hf_arrow": has_hf,
         },
@@ -182,8 +219,10 @@ def _yaml_front_matter(
         "coco",
         "skyscript",
         "matryoshka",
-        "preliminary",
     ]
+    splits = stats.get("splits") or {}
+    n_train = int(splits.get("train") or 0)
+    n_test = int(splits.get("test") or 0)
     # HuggingFace dataset card YAML (see huggingface.co/docs/hub/datasets-cards)
     lines = [
         "---",
@@ -201,7 +240,7 @@ def _yaml_front_matter(
         "task_ids:",
         "  - multi-class-image-classification",
         "  - multi-label-image-classification",
-        f"size_categories:",
+        "size_categories:",
         f"  - {size_cat}",
         "annotations_creators:",
         "  - found",
@@ -227,11 +266,15 @@ def _yaml_front_matter(
             f"  format_version: {stats['format_version']}",
             f"  num_examples: {n}",
             f"  image_size: {stats['image_size']}",
+            f"  train_examples: {n_train}",
+            f"  test_examples: {n_test}",
             "configs:",
             "  - config_name: default",
             "    data_files:",
             "      - split: train",
             "        path: data/train-*.parquet",
+            "      - split: test",
+            "        path: data/test-*.parquet",
             "    default: true",
         ]
     )
@@ -287,6 +330,19 @@ def render_dataset_card(
     img = int(stats["image_size"])
     q = stats.get("quality") or {}
     layout = stats.get("layout") or {}
+    splits = stats.get("splits") or {}
+    n_train = int(splits.get("train") or 0)
+    n_test = int(splits.get("test") or 0)
+    test_frac = splits.get("test_fraction") or (1.0 / OFFICIAL_TEST_DENOM)
+    split_seed = splits.get("seed", OFFICIAL_SPLIT_SEED)
+    by_dom = splits.get("by_domain") or {}
+    split_dom_lines = []
+    for d in sorted(by_dom.keys()):
+        td = by_dom[d]
+        split_dom_lines.append(
+            f"| `{d}` | {td.get('train', 0):,} | {td.get('test', 0):,} |"
+        )
+    split_dom_table = "\n".join(split_dom_lines) if split_dom_lines else "| — | — | — |"
 
     flagged_line = ""
     if q:
@@ -299,11 +355,10 @@ def render_dataset_card(
 
     body = f"""# {pretty}
 
-> **Preliminary public data release** for the TriSearch multimodal training stack.
-> This is an **initial curated corpus** (v{stats['dataset_version']}) intended for
-> research on joint image–text embedding spaces (contrastive + query-style text).
-> Expect schema stability with possible additive fields and quality improvements
-> in later versions. Not a final production benchmark.
+> **Initial public data release** for the TriSearch multimodal training stack
+> (**v{stats['dataset_version']}**). Curated image–text corpus for joint embedding
+> spaces (contrastive training + query-style text). Schema is intended to stay
+> stable; later versions may add fields or tighten quality filters.
 
 ## Summary
 
@@ -311,6 +366,7 @@ def render_dataset_card(
 |--|--|
 | **Version** | `{stats['dataset_version']}` (format v{stats['format_version']}) |
 | **Examples** | **{n:,}** image–text records |
+| **Train / test** | **{n_train:,}** / **{n_test:,}** (test = 1/{OFFICIAL_TEST_DENOM} of data) |
 | **Image size** | **{img}×{img}** RGB JPEG (center-crop after short-side scale) |
 | **Domains** | {_fmt_domains(stats['domains'])} |
 | **Captions / image** | {stats['captions_per_image']['min']}–{stats['captions_per_image']['max']} (mean {stats['captions_per_image']['mean']}) |
@@ -354,6 +410,7 @@ Each row is one training example:
 | `captions` | `list[string]` | ≥2 diverse natural-language captions for the **same** image |
 | `query` | `string` | Short search-style query expected to match this image |
 | `unrelated_query` | `string` | Search-style distractor on a **different** topic |
+| `split` | `string` | `train` or `test` (also encoded by parquet path) |
 
 ### On-disk / Hub layout
 
@@ -362,9 +419,11 @@ Each row is one training example:
   README.md                 # this card
   LICENSE                   # composite upstream notice
   dataset_info.json         # machine-readable stats
-  metadata.jsonl            # text fields + relative image paths (no pixels)
+  splits.json               # frozen train/test id lists + rule
+  metadata.jsonl            # text fields + split + relative image paths
   data/
-    train-XXXXX-of-YYYYY.parquet   # full rows including embedded images
+    train-XXXXX-of-YYYYY.parquet
+    test-XXXXX-of-YYYYY.parquet
   quality_report.json       # optional automated QC snapshot (if shipped)
 ```
 
@@ -374,7 +433,9 @@ Arrow `hf/` tree; the **Hub package prioritizes parquet** for `load_dataset`.
 | Artifact | Present in local export |
 |----------|-------------------------|
 | `metadata.jsonl` | {layout.get('metadata_jsonl')} |
-| parquet shards | {layout.get('parquet_shards')} |
+| `splits.json` | {layout.get('splits_json')} |
+| train parquet shards | {layout.get('train_parquet_shards')} |
+| test parquet shards | {layout.get('test_parquet_shards')} |
 | sidecar `images/` | {layout.get('sidecar_images')} |
 | `hf/` Arrow | {layout.get('hf_arrow')} |
 
@@ -440,11 +501,11 @@ of every row, or hard near-duplicate image dedup across sources. Treat as a
 - Safety / toxicity benchmarking
 - Geographic or demographic fairness claims
 - Medical or high-stakes remote-sensing decisions
-- Claiming SOTA retrieval numbers without an independent test split
+- Claiming SOTA numbers without reporting the **official `test` split** (or a clearly documented alternative)
 
 ## Out-of-scope uses
 
-- Do not present this preliminary mix as “the” standard RS or COCO replacement
+- Do not present this mix as “the” standard RS or COCO replacement
 - Do not ignore upstream licenses when redistributing derivatives
 - Do not use machine-generated queries as if they were human search logs
 
@@ -455,9 +516,12 @@ of every row, or hard near-duplicate image dedup across sources. Treat as a
 ```python
 from datasets import load_dataset
 
-ds = load_dataset("{repo_id or DEFAULT_HF_REPO_HINT}", split="train")
-print(ds)
-row = ds[0]
+# Official splits
+train = load_dataset("{repo_id or DEFAULT_HF_REPO_HINT}", split="train")
+test = load_dataset("{repo_id or DEFAULT_HF_REPO_HINT}", split="test")
+print(len(train), len(test))
+
+row = train[0]
 print(row["id"], row["domain"], row["query"])
 row["image"]  # PIL.Image.Image, {img}x{img}
 print(row["captions"])
@@ -475,18 +539,20 @@ for row in ds.take(3):
 ### From a local export
 
 ```python
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 
-# Parquet shards (embedded images)
-ds = load_dataset("parquet", data_files="data/train-*.parquet", split="train")
+train = load_dataset(
+    "parquet", data_files={{"train": "data/train-*.parquet"}}, split="train"
+)
+test = load_dataset(
+    "parquet", data_files={{"test": "data/test-*.parquet"}}, split="test"
+)
 
-# Or Arrow export if present
-# ds = load_from_disk("hf")
-
-# Text-only index (no pixels) for fast filtering
+# Text-only index (includes split field)
 import json
 with open("metadata.jsonl") as f:
     meta = [json.loads(line) for line in f]
+test_ids = {{r["id"] for r in meta if r.get("split") == "test"}}
 ```
 
 ### With the TriSearch training stack
@@ -494,6 +560,7 @@ with open("metadata.jsonl") as f:
 ```python
 from trisearch_dataset import load_curated_training_rows
 
+# Defaults to official train split only (does not leak test)
 rows = load_curated_training_rows("models/data/trisearch-v1", seed=42)
 # each row: image, caption(s), related_query, unrelated_query, domain, ...
 ```
@@ -511,19 +578,33 @@ where repair succeeded).
 
 ## Splits
 
-This preliminary release ships a single **`train`** split only.
+**Official splits (frozen for v{stats['dataset_version']}):**
 
-There is **no official validation/test split** yet. If you report numbers:
+| Split | Count | Fraction |
+|-------|------:|---------:|
+| `train` | {n_train:,} | ~{100 * (1 - test_frac):.1f}% |
+| `test` | {n_test:,} | **1/{OFFICIAL_TEST_DENOM}** (~{100 * test_frac:.1f}%) |
+| **total** | {n:,} | 100% |
 
-1. Hold out your own random or domain-stratified subset, or
-2. Wait for a later release with frozen eval ids
+**Per domain** (stratified — each domain contributes 1/{OFFICIAL_TEST_DENOM} to test):
 
-Recommended ad-hoc holdout:
+| Domain | Train | Test |
+|--------|------:|-----:|
+{split_dom_table}
 
-```python
-ds = ds.train_test_split(test_size=0.02, seed=42)
-train, smoke_test = ds["train"], ds["test"]
-```
+**Assignment rule (deterministic):**
+
+1. Group rows by `domain`.
+2. Sort ids within the domain.
+3. Shuffle with `random.Random(f"{{seed}}:{{domain}}")` where **seed = {split_seed}**.
+4. First `floor(n_domain / {OFFICIAL_TEST_DENOM})` ids → **`test`**; remainder → **`train`**.
+
+Canonical id lists ship in **`splits.json`**. Do not re-split for reported
+benchmarks — use `split="test"` from this release.
+
+**Training guidance:** fit models on **`train` only**. Use **`test`** for
+held-out retrieval / ranking metrics. There is no separate validation split;
+if you need early stopping, carve a small subset from **train** only.
 
 ## Data fields (detailed)
 
@@ -627,14 +708,15 @@ Also cite MS-COCO and SkyScript as required by their authors:
 
 ## Changelog
 
-### `{stats['dataset_version']}` — preliminary
+### `{stats['dataset_version']}`
 
 - Initial public packaging of {n:,} curated rows
+- Official **train / test** split (test = 1/{OFFICIAL_TEST_DENOM}, domain-stratified, seed={split_seed})
 - 50/50 general (COCO) / satellite (SkyScript)
 - {img}×{img} images, multi-caption, query + unrelated_query
 - Diversity filtering + LLM assist + post-hoc repair for distractors/queries
 - Automated text QC report
-- HF parquet layout for `load_dataset`
+- HF parquet layout (`data/train-*.parquet`, `data/test-*.parquet`)
 
 ## Maintenance
 

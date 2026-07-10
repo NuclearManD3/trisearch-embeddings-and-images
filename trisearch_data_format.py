@@ -58,6 +58,11 @@ VALID_DOMAINS = frozenset({DOMAIN_GENERAL, DOMAIN_SATELLITE})
 DEFAULT_WRITE_CHUNK = 256  # rows per parquet flush
 DEFAULT_EXPORT_WORKERS = 16  # parallel image/sidecar I/O during export
 
+# Official Hub splits (frozen for v0.0.1+)
+OFFICIAL_SPLIT_SEED = 42
+OFFICIAL_TEST_DENOM = 16  # test size = floor(n_domain / 16) per domain
+VALID_SPLITS = frozenset({"train", "test"})
+
 REQUIRED_FIELDS = (
     "id",
     "domain",
@@ -353,7 +358,73 @@ def _prepare_export_row(
             "query": query,
             "unrelated_query": unrelated,
         }
+        if row.get("split"):
+            meta["split"] = str(row["split"])
     return rec, meta
+
+
+def assign_official_splits(
+    rows: Sequence[dict[str, Any]],
+    *,
+    seed: int = OFFICIAL_SPLIT_SEED,
+    test_denom: int = OFFICIAL_TEST_DENOM,
+) -> dict[str, str]:
+    """Map row ``id`` → ``train``|``test`` (stratified by domain).
+
+    For each domain independently: sort ids, shuffle with
+    ``Random(f\"{seed}:{domain}\")``, take the first ``len // test_denom``
+    as **test**, remainder as **train**.
+
+    With 32 768 rows/domain and ``test_denom=16`` → 2 048 test + 30 720 train
+    per domain (4 096 / 61 440 overall on a full 65 536-row export).
+    """
+    import random
+    from collections import defaultdict
+
+    if test_denom < 2:
+        raise ValueError("test_denom must be >= 2")
+    by_domain: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        rid = str(row["id"])
+        domain = str(row.get("domain", "unknown"))
+        by_domain[domain].append(rid)
+
+    id_to_split: dict[str, str] = {}
+    for domain in sorted(by_domain.keys()):
+        ids = sorted(set(by_domain[domain]))
+        rng = random.Random(f"{seed}:{domain}")
+        rng.shuffle(ids)
+        n_test = len(ids) // test_denom
+        for i, rid in enumerate(ids):
+            id_to_split[rid] = "test" if i < n_test else "train"
+    return id_to_split
+
+
+def apply_official_splits(
+    rows: list[dict[str, Any]],
+    *,
+    seed: int = OFFICIAL_SPLIT_SEED,
+    test_denom: int = OFFICIAL_TEST_DENOM,
+    force: bool = False,
+) -> dict[str, int]:
+    """Set ``row['split']`` in place. Returns counts ``{train, test}``.
+
+    If every row already has a valid split and ``force`` is False, keeps them.
+    """
+    have_all = all(str(r.get("split", "")) in VALID_SPLITS for r in rows)
+    if have_all and not force:
+        counts = {"train": 0, "test": 0}
+        for r in rows:
+            counts[str(r["split"])] += 1
+        return counts
+
+    id_to_split = assign_official_splits(rows, seed=seed, test_denom=test_denom)
+    counts = {"train": 0, "test": 0}
+    for row in rows:
+        sp = id_to_split[str(row["id"])]
+        row["split"] = sp
+        counts[sp] += 1
+    return counts
 
 
 def save_dataset_streaming(
@@ -365,6 +436,8 @@ def save_dataset_streaming(
     jpeg_quality: int = 92,
     write_hf_arrow: bool = True,
     workers: int = DEFAULT_EXPORT_WORKERS,
+    split_name: str = "train",
+    clear_output: bool = True,
 ) -> Path:
     """Write dataset from staged rows without loading all images at once.
 
@@ -375,13 +448,16 @@ def save_dataset_streaming(
     Row prep + sidecar copies run in a thread pool (``workers``, default 16).
     Staged JPEGs are embedded as raw bytes (no PIL re-encode). Peak memory is
     O(chunk_size) rows, not O(N).
+
+    ``split_name`` prefixes parquet files (``train-*.parquet`` / ``test-*.parquet``).
+    Set ``clear_output=False`` when appending a second split into the same dir.
     """
     import gc
 
     from datasets import Dataset
 
     output_dir = Path(output_dir)
-    if output_dir.exists():
+    if clear_output and output_dir.exists():
         # Remove previous export contents carefully (keep parent / progress cache).
         for name in ("data", "hf", "images", "metadata.jsonl",
                      "dataset_info.json", "README.md"):
@@ -400,6 +476,7 @@ def save_dataset_streaming(
     if chunk_size < 1:
         raise ValueError("chunk_size must be >= 1")
     n_workers = max(1, min(int(workers), 16))
+    prefix = str(split_name or "train")
 
     domains: dict[str, int] = {"general": 0, "satellite": 0}
     sources: dict[str, int] = {}
@@ -417,7 +494,7 @@ def save_dataset_streaming(
         if not chunk:
             return
         ds = Dataset.from_list(chunk, features=features_spec())
-        out = data_dir / f"train-part-{shard_i:05d}.parquet"
+        out = data_dir / f"{prefix}-part-{shard_i:05d}.parquet"
         ds.to_parquet(str(out))
         parquet_paths.append(out)
         shard_i += 1
@@ -430,7 +507,7 @@ def save_dataset_streaming(
     n_total = len(staged_rows)
     t0 = time.monotonic()
     print(
-        f"  export: writing {n_total:,} rows (chunk={chunk_size}, "
+        f"  export[{prefix}]: writing {n_total:,} rows (chunk={chunk_size}, "
         f"sidecars={write_sidecar_jpegs}, workers={n_workers}) ...",
         flush=True,
     )
@@ -443,7 +520,8 @@ def save_dataset_streaming(
             jpeg_quality=jpeg_quality,
         )
 
-    with open(meta_path, "w", encoding="utf-8") as meta_fh, ThreadPoolExecutor(
+    meta_mode = "w" if clear_output else "a"
+    with open(meta_path, meta_mode, encoding="utf-8") as meta_fh, ThreadPoolExecutor(
         max_workers=n_workers
     ) as pool:
         for start in range(0, n_total, chunk_size):
@@ -464,19 +542,19 @@ def save_dataset_streaming(
             rate = total / elapsed
             eta = (n_total - total) / rate if rate > 0 else 0
             print(
-                f"  wrote {total:,}/{n_total:,} rows "
+                f"  wrote[{prefix}] {total:,}/{n_total:,} rows "
                 f"({rate:.1f}/s, ETA {eta / 60:.1f} min, "
                 f"shard {shard_i})",
                 flush=True,
             )
 
-    print(f"  parquet pass complete: {total:,} rows", flush=True)
+    print(f"  parquet pass complete[{prefix}]: {total:,} rows", flush=True)
 
-    # Rename parts to train-XXXXX-of-YYYYY.parquet
+    # Rename parts to {split}-XXXXX-of-YYYYY.parquet
     n_shards = len(parquet_paths)
     final_paths: list[Path] = []
     for i, path in enumerate(parquet_paths):
-        final = data_dir / f"train-{i:05d}-of-{n_shards:05d}.parquet"
+        final = data_dir / f"{prefix}-{i:05d}-of-{n_shards:05d}.parquet"
         path.rename(final)
         final_paths.append(final)
 

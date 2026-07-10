@@ -379,17 +379,18 @@ def load_metadata_rows(
             if not line:
                 continue
             meta = json.loads(line)
-            rows.append(
-                {
-                    "id": str(meta["id"]),
-                    "domain": str(meta["domain"]),
-                    "source": str(meta.get("source", "")),
-                    "captions": list(meta.get("captions") or []),
-                    "query": str(meta.get("query", "")),
-                    "unrelated_query": str(meta.get("unrelated_query", "")),
-                    "file_name": str(meta.get("file_name", "")),
-                }
-            )
+            rec = {
+                "id": str(meta["id"]),
+                "domain": str(meta["domain"]),
+                "source": str(meta.get("source", "")),
+                "captions": list(meta.get("captions") or []),
+                "query": str(meta.get("query", "")),
+                "unrelated_query": str(meta.get("unrelated_query", "")),
+                "file_name": str(meta.get("file_name", "")),
+            }
+            if meta.get("split"):
+                rec["split"] = str(meta["split"])
+            rows.append(rec)
     return rows
 
 
@@ -733,6 +734,8 @@ def write_metadata_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
                     "query": str(row.get("query", "")),
                     "unrelated_query": str(row.get("unrelated_query", "")),
                 }
+                if row.get("split"):
+                    rec["split"] = str(row["split"])
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         os.replace(tmp_name, path)
     except BaseException:
