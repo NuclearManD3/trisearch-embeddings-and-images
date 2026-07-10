@@ -8,7 +8,7 @@ Images are **never** all kept in RAM. Flow:
 
 1. Stream sources → resize to 1024 → write staging JPEG to disk → keep metadata only.
 2. Diversify captions / generate queries (text-only, low RAM).
-3. Export parquet + hf/ in small chunks (``--write-chunk``, default 64).
+3. Export parquet + hf/ in chunks (``--write-chunk``, default 4096 rows ≈ ~0.7GB).
 
 Sources
 -------

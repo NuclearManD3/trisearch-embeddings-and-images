@@ -55,7 +55,10 @@ DEFAULT_DATASET_ROOT = Path("models/data/trisearch-v1")
 DOMAIN_GENERAL = "general"
 DOMAIN_SATELLITE = "satellite"
 VALID_DOMAINS = frozenset({DOMAIN_GENERAL, DOMAIN_SATELLITE})
-DEFAULT_WRITE_CHUNK = 256  # rows per parquet flush
+# Rows per parquet shard. 256 was a legacy RAM cap when PIL images were held
+# in memory (~40MB shards). With staged JPEG-bytes embedding, ~4k–8k rows is
+# fine and yields ~0.6–1.2GB shards (better for Hub / fewer files).
+DEFAULT_WRITE_CHUNK = 4096
 DEFAULT_EXPORT_WORKERS = 16  # parallel image/sidecar I/O during export
 
 # Official Hub splits (frozen for v0.0.1+)

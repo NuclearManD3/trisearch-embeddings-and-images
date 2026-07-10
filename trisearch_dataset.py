@@ -23,7 +23,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 # Stage 1 defaults (training_plan.md §2–3)
-# Prefer the curated TriSearch export from generate_datasets.py when present.
+# Published curated corpus on the Hub (preferred). Local export is optional cache.
+DEFAULT_TRISEARCH_HF_DATASET = "NuclearManD/trisearch-dataset-64k-v0.0.1"
 DEFAULT_CURATED_DATASET_DIR = Path("models/data/trisearch-v1")
 DEFAULT_SATELLITE_DATASET = "SkyScript"
 DEFAULT_SATELLITE_SPLIT = "train"
@@ -336,54 +337,60 @@ def build_mixed_dataset(
 
 
 def curated_dataset_available(path: str | Path | None = None) -> bool:
+    """True if a *local* curated export exists (parquet / hf / metadata+images)."""
     root = Path(path or DEFAULT_CURATED_DATASET_DIR)
-    return (root / "hf").is_dir() or any((root / "data").glob("*.parquet")) if root.is_dir() else False
+    if not root.is_dir():
+        return False
+    if (root / "hf").is_dir():
+        return True
+    if any((root / "data").glob("*.parquet")):
+        return True
+    if (root / "metadata.jsonl").is_file() and (root / "images").is_dir():
+        return True
+    return False
 
 
-def load_curated_training_rows(
-    dataset_dir: str | Path | None = None,
+def _row_from_trisearch_record(rec: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a curated record (local or Hub) into a training/demo row."""
+    captions = list(rec.get("captions") or [])
+    if not captions:
+        raise ValueError(f"row {rec.get('id')!r} has no captions")
+    primary = str(captions[0]).strip()
+    related = str(rec.get("query") or "").strip()
+    if not related and len(captions) > 1:
+        related = str(captions[1]).strip()
+    unrelated = str(rec.get("unrelated_query") or "").strip()
+    image = rec.get("image")
+    if image is not None and not isinstance(image, Image.Image):
+        image = load_pil_image(image)
+    if isinstance(image, Image.Image):
+        # .copy() detaches from HF streaming/file handles (avoids exit crashes).
+        image = image.convert("RGB").copy()
+    elif image is None:
+        raise ValueError(f"row {rec.get('id')!r} missing image")
+    return {
+        "image": image,
+        "caption": primary,
+        "captions": [str(c) for c in captions],
+        "domain": str(rec.get("domain") or "general"),
+        "source": str(rec.get("source") or "trisearch"),
+        "id": str(rec.get("id") or ""),
+        QUERY_CACHE_RELATED_KEY: related,
+        QUERY_CACHE_UNRELATED_KEY: unrelated,
+    }
+
+
+def _balance_domain_sample(
+    records: list[dict[str, Any]],
     *,
-    max_samples: int | None = None,
-    seed: int = 42,
-    satellite_fraction: float | None = None,
-    split: str = "train",
+    max_samples: int | None,
+    seed: int,
+    satellite_fraction: float | None,
 ) -> list[dict[str, Any]]:
-    """Load generate_datasets.py output into Stage-1 training row dicts.
-
-    Each row has:
-      - image (PIL), caption, captions (list), domain, source
-      - related_query (search query), unrelated_query
-    Extra captions beyond the primary are available as related text pairs.
-
-    ``split`` defaults to ``\"train\"`` so official test rows are not used for
-    fitting. Pass ``split=\"test\"`` or ``split=\"all\"`` when needed.
-    """
-    from trisearch_data_format import apply_official_splits, load_dataset_records
-
-    root = Path(dataset_dir or DEFAULT_CURATED_DATASET_DIR)
-    # Prefer metadata path for split filtering without decoding every image first.
-    try:
-        from trisearch_quality import load_metadata_rows
-
-        meta_rows = load_metadata_rows(root)
-        apply_official_splits(meta_rows, force=False)
-        if split in ("train", "test"):
-            allowed = {r["id"] for r in meta_rows if r.get("split") == split}
-        elif split == "all":
-            allowed = None
-        else:
-            raise ValueError(f"split must be train|test|all, got {split!r}")
-    except FileNotFoundError:
-        allowed = None
-
-    records = load_dataset_records(root, max_samples=None)
-    if allowed is not None:
-        records = [r for r in records if str(r.get("id")) in allowed]
     rng = random.Random(seed)
-
     if satellite_fraction is not None and 0.0 < satellite_fraction < 1.0:
-        sat = [r for r in records if r["domain"] == "satellite"]
-        gen = [r for r in records if r["domain"] == "general"]
+        sat = [r for r in records if str(r.get("domain")) == "satellite"]
+        gen = [r for r in records if str(r.get("domain")) == "general"]
         if sat and gen:
             if max_samples is not None:
                 n_sat = int(round(max_samples * satellite_fraction))
@@ -392,44 +399,209 @@ def load_curated_training_rows(
                 n_sat, n_gen = len(sat), len(gen)
             rng.shuffle(sat)
             rng.shuffle(gen)
-            records = sat[:n_sat] + gen[:n_gen]
-            rng.shuffle(records)
-        elif max_samples is not None and len(records) > max_samples:
-            records = rng.sample(records, max_samples)
-    elif max_samples is not None and len(records) > max_samples:
-        records = rng.sample(records, max_samples)
+            out = sat[:n_sat] + gen[:n_gen]
+            rng.shuffle(out)
+            return out
+    if max_samples is not None and len(records) > max_samples:
+        return rng.sample(records, max_samples)
+    return records
 
-    rows: list[dict[str, Any]] = []
-    for rec in records:
-        captions = list(rec["captions"])
-        primary = captions[0]
-        # Prefer curated search query; fall back to a secondary caption.
-        related = str(rec.get("query") or "").strip()
-        if not related and len(captions) > 1:
-            related = captions[1]
-        unrelated = str(rec.get("unrelated_query") or "").strip()
-        rows.append({
-            "image": rec["image"],
-            "caption": primary,
-            "captions": captions,
-            "domain": rec["domain"],
-            "source": rec["source"],
-            "id": rec["id"],
-            QUERY_CACHE_RELATED_KEY: related,
-            QUERY_CACHE_UNRELATED_KEY: unrelated,
-        })
+
+def load_trisearch_hub_rows(
+    dataset_id: str = DEFAULT_TRISEARCH_HF_DATASET,
+    *,
+    split: str = "train",
+    max_samples: int | None = None,
+    seed: int = 42,
+    satellite_fraction: float | None = None,
+    revision: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load curated TriSearch rows from the Hugging Face Hub.
+
+    Uses the datasets cache (no custom download scripts / trust_remote_code).
+    When ``max_samples`` is set, streams + reservoir-samples to avoid pulling
+    the full ~10 GB corpus into RAM for smoke tests / demos.
+    """
+    from datasets import load_dataset
+
+    if split not in ("train", "test", "all"):
+        raise ValueError(f"split must be train|test|all, got {split!r}")
+
     print(
-        f"Loaded curated TriSearch dataset from {root}: {len(rows):,} rows "
-        f"(split={split})"
+        f"Loading TriSearch Hub dataset {dataset_id!r} "
+        f"(split={split}, max_samples={max_samples}) ...",
+        flush=True,
     )
-    return rows
+
+    # Fast path for small samples: pull a bounded prefix from the stream
+    # (do NOT full-pass reservoir over 60k rows — that downloads everything).
+    if max_samples is not None and max_samples > 0:
+        from itertools import islice
+
+        # Oversample so domain balancing still has room.
+        stream_n = max(max_samples * 6, max_samples + 48)
+        raw: list[dict[str, Any]] = []
+        splits = ("train", "test") if split == "all" else (split,)
+        per = max(1, stream_n // len(splits))
+        for sp in splits:
+            ds_stream = load_dataset(
+                dataset_id, split=sp, streaming=True, revision=revision
+            )
+            raw.extend(list(islice(ds_stream, per)))
+        records: list[dict[str, Any]] = []
+        for row in raw:
+            try:
+                rec = {
+                    "id": row.get("id"),
+                    "domain": row.get("domain"),
+                    "source": row.get("source"),
+                    "captions": list(row.get("captions") or []),
+                    "query": row.get("query"),
+                    "unrelated_query": row.get("unrelated_query"),
+                    "image": row.get("image"),
+                }
+                records.append(_row_from_trisearch_record(rec))
+            except (TypeError, ValueError, OSError) as exc:
+                print(f"  skip hub row: {exc}", flush=True)
+        records = _balance_domain_sample(
+            records,
+            max_samples=max_samples,
+            seed=seed,
+            satellite_fraction=satellite_fraction,
+        )
+        print(
+            f"  Hub sample ready: {len(records):,} rows from {dataset_id}",
+            flush=True,
+        )
+        return records
+
+    # Full split (uses HF arrow/parquet cache on disk).
+    if split == "all":
+        from datasets import concatenate_datasets
+
+        parts = [
+            load_dataset(dataset_id, split=sp, revision=revision)
+            for sp in ("train", "test")
+        ]
+        ds = concatenate_datasets(parts)
+    else:
+        ds = load_dataset(dataset_id, split=split, revision=revision)
+
+    records = []
+    for row in ds:
+        try:
+            rec = {
+                "id": row.get("id"),
+                "domain": row.get("domain"),
+                "source": row.get("source"),
+                "captions": list(row.get("captions") or []),
+                "query": row.get("query"),
+                "unrelated_query": row.get("unrelated_query"),
+                "image": row.get("image"),
+            }
+            records.append(_row_from_trisearch_record(rec))
+        except (TypeError, ValueError, OSError) as exc:
+            print(f"  skip hub row: {exc}", flush=True)
+    records = _balance_domain_sample(
+        records,
+        max_samples=max_samples,
+        seed=seed,
+        satellite_fraction=satellite_fraction,
+    )
+    print(
+        f"  Loaded {len(records):,} rows from Hub {dataset_id} (split={split})",
+        flush=True,
+    )
+    return records
+
+
+def load_curated_training_rows(
+    dataset_dir: str | Path | None = None,
+    *,
+    hf_dataset: str | None = DEFAULT_TRISEARCH_HF_DATASET,
+    max_samples: int | None = None,
+    seed: int = 42,
+    satellite_fraction: float | None = None,
+    split: str = "train",
+    prefer_local: bool = False,
+    revision: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load curated TriSearch rows for Stage-1 training / demos.
+
+    Preference (default):
+      1. Hugging Face Hub ``hf_dataset`` (published 64k v0.0.1)
+      2. Local export at ``dataset_dir`` when ``prefer_local=True``
+
+    Each row has:
+      - image (PIL), caption, captions (list), domain, source, id
+      - related_query, unrelated_query
+
+    ``split`` defaults to ``\"train\"``. Pass ``test`` or ``all`` as needed.
+    """
+    root = Path(dataset_dir or DEFAULT_CURATED_DATASET_DIR)
+    if prefer_local and curated_dataset_available(root):
+        from trisearch_data_format import apply_official_splits, load_dataset_records
+
+        try:
+            from trisearch_quality import load_metadata_rows
+
+            meta_rows = load_metadata_rows(root)
+            apply_official_splits(meta_rows, force=False)
+            if split in ("train", "test"):
+                allowed = {r["id"] for r in meta_rows if r.get("split") == split}
+            elif split == "all":
+                allowed = None
+            else:
+                raise ValueError(f"split must be train|test|all, got {split!r}")
+        except FileNotFoundError:
+            allowed = None
+
+        records_raw = load_dataset_records(root, max_samples=None)
+        if allowed is not None:
+            records_raw = [r for r in records_raw if str(r.get("id")) in allowed]
+        records = []
+        for rec in records_raw:
+            try:
+                records.append(_row_from_trisearch_record(rec))
+            except (TypeError, ValueError, OSError):
+                continue
+        records = _balance_domain_sample(
+            records,
+            max_samples=max_samples,
+            seed=seed,
+            satellite_fraction=satellite_fraction,
+        )
+        print(
+            f"Loaded curated TriSearch dataset from local {root}: "
+            f"{len(records):,} rows (split={split})",
+            flush=True,
+        )
+        return records
+
+    if hf_dataset:
+        return load_trisearch_hub_rows(
+            hf_dataset,
+            split=split,
+            max_samples=max_samples,
+            seed=seed,
+            satellite_fraction=satellite_fraction,
+            revision=revision,
+        )
+
+    raise FileNotFoundError(
+        f"No local curated dataset at {root} and no hf_dataset id provided. "
+        f"Pass hf_dataset={DEFAULT_TRISEARCH_HF_DATASET!r} or run generate_datasets.py."
+    )
 
 
 def load_stage1_training_rows(
     *,
     data_jsonl: str | None = None,
     curated_dataset_dir: str | None = None,
+    hf_dataset: str | None = DEFAULT_TRISEARCH_HF_DATASET,
     prefer_curated: bool = True,
+    prefer_local_curated: bool = False,
+    curated_split: str = "train",
     image_root: str | None = None,
     satellite_dataset: str = DEFAULT_SATELLITE_DATASET,
     satellite_split: str = DEFAULT_SATELLITE_SPLIT,
@@ -450,7 +622,7 @@ def load_stage1_training_rows(
 
     Preference order:
       1. ``--data-jsonl`` local JSONL
-      2. Curated TriSearch dataset from ``generate_datasets.py`` (default path)
+      2. Curated TriSearch (local export if present, else Hub ``hf_dataset``)
       3. Legacy HF satellite + general mix
     """
     if data_jsonl:
@@ -460,26 +632,29 @@ def load_stage1_training_rows(
         return rows, "image", "caption", effective_root
 
     curated_path = Path(curated_dataset_dir or DEFAULT_CURATED_DATASET_DIR)
-    if prefer_curated and curated_dataset_available(curated_path):
+    if prefer_curated:
         max_total = None
         if max_satellite_samples is not None or max_general_samples is not None:
             max_total = (max_satellite_samples or 0) + (max_general_samples or 0)
             if max_total <= 0:
                 max_total = None
-        rows = load_curated_training_rows(
-            curated_path,
-            max_samples=max_total,
-            seed=seed,
-            satellite_fraction=satellite_fraction,
-        )
-        # Images are already PIL; image_root unused.
-        return rows, "image", "caption", None
-
-    if prefer_curated:
-        print(
-            f"Curated dataset not found at {curated_path}; "
-            f"falling back to HF mix. Run: python3 generate_datasets.py"
-        )
+        try:
+            rows = load_curated_training_rows(
+                curated_path,
+                hf_dataset=hf_dataset,
+                max_samples=max_total,
+                seed=seed,
+                satellite_fraction=satellite_fraction,
+                split=curated_split,
+                prefer_local=prefer_local_curated,
+            )
+            return rows, "image", "caption", None
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"Curated TriSearch load failed ({exc}); "
+                f"falling back to legacy HF mix.",
+                flush=True,
+            )
 
     explicit_sat_root = satellite_image_root or image_root
     # Legacy ChatEarthNet path only when that dataset is explicitly requested.
@@ -611,29 +786,38 @@ def load_stage1_demo_samples(
     satellite_fraction: float = 0.5,
     download_satellite_images: bool = False,
     curated_dataset_dir: str | Path | None = None,
+    hf_dataset: str | None = DEFAULT_TRISEARCH_HF_DATASET,
+    curated_split: str = "train",
+    prefer_local_curated: bool = False,
 ) -> list[dict[str, Any]]:
-    """Sample ``count`` images using the same sat/general mix as Stage-1 training.
+    """Sample ``count`` images using the curated TriSearch corpus (Hub or local).
 
     Returns a list of ``{"image": PIL.Image, "caption": str, "source": str}``
-    ready for the retrieval demo index. Prefers the curated TriSearch export
-    when present.
+    ready for the retrieval demo index. Falls back to legacy sat/general mix
+    only if curated load fails.
     """
-    curated = Path(curated_dataset_dir or DEFAULT_CURATED_DATASET_DIR)
-    if curated_dataset_available(curated):
+    try:
         rows = load_curated_training_rows(
-            curated,
+            curated_dataset_dir,
+            hf_dataset=hf_dataset,
             max_samples=count,
             seed=seed,
             satellite_fraction=satellite_fraction,
+            split=curated_split,
+            prefer_local=prefer_local_curated,
         )
         return [
             {
                 "image": r["image"],
                 "caption": r["caption"],
                 "source": r.get("source", "trisearch-curated"),
+                "id": r.get("id", ""),
+                "query": r.get(QUERY_CACHE_RELATED_KEY, ""),
             }
             for r in rows[:count]
         ]
+    except Exception as exc:  # noqa: BLE001
+        print(f"Curated demo load failed ({exc}); using legacy mix.", flush=True)
 
     # Over-sample each source so the mix can hit ``count`` after path failures.
     per_source = max(1, (count + 1) // 2)

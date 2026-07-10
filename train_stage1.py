@@ -43,6 +43,7 @@ from trisearch_dataset import (
     DEFAULT_GENERAL_SPLIT,
     DEFAULT_OPENROUTER_CONFIG,
     DEFAULT_QUERY_CACHE_PATH,
+    DEFAULT_TRISEARCH_HF_DATASET,
     OPENROUTER_QUERY_BATCH_SIZE,
     OPENROUTER_QUERY_PARALLELISM,
     DEFAULT_SATELLITE_DATASET,
@@ -94,15 +95,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-jsonl", default=None,
                         help="Local JSONL with image path + caption fields.")
     parser.add_argument(
+        "--hf-dataset",
+        default=DEFAULT_TRISEARCH_HF_DATASET,
+        help="HuggingFace dataset id for curated TriSearch "
+             f"(default {DEFAULT_TRISEARCH_HF_DATASET}).",
+    )
+    parser.add_argument(
         "--curated-dataset-dir",
         default=str(DEFAULT_CURATED_DATASET_DIR),
-        help="TriSearch curated dataset from generate_datasets.py "
-             f"(default {DEFAULT_CURATED_DATASET_DIR}).",
+        help="Optional local curated export (only if --prefer-local-curated).",
+    )
+    parser.add_argument(
+        "--prefer-local-curated",
+        action="store_true",
+        help="Prefer local --curated-dataset-dir over the Hub dataset when present.",
+    )
+    parser.add_argument(
+        "--curated-split",
+        default="train",
+        choices=("train", "test", "all"),
+        help="Official curated split to train on (default train).",
     )
     parser.add_argument(
         "--no-curated-dataset",
         action="store_true",
-        help="Ignore curated export; use legacy HF satellite/general mix.",
+        help="Ignore curated Hub/local dataset; use legacy HF satellite/general mix.",
     )
     parser.add_argument("--image-root", default=None,
                         help="Base directory for relative image paths in JSONL.")
@@ -210,7 +227,10 @@ def main():
     mixed_rows, image_column, caption_column, image_root = load_stage1_training_rows(
         data_jsonl=args.data_jsonl,
         curated_dataset_dir=args.curated_dataset_dir,
+        hf_dataset=None if args.no_curated_dataset else args.hf_dataset,
         prefer_curated=not args.no_curated_dataset,
+        prefer_local_curated=args.prefer_local_curated,
+        curated_split=args.curated_split,
         image_root=args.image_root,
         satellite_dataset=args.satellite_dataset,
         satellite_split=args.satellite_split,

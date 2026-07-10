@@ -39,6 +39,7 @@ from trisearch_dataset import (
     DEFAULT_GENERAL_SPLIT,
     DEFAULT_SATELLITE_DATASET,
     DEFAULT_SATELLITE_SPLIT,
+    DEFAULT_TRISEARCH_HF_DATASET,
     load_dataset_samples,
     load_stage1_demo_samples,
 )
@@ -54,7 +55,7 @@ from trisearch_models import (
 DEFAULT_COUNT = 1000
 DEFAULT_CACHE_DIR = "models/demo_index"
 CACHE_VERSION = 2
-STAGE1_MIX_LABEL = "stage1_mix"
+STAGE1_MIX_LABEL = "trisearch_curated"
 
 
 @dataclass
@@ -240,12 +241,16 @@ def _load_demo_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
         general_caption_column=args.general_caption_column,
         satellite_fraction=args.satellite_fraction,
         download_satellite_images=args.download_satellite_images,
+        hf_dataset=args.hf_dataset,
+        curated_split=args.curated_split,
+        prefer_local_curated=args.prefer_local_curated,
+        curated_dataset_dir=args.curated_dataset_dir,
     )
 
 
 def build_or_load_index(args: argparse.Namespace) -> ImageSearchIndex:
-    dataset_label = args.dataset or STAGE1_MIX_LABEL
-    split_label = args.split if args.dataset else "mixed"
+    dataset_label = args.dataset or f"trisearch:{args.hf_dataset}"
+    split_label = args.split if args.dataset else args.curated_split
     cache_file = cache_path_for(
         Path(args.cache_dir),
         dataset=dataset_label,
@@ -430,7 +435,28 @@ def parse_args() -> argparse.Namespace:
                         help="Directory of image files for path-only datasets "
                              "(alias for --satellite-image-root).")
 
-    # Stage-1 mix options (default mode when --dataset is omitted).
+    # Curated TriSearch (default when --dataset is omitted).
+    parser.add_argument(
+        "--hf-dataset",
+        default=DEFAULT_TRISEARCH_HF_DATASET,
+        help=f"Hub curated dataset (default {DEFAULT_TRISEARCH_HF_DATASET}).",
+    )
+    parser.add_argument(
+        "--curated-dataset-dir",
+        default=None,
+        help="Optional local curated export when --prefer-local-curated.",
+    )
+    parser.add_argument(
+        "--prefer-local-curated",
+        action="store_true",
+        help="Prefer local curated export over the Hub dataset.",
+    )
+    parser.add_argument(
+        "--curated-split",
+        default="train",
+        choices=("train", "test", "all"),
+        help="Curated split to sample for the index (default train).",
+    )
     parser.add_argument("--satellite-dataset", default=DEFAULT_SATELLITE_DATASET)
     parser.add_argument("--satellite-split", default=DEFAULT_SATELLITE_SPLIT)
     parser.add_argument("--satellite-image-column", default="image")
@@ -495,7 +521,8 @@ def main():
         data_desc = f"`{args.dataset}` ({args.split})"
     else:
         data_desc = (
-            f"Stage-1 mix ({args.satellite_fraction:.0%} "
+            f"TriSearch curated `{args.hf_dataset}` ({args.curated_split}; "
+            f"{args.satellite_fraction:.0%} sat target; legacy fallback "
             f"`{args.satellite_dataset}` + "
             f"{1.0 - args.satellite_fraction:.0%} `{args.general_dataset}`)"
         )

@@ -8,21 +8,32 @@ Workflow
    so Hub text matches the post-repair source of truth.
 3. Write a detailed dataset card (``README.md``), ``LICENSE``, ``dataset_info.json``.
 4. Stage a clean upload tree (no progress caches / staging dirs).
-5. Upload with ``huggingface_hub`` (``upload_large_folder`` by default).
+5. Upload with **resumable classic git-LFS** (XET disabled by default).
+
+Upload reliability
+------------------
+``upload_large_folder`` + XET often **stalls** on multi‑GB dataset pushes.
+This script defaults to:
+
+* ``HF_HUB_DISABLE_XET=1`` (classic LFS)
+* one file per commit (progress + easier resume)
+* skip remote files whose size already matches
+* per-file retries with exponential backoff
+
+Re-run the same command after a stall to continue.
 
 Examples
 --------
   # Card + validation only (no network upload)
   python3 publish_dataset.py --dry-run
 
-  # Write card into the export, rebuild parquet from metadata, then push
+  # Rebuild parquet + push (resumable)
   python3 publish_dataset.py \\
       --repo-id NuclearManD/trisearch-v1 \\
-      --sync-parquet \\
-      --public
+      --sync-parquet --public --yes
 
-  # Private draft repo
-  python3 publish_dataset.py --repo-id NuclearManD/trisearch-v1-private --private
+  # Private draft
+  python3 publish_dataset.py --repo-id NuclearManD/trisearch-v1-private --private --yes
 """
 
 from __future__ import annotations
@@ -394,6 +405,129 @@ def build_staging_dir(
     return manifest
 
 
+def _disable_hf_xet() -> None:
+    """Force classic git-LFS uploads. XET often stalls on multi‑GB dataset pushes.
+
+    Must patch both the env var and the already-imported constants flag
+    (``HF_HUB_DISABLE_XET`` is read once at import time).
+    """
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    # hf_transfer is download-oriented; leave off so it cannot interfere.
+    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    try:
+        from huggingface_hub import constants as hf_constants
+
+        hf_constants.HF_HUB_DISABLE_XET = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _iter_staging_payload(staging: Path) -> list[tuple[str, Path, int]]:
+    """Return ``(path_in_repo, local_resolved_path, size_bytes)`` for upload.
+
+    Follows symlinks so staging can be lightweight. Skips internal manifests
+    and accidental ``.cache/`` trees left by interrupted hub uploads.
+    """
+    skip_names = {"UPLOAD_MANIFEST.json"}
+    skip_prefixes = (".cache/", ".git/")
+    items: list[tuple[str, Path, int]] = []
+    for path in sorted(staging.rglob("*")):
+        if not path.is_file() and not path.is_symlink():
+            continue
+        if path.name in skip_names or path.name.startswith("."):
+            # Keep .gitattributes; skip other dotfiles.
+            if path.name != ".gitattributes":
+                continue
+        rel = path.relative_to(staging).as_posix()
+        if rel.startswith(skip_prefixes) or "/.cache/" in f"/{rel}":
+            continue
+        try:
+            real = path.resolve(strict=True)
+        except OSError:
+            _log(f"  skip broken symlink: {rel}")
+            continue
+        if not real.is_file():
+            continue
+        items.append((rel, real, real.stat().st_size))
+    # Stable order: small metadata first, large parquets last (progress + resume).
+    def _key(it: tuple[str, Path, int]) -> tuple[int, str]:
+        rel, _, size = it
+        is_big = 1 if size >= 8 * 1024 * 1024 or rel.startswith("data/") else 0
+        return (is_big, rel)
+
+    items.sort(key=_key)
+    return items
+
+
+def _remote_file_sizes(api: Any, repo_id: str) -> dict[str, int]:
+    """Map path_in_repo → size for files already on the Hub (best-effort)."""
+    out: dict[str, int] = {}
+    try:
+        # list_repo_tree is more reliable than list_repo_files for sizes
+        for entry in api.list_repo_tree(
+            repo_id, repo_type="dataset", recursive=True
+        ):
+            path = getattr(entry, "path", None)
+            size = getattr(entry, "size", None)
+            if path is not None and size is not None:
+                out[str(path)] = int(size)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  warn: could not list remote files ({exc}); will re-upload all")
+    return out
+
+
+def _upload_one_with_retries(
+    api: Any,
+    *,
+    local_path: Path,
+    path_in_repo: str,
+    repo_id: str,
+    commit_message: str,
+    max_attempts: int = 8,
+) -> None:
+    """Upload a single file via classic LFS; retry on transient network errors."""
+    last: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type="dataset",
+                commit_message=commit_message,
+            )
+            return
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:  # noqa: BLE001 — network stack varies
+            last = exc
+            # Don't thrash on auth / not-found style errors
+            msg = str(exc).lower()
+            if any(
+                s in msg
+                for s in (
+                    "401",
+                    "403",
+                    "unauthorized",
+                    "forbidden",
+                    "invalid username",
+                    "invalid token",
+                )
+            ):
+                raise
+            wait = min(120.0, 2.0 ** min(attempt, 6)) + (0.1 * attempt)
+            _log(
+                f"    retry {attempt}/{max_attempts} for {path_in_repo} "
+                f"after {type(exc).__name__}: {exc}  (sleep {wait:.0f}s)"
+            )
+            time.sleep(wait)
+    assert last is not None
+    raise RuntimeError(
+        f"Failed to upload {path_in_repo} after {max_attempts} attempts"
+    ) from last
+
+
 def push_to_hub(
     staging: Path,
     *,
@@ -402,11 +536,27 @@ def push_to_hub(
     token: str | None,
     commit_message: str,
     large_folder: bool,
+    upload_workers: int = 1,
+    max_attempts: int = 8,
 ) -> str:
+    """Push staging tree to the Hub with stall-resistant defaults.
+
+    Default path (**resumable LFS**):
+      * disables XET (frequent multi‑GB stalls)
+      * uploads one file per commit (classic git LFS)
+      * skips remote files that already match local size
+      * retries each file with exponential backoff
+
+    ``large_folder=True`` keeps ``upload_large_folder`` as an opt-in (XET-heavy,
+    can hang on the final commit for big datasets).
+    """
+    _disable_hf_xet()
+
     from huggingface_hub import HfApi
 
     api = HfApi(token=token)
     _log(f"  ensure repo exists: {repo_id} (private={private})")
+    _log("  upload transport: classic git-LFS (HF_HUB_DISABLE_XET=1)")
     api.create_repo(
         repo_id=repo_id,
         repo_type="dataset",
@@ -416,22 +566,75 @@ def push_to_hub(
 
     _log(f"  uploading from {staging} ...")
     t0 = time.monotonic()
+
     if large_folder:
-        # Best for multi-GB multi-file dataset uploads
+        _log(
+            "  mode=upload_large_folder (opt-in; may stall on XET/commit — "
+            "prefer default resumable mode)"
+        )
+        # Still force XET off; large_folder then uses LFS batch path.
         api.upload_large_folder(
             repo_id=repo_id,
             folder_path=str(staging),
             repo_type="dataset",
-            # num_workers default is fine
+            num_workers=max(1, min(upload_workers, 4)),
+            print_report=True,
+            print_report_every=30,
         )
     else:
-        api.upload_folder(
-            repo_id=repo_id,
-            folder_path=str(staging),
-            repo_type="dataset",
-            commit_message=commit_message,
-            ignore_patterns=["UPLOAD_MANIFEST.json"],
+        payload = _iter_staging_payload(staging)
+        total_bytes = sum(s for _, _, s in payload)
+        _log(
+            f"  mode=resumable per-file LFS: {len(payload)} files, "
+            f"{total_bytes / 1e9:.2f} GB"
         )
+        remote = _remote_file_sizes(api, repo_id)
+        if remote:
+            _log(f"  remote already has {len(remote)} file path(s)")
+
+        todo: list[tuple[str, Path, int]] = []
+        skipped = 0
+        for rel, local, size in payload:
+            rsz = remote.get(rel)
+            if rsz is not None and rsz == size:
+                skipped += 1
+                continue
+            todo.append((rel, local, size))
+        _log(
+            f"  skip {skipped} already-matching file(s); "
+            f"upload {len(todo)} remaining"
+        )
+
+        done_bytes = 0
+        todo_bytes = sum(s for _, _, s in todo)
+        for i, (rel, local, size) in enumerate(todo, 1):
+            msg = f"{commit_message} [{i}/{len(todo)}] {rel}"
+            _log(
+                f"  ({i}/{len(todo)}) {rel}  ({size / 1e6:.1f} MB) ..."
+            )
+            file_t0 = time.monotonic()
+            _upload_one_with_retries(
+                api,
+                local_path=local,
+                path_in_repo=rel,
+                repo_id=repo_id,
+                commit_message=msg,
+                max_attempts=max_attempts,
+            )
+            dt = max(time.monotonic() - file_t0, 1e-6)
+            done_bytes += size
+            rate = size / dt / 1e6
+            pct = 100.0 * done_bytes / todo_bytes if todo_bytes else 100.0
+            eta = (
+                (todo_bytes - done_bytes) / (done_bytes / max(time.monotonic() - t0, 1e-6))
+                if done_bytes
+                else 0
+            )
+            _log(
+                f"    ok {rate:.1f} MB/s  overall {pct:.1f}%  "
+                f"ETA {eta / 60:.1f} min"
+            )
+
     url = f"https://huggingface.co/datasets/{repo_id}"
     _log(f"  upload finished in {time.monotonic() - t0:.1f}s → {url}")
     return url
@@ -524,15 +727,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Do not delete staging dir after upload",
     )
     p.add_argument(
+        "--large-folder",
+        action="store_true",
+        help="Use upload_large_folder (can stall on multi-GB / XET). "
+             "Default is resumable per-file classic LFS instead.",
+    )
+    p.add_argument(
         "--no-large-folder",
         action="store_true",
-        help="Use upload_folder instead of upload_large_folder",
+        help=argparse.SUPPRESS,  # legacy alias: default is already non-large
+    )
+    p.add_argument(
+        "--upload-workers",
+        type=int,
+        default=1,
+        help="Parallelism for --large-folder only (default 1; keep low).",
+    )
+    p.add_argument(
+        "--upload-retries",
+        type=int,
+        default=8,
+        help="Per-file upload attempts with backoff (default 8).",
     )
     p.add_argument(
         "--commit-message",
         type=str,
         default=None,
-        help="Commit message for non-large-folder upload",
+        help="Commit message prefix for uploads",
     )
     p.add_argument(
         "--check-images",
@@ -687,11 +908,17 @@ def main(argv: list[str] | None = None) -> int:
             private=private,
             token=token,
             commit_message=commit,
-            large_folder=not args.no_large_folder,
+            large_folder=bool(args.large_folder),
+            upload_workers=args.upload_workers,
+            max_attempts=max(1, args.upload_retries),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"  upload failed: {exc}", file=sys.stderr)
-        _log(f"  staging left at {staging}")
+        _log(
+            f"  staging left at {staging}\n"
+            "  Re-run the same command to resume — files already on the Hub "
+            "with matching size are skipped."
+        )
         return 1
 
     if not args.keep_staging and staging.exists():

@@ -29,6 +29,7 @@ from trisearch_data_format import (  # noqa: E402
     validate_record,
 )
 from trisearch_dataset import (  # noqa: E402
+    DEFAULT_TRISEARCH_HF_DATASET,
     QUERY_CACHE_RELATED_KEY,
     QUERY_CACHE_UNRELATED_KEY,
     ImageCaptionDataset,
@@ -36,6 +37,7 @@ from trisearch_dataset import (  # noqa: E402
     enrich_rows_with_text_queries,
     load_curated_training_rows,
     load_stage1_training_rows,
+    load_trisearch_hub_rows,
 )
 
 
@@ -163,7 +165,9 @@ class TestSaveLoadRoundtrip(unittest.TestCase):
             _ = lazy[0]
             self.assertIn(0, lazy._image_cache)
 
-            train_rows = load_curated_training_rows(out, seed=0)
+            train_rows = load_curated_training_rows(
+                out, seed=0, prefer_local=True, hf_dataset=None
+            )
             self.assertEqual(len(train_rows), 4)
             self.assertIn(QUERY_CACHE_RELATED_KEY, train_rows[0])
             self.assertTrue(train_rows[0][QUERY_CACHE_RELATED_KEY])
@@ -171,6 +175,8 @@ class TestSaveLoadRoundtrip(unittest.TestCase):
             mixed, col_i, col_c, root = load_stage1_training_rows(
                 curated_dataset_dir=str(out),
                 prefer_curated=True,
+                prefer_local_curated=True,
+                hf_dataset=None,
                 seed=0,
             )
             self.assertEqual(col_i, "image")
@@ -510,6 +516,47 @@ class TestQualityAudit(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertIn(q, text)
             self.assertIn(uq, text)
+
+
+class TestHubCuratedLoad(unittest.TestCase):
+    """Live Hub smoke (network + HF cache). Skips only if Hub is unreachable."""
+
+    def test_stream_sample_from_published_dataset(self):
+        try:
+            rows = load_trisearch_hub_rows(
+                DEFAULT_TRISEARCH_HF_DATASET,
+                split="train",
+                max_samples=4,
+                seed=0,
+                satellite_fraction=0.5,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"Hub unavailable: {exc}")
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertLessEqual(len(rows), 4)
+        r0 = rows[0]
+        self.assertIn("image", r0)
+        self.assertTrue(r0["captions"])
+        self.assertTrue(r0[QUERY_CACHE_RELATED_KEY])
+        self.assertEqual(r0["image"].size[0], r0["image"].size[1])
+
+    def test_stage1_loader_uses_hub_by_default(self):
+        try:
+            rows, col_i, col_c, root = load_stage1_training_rows(
+                prefer_curated=True,
+                prefer_local_curated=False,
+                hf_dataset=DEFAULT_TRISEARCH_HF_DATASET,
+                max_satellite_samples=2,
+                max_general_samples=2,
+                seed=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"Hub unavailable: {exc}")
+        self.assertEqual(col_i, "image")
+        self.assertEqual(col_c, "caption")
+        self.assertIsNone(root)
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertTrue(rows[0].get(QUERY_CACHE_RELATED_KEY) or rows[0].get("caption"))
 
 
 class TestOfficialSplits(unittest.TestCase):

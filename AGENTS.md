@@ -133,8 +133,12 @@ Hardware: tested on 2× RTX 3060 12GB.
 ## Common commands
 
 ```bash
-# Stage 1 training (real data only)
+# Stage 1 training on published Hub curated set (default)
 python3 train_stage1.py --max-steps 10000 --batch-size 4
+
+# Smoke train (small Hub sample)
+python3 train_stage1.py --max-steps 4 --max-satellite-samples 8 --max-general-samples 8 \
+  --skip-query-generation --batch-size 2
 
 # Resume from models/trained/stage1/ (default)
 python3 train_stage1.py --max-steps 20000
@@ -142,12 +146,12 @@ python3 train_stage1.py --max-steps 20000
 # Fresh run from seeds
 python3 train_stage1.py --fresh --max-steps 10000
 
-# Image search demo (curated mix or Flickr/COCO)
+# Image search demo (Hub curated sample)
 python3 demo_image_search.py --phase 1 --count 100 --rebuild-index
 
-# Curated dataset (preview then inspect)
-python3 generate_datasets.py --preview --skip-query-generation --allow-rsicd-fallback
-python3 view_dataset.py --dataset-dir models/data/trisearch-v1
+# Dataset viewer (Hub sample by default; local optional)
+python3 view_dataset.py --max-load 64
+python3 view_dataset.py --prefer-local --dataset-dir models/data/trisearch-v1
 
 # Runner smoke tests
 python3 run_siglip.py --phase 1

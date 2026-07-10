@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Browse a curated TriSearch dataset (from generate_datasets.py).
+Browse a curated TriSearch dataset (Hub or local export).
 
   python3 view_dataset.py
-  python3 view_dataset.py --dataset-dir models/data/trisearch-v1 --port 7861
+  python3 view_dataset.py --hf-dataset NuclearManD/trisearch-dataset-64k-v0.0.1
+  python3 view_dataset.py --dataset-dir models/data/trisearch-v1 --prefer-local
 
 Shows image, domain tag, captions, query, and unrelated_query with paging.
 
-Images and parquet rows are loaded on demand (metadata is indexed once;
-recent images stay in a small LRU cache).
+Local exports: metadata indexed once; images load on demand (LRU cache).
+Hub mode: streams a sample (``--max-load``, default 256) for browsing.
 """
 
 from __future__ import annotations
@@ -23,6 +24,10 @@ from trisearch_data_format import (
     DEFAULT_IMAGE_CACHE_SIZE,
     open_lazy_dataset,
 )
+from trisearch_dataset import (
+    DEFAULT_TRISEARCH_HF_DATASET,
+    load_trisearch_hub_rows,
+)
 
 
 class _RecordSequence(Protocol):
@@ -32,12 +37,29 @@ class _RecordSequence(Protocol):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--hf-dataset",
+        default=DEFAULT_TRISEARCH_HF_DATASET,
+        help=f"Hub dataset id (default {DEFAULT_TRISEARCH_HF_DATASET}).",
+    )
+    p.add_argument(
+        "--prefer-local",
+        action="store_true",
+        help="Use --dataset-dir local export instead of the Hub.",
+    )
     p.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_ROOT)
+    p.add_argument(
+        "--split",
+        default="train",
+        choices=("train", "test", "all"),
+        help="Hub/local official split (default train).",
+    )
     p.add_argument(
         "--max-load",
         type=int,
         default=None,
-        help="Only index first N rows (default: all). Images still load on demand.",
+        help="Only load first N rows (Hub default 256; local default: all). "
+             "Images still load on demand for local exports.",
     )
     p.add_argument(
         "--image-cache-size",
@@ -157,18 +179,45 @@ def build_viewer(records: Sequence[dict] | _RecordSequence):
 
 def main() -> None:
     args = parse_args()
-    if not args.dataset_dir.exists():
-        raise SystemExit(
-            f"Dataset not found at {args.dataset_dir}. "
-            f"Run: python3 generate_datasets.py --preview --skip-query-generation"
+    if args.prefer_local:
+        if not args.dataset_dir.exists():
+            raise SystemExit(
+                f"Local dataset not found at {args.dataset_dir}. "
+                f"Omit --prefer-local to use Hub {args.hf_dataset!r}."
+            )
+        print(f"Indexing local {args.dataset_dir} (metadata only) ...", flush=True)
+        records: _RecordSequence = open_lazy_dataset(
+            args.dataset_dir,
+            max_samples=args.max_load,
+            image_cache_size=args.image_cache_size,
         )
+    else:
+        max_load = args.max_load if args.max_load is not None else 256
+        print(
+            f"Loading Hub sample from {args.hf_dataset!r} "
+            f"(split={args.split}, n={max_load}) ...",
+            flush=True,
+        )
+        rows = load_trisearch_hub_rows(
+            args.hf_dataset,
+            split=args.split,
+            max_samples=max_load,
+            seed=0,
+            satellite_fraction=0.5,
+        )
+        # Viewer expects query / unrelated_query field names
+        records = []
+        for r in rows:
+            records.append({
+                "id": r.get("id", ""),
+                "domain": r.get("domain", ""),
+                "source": r.get("source", ""),
+                "captions": r.get("captions") or [r.get("caption", "")],
+                "query": r.get("related_query") or r.get("query", ""),
+                "unrelated_query": r.get("unrelated_query", ""),
+                "image": r["image"],
+            })
 
-    print(f"Indexing {args.dataset_dir} (metadata only) ...", flush=True)
-    records = open_lazy_dataset(
-        args.dataset_dir,
-        max_samples=args.max_load,
-        image_cache_size=args.image_cache_size,
-    )
     if not len(records):
         raise SystemExit("Dataset is empty.")
     print(
