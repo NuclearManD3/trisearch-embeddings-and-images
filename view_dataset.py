@@ -24,7 +24,7 @@ from trisearch_data_format import (
     DEFAULT_IMAGE_CACHE_SIZE,
     open_lazy_dataset,
 )
-from trisearch_dataset import DEFAULT_TRISEARCH_HF_DATASET
+from trisearch_dataset import DEFAULT_TRISEARCH_HF_DATASET, normalize_training_text
 
 
 class _RecordSequence(Protocol):
@@ -72,12 +72,13 @@ def parse_args() -> argparse.Namespace:
 
 def _card_html(rec: dict, index: int, total: int) -> str:
     caps = "".join(
-        f"<li>{html.escape(str(c))}</li>" for c in rec.get("captions") or []
+        f"<li>{html.escape(normalize_training_text(c))}</li>"
+        for c in (rec.get("captions") or [])
     )
     domain = html.escape(str(rec.get("domain", "")))
     source = html.escape(str(rec.get("source", "")))
-    q = html.escape(str(rec.get("query", "")))
-    uq = html.escape(str(rec.get("unrelated_query", "")))
+    q = html.escape(normalize_training_text(rec.get("query", "")))
+    uq = html.escape(normalize_training_text(rec.get("unrelated_query", "")))
     rid = html.escape(str(rec.get("id", "")))
     return f"""
     <div style="font-family:system-ui,sans-serif;max-width:720px">

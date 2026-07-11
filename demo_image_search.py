@@ -42,6 +42,7 @@ from tqdm import tqdm
 from trisearch_dataset import (
     DEFAULT_TRISEARCH_HF_DATASET,
     TriSearchMapDataset,
+    normalize_training_text,
     open_trisearch_map_dataset,
 )
 from trisearch_models import (
@@ -134,10 +135,14 @@ class ImageSearchIndex:
             normed = matryoshka_normalize(projected)
 
             for offset, row in enumerate(chunk_meta):
+                cap = normalize_training_text(
+                    row.get("caption")
+                    or (row.get("captions") or [""])[0]
+                )
                 self.entries.append(
                     IndexedImage(
                         image_id=start + offset,
-                        caption=str(row.get("caption") or ""),
+                        caption=cap,
                         embeddings=normed[offset].detach().float().cpu(),
                         record_id=str(row.get("id") or ""),
                     )
@@ -187,7 +192,8 @@ class ImageSearchIndex:
         entries = [
             IndexedImage(
                 image_id=int(raw["image_id"]),
-                caption=str(raw["caption"]),
+                # Re-normalize so older caches (pre-lowercase) still display lower.
+                caption=normalize_training_text(raw.get("caption")),
                 embeddings=raw["embeddings"],
                 record_id=str(raw.get("record_id") or ""),
             )
@@ -404,7 +410,8 @@ def create_search_fn(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder):
         gallery_html_parts = []
         lines = []
         for rank, (score, entry) in enumerate(hits, 1):
-            lines.append(f"{rank}. [{score:.3f}] {entry.caption[:120]}")
+            cap = normalize_training_text(entry.caption)
+            lines.append(f"{rank}. [{score:.3f}] {cap[:120]}")
             # Decode **only** hit images (top-k), not the full index.
             img = index.get_image(entry)
             b64 = base64.b64encode(_pil_to_jpeg_bytes(img, quality=80)).decode("ascii")
@@ -413,7 +420,7 @@ def create_search_fn(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder):
                 f'<img src="data:image/jpeg;base64,{b64}" '
                 f'style="max-width:180px;max-height:180px;border-radius:6px"/>'
                 f'<div style="font-size:12px;max-width:180px">'
-                f"{rank}. {html.escape(entry.caption[:80])}</div></div>"
+                f"{rank}. {html.escape(cap[:80])}</div></div>"
             )
         return "".join(gallery_html_parts), "\n".join(lines)
 
@@ -453,7 +460,7 @@ def build_ui(
                 ["people on a beach at sunset", 12],
                 ["dense forest canopy from above", 8],
                 ["a city street with cars", 8],
-            ],
+            ],  # keep examples lowercase (matches training text policy)
             inputs=[query, top_k],
         )
     return demo

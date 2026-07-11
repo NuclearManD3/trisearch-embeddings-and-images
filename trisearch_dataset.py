@@ -196,11 +196,21 @@ def load_pil_image(value: Any, image_root: str | None = None) -> Image.Image:
     raise TypeError(f"Unsupported image value type: {type(value)}")
 
 
+def normalize_training_text(value: Any) -> str:
+    """Canonical text form for all training strings: strip + lowercase.
+
+    Applied at load/stream time in this module so demos/trainers need no
+    special casing. Empty after strip stays empty.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value).strip().lower()
+
+
 def pick_caption(row: dict[str, Any], caption_column: str) -> str:
-    caption = row.get(caption_column, "")
-    if isinstance(caption, list):
-        caption = caption[0] if caption else ""
-    return str(caption).strip()
+    return normalize_training_text(row.get(caption_column, ""))
 
 
 def caption_from_row(row: dict[str, Any], caption_column: str | None) -> str:
@@ -208,10 +218,7 @@ def caption_from_row(row: dict[str, Any], caption_column: str | None) -> str:
         return pick_caption(row, caption_column)
     for key in ("caption", "caption_0", "text", "sentence", "sentences"):
         if key in row and row[key]:
-            value = row[key]
-            if isinstance(value, list) and value:
-                return str(value[0]).strip()
-            return str(value).strip()
+            return normalize_training_text(row[key])
     return ""
 
 
@@ -346,26 +353,30 @@ def curated_dataset_available(path: str | Path | None = None) -> bool:
 
 
 def _normalize_trisearch_fields(rec: dict[str, Any]) -> dict[str, Any]:
-    """Text fields only — **never** decode the image here (RAM rule)."""
-    captions = list(rec.get("captions") or [])
-    if not captions and rec.get("caption"):
-        captions = [rec["caption"]]
+    """Text fields only — **never** decode the image here (RAM rule).
+
+    All human-language fields are lowercased for training consistency.
+    """
+    raw_caps = list(rec.get("captions") or [])
+    if not raw_caps and rec.get("caption"):
+        raw_caps = [rec["caption"]]
+    captions = [normalize_training_text(c) for c in raw_caps if normalize_training_text(c)]
     if not captions:
         raise ValueError(f"row {rec.get('id')!r} has no captions")
-    primary = str(captions[0]).strip()
-    related = str(
+    primary = captions[0]
+    related = normalize_training_text(
         rec.get(QUERY_CACHE_RELATED_KEY) or rec.get("query") or ""
-    ).strip()
+    )
     if not related and len(captions) > 1:
-        related = str(captions[1]).strip()
-    unrelated = str(
+        related = captions[1]
+    unrelated = normalize_training_text(
         rec.get(QUERY_CACHE_UNRELATED_KEY) or rec.get("unrelated_query") or ""
-    ).strip()
+    )
     return {
         # Keep raw image handle (path / HF Image / bytes dict); decode in getitem.
         "image": rec.get("image"),
         "caption": primary,
-        "captions": [str(c) for c in captions],
+        "captions": captions,
         "domain": str(rec.get("domain") or "general"),
         "source": str(rec.get("source") or "trisearch"),
         "id": str(rec.get("id") or ""),
@@ -957,8 +968,8 @@ def _extract_json_value(text: str) -> Any:
 def _normalize_query_entry(payload: Any) -> dict[str, str]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected object, got {type(payload)!r}")
-    related = str(payload.get("related_query", "")).strip()
-    unrelated = str(payload.get("unrelated_query", "")).strip()
+    related = normalize_training_text(payload.get("related_query", ""))
+    unrelated = normalize_training_text(payload.get("unrelated_query", ""))
     if not related or not unrelated:
         raise ValueError(f"Missing query fields in {payload!r}")
     return {
@@ -1491,10 +1502,12 @@ def enrich_rows_with_text_queries(
             if alt and skip_generation:
                 enriched.append({
                     **row,
-                    QUERY_CACHE_RELATED_KEY: alt,
-                    QUERY_CACHE_UNRELATED_KEY: row.get(
-                        QUERY_CACHE_UNRELATED_KEY,
-                        "red sports car on a racetrack at night",
+                    QUERY_CACHE_RELATED_KEY: normalize_training_text(alt),
+                    QUERY_CACHE_UNRELATED_KEY: normalize_training_text(
+                        row.get(
+                            QUERY_CACHE_UNRELATED_KEY,
+                            "red sports car on a racetrack at night",
+                        )
                     ),
                 })
                 continue
@@ -1505,8 +1518,12 @@ def enrich_rows_with_text_queries(
         entry = cache[caption]
         enriched.append({
             **row,
-            QUERY_CACHE_RELATED_KEY: entry[QUERY_CACHE_RELATED_KEY],
-            QUERY_CACHE_UNRELATED_KEY: entry[QUERY_CACHE_UNRELATED_KEY],
+            QUERY_CACHE_RELATED_KEY: normalize_training_text(
+                entry[QUERY_CACHE_RELATED_KEY]
+            ),
+            QUERY_CACHE_UNRELATED_KEY: normalize_training_text(
+                entry[QUERY_CACHE_UNRELATED_KEY]
+            ),
         })
     print(
         f"Attached text queries to {len(enriched):,} rows "
@@ -1546,6 +1563,8 @@ def load_verification_samples(
 
 
 def _tokenize_text(tokenizer, text: str, max_text_length: int) -> dict[str, Any]:
+    # Final training choke point: never feed mixed-case strings to the tokenizer.
+    text = normalize_training_text(text)
     return tokenizer(
         text,
         return_tensors="pt",
@@ -1593,15 +1612,15 @@ class ImageCaptionDataset(Dataset):
         return len(self.rows)
 
     def _resolve_related_query(self, row: dict[str, Any], caption: str) -> str:
-        """Search query, else another caption for multi-caption COCO/SkyScript rows."""
-        related = str(row.get(self.related_query_column, "")).strip()
+        """Search query, else another caption for multi-caption rows (lowercase)."""
+        related = normalize_training_text(row.get(self.related_query_column, ""))
         if related:
             return related
         if self.use_extra_captions_as_related:
             extras = row.get("captions")
             if isinstance(extras, (list, tuple)):
                 for text in extras:
-                    text = str(text).strip()
+                    text = normalize_training_text(text)
                     if text and text != caption:
                         return text
         return ""
@@ -1615,7 +1634,8 @@ class ImageCaptionDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self._fetch_row(idx)
         image = load_pil_image(row[self.image_column], self.image_root)
-        caption = pick_caption(row, self.caption_column)
+        # Always lowercase at the training-stream boundary (even if row was raw HF).
+        caption = normalize_training_text(pick_caption(row, self.caption_column))
 
         pixel_values = self.image_processor(
             images=image, return_tensors="pt"
@@ -1628,7 +1648,9 @@ class ImageCaptionDataset(Dataset):
         }
         if self.with_text_queries:
             related = self._resolve_related_query(row, caption)
-            unrelated = str(row.get(self.unrelated_query_column, "")).strip()
+            unrelated = normalize_training_text(
+                row.get(self.unrelated_query_column, "")
+            )
             if not related or not unrelated:
                 raise ValueError(
                     f"Row {idx} is missing text queries "

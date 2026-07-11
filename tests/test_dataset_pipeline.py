@@ -525,6 +525,36 @@ class TestQualityAudit(unittest.TestCase):
             self.assertIn(uq, text)
 
 
+class TestTrainingTextLowercase(unittest.TestCase):
+    def test_normalize_and_map_fields_are_lowercase(self):
+        from trisearch_dataset import (
+            _normalize_trisearch_fields,
+            normalize_training_text,
+            pick_caption,
+        )
+
+        self.assertEqual(normalize_training_text("  Hello World  "), "hello world")
+        self.assertEqual(
+            pick_caption({"caption": "A Red Barn."}, "caption"),
+            "a red barn.",
+        )
+        rec = _normalize_trisearch_fields(
+            {
+                "id": "t-0",
+                "domain": "general",
+                "source": "unit",
+                "captions": ["A Red Barn In SNOW", "Farm Building COUNTRYSIDE"],
+                "query": "Red Barn Photo",
+                "unrelated_query": "Underwater Coral Reef",
+                "image": None,
+            }
+        )
+        self.assertEqual(rec["caption"], "a red barn in snow")
+        self.assertEqual(rec["captions"][1], "farm building countryside")
+        self.assertEqual(rec["related_query"], "red barn photo")
+        self.assertEqual(rec["unrelated_query"], "underwater coral reef")
+
+
 class TestHubCuratedLoad(unittest.TestCase):
     """Live Hub smoke (network + HF cache). Skips only if Hub is unreachable."""
 
