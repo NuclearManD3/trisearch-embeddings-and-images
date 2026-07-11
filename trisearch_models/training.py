@@ -41,7 +41,7 @@ TEXT_COMPONENT = "text_model"
 PROJECTION_FILE = "projection_heads.pt"
 TRAINING_STATE_FILE = "training_state.pt"
 CONFIG_FILE = "stage1_config.json"
-DEFAULT_MAX_TEXT_LENGTH = 256
+DEFAULT_MAX_INPUT_TOKENS = 256
 DEFAULT_MATRYOSHKA_DIMS = (64, 128, 256, 512, 1024)
 
 
@@ -1166,7 +1166,7 @@ def verify_trained_checkpoint(
     seed_text_dir: str,
     tokenizer_id: str = QWEN_TOKENIZER_ID,
     vision_processor_id: str = SIGLIP_PROCESSOR_ID,
-    max_text_length: int = DEFAULT_MAX_TEXT_LENGTH,
+    max_text_length: int = DEFAULT_MAX_INPUT_TOKENS,
     bf16: bool = True,
     vision_gpu: int = 0,
     text_gpu: int = 1,

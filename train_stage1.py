@@ -55,7 +55,7 @@ from trisearch_dataset import (
 )
 from trisearch_models import (
     DEFAULT_MATRYOSHKA_DIMS,
-    DEFAULT_MAX_TEXT_LENGTH,
+    DEFAULT_MAX_INPUT_TOKENS,
     DEFAULT_MEMORY_BANK_SIZE,
     DEFAULT_SEED_TEXT_DIR,
     DEFAULT_SEED_VISION_DIR,
@@ -144,11 +144,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max-satellite-samples", type=int, default=None)
     parser.add_argument("--max-general-samples", type=int, default=None)
-    parser.add_argument("--max-text-length", type=int, default=DEFAULT_MAX_TEXT_LENGTH)
+    parser.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
 
     parser.add_argument("--matryoshka-dims", default="64,128,256,512,1024")
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--contrastive-weight", type=float, default=1.0)
+    parser.add_argument("--contrastive-weight", type=float, default=2.0)
     parser.add_argument("--matryoshka-weight", type=float, default=0.5)
     parser.add_argument("--text-text-weight", type=float, default=1.0,
                         help="Weight for query↔caption text-text contrastive loss.")
@@ -279,7 +279,7 @@ def main():
     text_model, tokenizer, text_hidden = load_text_model_for_training(
         model_dir=str(text_load_dir),
         tokenizer_id=args.text_tokenizer_id,
-        max_seq_length=args.max_text_length,
+        max_seq_length=args.max_input_tokens,
         text_device=text_device,
         compute_dtype=compute_dtype,
     )
@@ -300,7 +300,7 @@ def main():
         image_column=image_column,
         caption_column=caption_column,
         image_root=image_root,
-        max_text_length=args.max_text_length,
+        max_text_length=args.max_input_tokens,
         with_text_queries=with_text_queries,
     )
 
@@ -363,7 +363,7 @@ def main():
         f"  memory bank    : {args.memory_bank_size} "
         f"(contrastive negatives ≈ micro-batch-1 + bank)"
     )
-    print(f"  max tokens     : {args.max_text_length}")
+    print(f"  max tokens     : {args.max_input_tokens}")
     print(f"  matryoshka dims: {matryoshka_dims}")
     print(f"  text-text train: {with_text_queries}")
     if with_text_queries:
@@ -407,7 +407,7 @@ def main():
         seed_text_dir=args.seed_text_dir,
         tokenizer_id=args.text_tokenizer_id,
         vision_processor_id=args.vision_processor_id,
-        max_text_length=args.max_text_length,
+        max_text_length=args.max_input_tokens,
         bf16=args.bf16,
         vision_gpu=args.vision_gpu,
         text_gpu=args.text_gpu,
