@@ -76,6 +76,11 @@ from trisearch_models import (
     save_stage1_checkpoint,
     verify_trained_checkpoint,
 )
+from trisearch_models.training import (
+    DEFAULT_MULTI_POSITIVE_JACCARD,
+    DEFAULT_SOFT_MAXSIM_TEMPERATURE,
+    DEFAULT_VISION_PATCH_KEEP_RATIO,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -164,6 +169,45 @@ def parse_args() -> argparse.Namespace:
              f"negatives (default {DEFAULT_MEMORY_BANK_SIZE}). "
              "Gives a large effective negative set without a large micro-batch. "
              "Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--bank-score-policy",
+        choices=("accum_window", "live"),
+        default="accum_window",
+        help="Memory-bank scoring policy. 'accum_window' (policy B, default): "
+             "enqueue every micro-batch, but score against the bank snapshot "
+             "from the start of the gradient-accumulation window. "
+             "'live': score against bank after each prior micro-batch enqueue.",
+    )
+    parser.add_argument(
+        "--soft-maxsim",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use soft MaxSim (τ logsumexp) instead of hard max (default: enabled).",
+    )
+    parser.add_argument(
+        "--soft-maxsim-temperature",
+        type=float,
+        default=DEFAULT_SOFT_MAXSIM_TEMPERATURE,
+        help=f"Soft MaxSim temperature τ_s (default {DEFAULT_SOFT_MAXSIM_TEMPERATURE}). "
+             "Smaller → closer to hard max.",
+    )
+    parser.add_argument(
+        "--multi-positive-jaccard",
+        type=float,
+        default=DEFAULT_MULTI_POSITIVE_JACCARD,
+        help="Caption token-Jaccard threshold for multi-positive non-negative "
+             f"masking in InfoNCE (default {DEFAULT_MULTI_POSITIVE_JACCARD}). "
+             "Pairs at/above threshold are excluded from the negative set. "
+             "Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--vision-patch-keep-ratio",
+        type=float,
+        default=DEFAULT_VISION_PATCH_KEEP_RATIO,
+        help="Keep top fraction of SigLIP vision patches by pre-norm L2 "
+             f"(drop background; default {DEFAULT_VISION_PATCH_KEEP_RATIO}). "
+             "1.0 keeps all patches.",
     )
     parser.add_argument("--openrouter-config", default=str(DEFAULT_OPENROUTER_CONFIG),
                         help="YAML file with openrouter.api_key and openrouter.model.")
@@ -321,6 +365,11 @@ def main():
         ),
         compute_dtype=compute_dtype,
         memory_bank_size=args.memory_bank_size,
+        soft_maxsim=args.soft_maxsim,
+        soft_maxsim_temperature=args.soft_maxsim_temperature,
+        multi_positive_jaccard=args.multi_positive_jaccard,
+        vision_patch_keep_ratio=args.vision_patch_keep_ratio,
+        bank_score_policy=args.bank_score_policy,
     )
     alignment_model.vision_projection.to(device=vision_device, dtype=compute_dtype)
     alignment_model.text_projection.to(device=text_device, dtype=compute_dtype)
@@ -363,6 +412,13 @@ def main():
         f"  memory bank    : {args.memory_bank_size} "
         f"(contrastive negatives ≈ micro-batch-1 + bank)"
     )
+    print(f"  bank policy    : {args.bank_score_policy}")
+    print(
+        f"  soft MaxSim    : {args.soft_maxsim}"
+        + (f" (τ_s={args.soft_maxsim_temperature})" if args.soft_maxsim else "")
+    )
+    print(f"  multi-pos Jac  : {args.multi_positive_jaccard}")
+    print(f"  vision keep    : {args.vision_patch_keep_ratio} (L2 background drop)")
     print(f"  max tokens     : {args.max_input_tokens}")
     print(f"  matryoshka dims: {matryoshka_dims}")
     print(f"  text-text train: {with_text_queries}")

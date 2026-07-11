@@ -43,16 +43,74 @@ TRAINING_STATE_FILE = "training_state.pt"
 CONFIG_FILE = "stage1_config.json"
 DEFAULT_MAX_INPUT_TOKENS = 256
 DEFAULT_MATRYOSHKA_DIMS = (64, 128, 256, 512, 1024)
+# Soft MaxSim: τ_s * logsumexp(sim / τ_s). Smaller τ_s → closer to hard max.
+DEFAULT_SOFT_MAXSIM_TEMPERATURE = 0.05
+# Caption token-Jaccard above this → treat as non-negative (not a false neg).
+DEFAULT_MULTI_POSITIVE_JACCARD = 0.5
+# Keep top fraction of SigLIP patches by pre-norm L2 (drop background).
+DEFAULT_VISION_PATCH_KEEP_RATIO = 0.75
+
+
+def pad_token_sequences(
+    tokens: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad a list of ``(n_i, D)`` tensors to ``(B, max_n, D)`` + bool mask."""
+    if not tokens:
+        raise ValueError("pad_token_sequences requires a non-empty token list.")
+    device = tokens[0].device
+    dtype = tokens[0].dtype
+    dim = tokens[0].shape[-1]
+    lengths = [0 if t.numel() == 0 else int(t.shape[0]) for t in tokens]
+    max_n = max(lengths) if lengths else 0
+    batch = len(tokens)
+    if max_n == 0:
+        padded = tokens[0].new_zeros((batch, 1, dim))
+        mask = torch.zeros(batch, 1, dtype=torch.bool, device=device)
+        return padded, mask
+    padded = tokens[0].new_zeros((batch, max_n, dim))
+    mask = torch.zeros(batch, max_n, dtype=torch.bool, device=device)
+    for i, t in enumerate(tokens):
+        if t.numel() == 0:
+            continue
+        if t.ndim == 1:
+            t = t.unsqueeze(0)
+        n = t.shape[0]
+        padded[i, :n] = t.to(device=device, dtype=dtype)
+        mask[i, :n] = True
+    return padded, mask
+
+
+def soft_or_hard_maxsim(
+    sim: torch.Tensor,
+    *,
+    soft_temperature: float | None = None,
+    dim: int = -1,
+) -> torch.Tensor:
+    """Max (or soft-Max) over ``dim``.
+
+    Soft MaxSim: ``τ_s * logsumexp(sim / τ_s)``. As ``τ_s → 0`` this recovers
+    hard max while remaining differentiable w.r.t. all document tokens.
+    """
+    if soft_temperature is None or soft_temperature <= 0.0:
+        return sim.max(dim=dim).values
+    tau = float(soft_temperature)
+    return tau * torch.logsumexp(sim / tau, dim=dim)
 
 
 def differentiable_late_interaction_score(
-    query: torch.Tensor, doc: torch.Tensor
+    query: torch.Tensor,
+    doc: torch.Tensor,
+    *,
+    soft_maxsim_temperature: float | None = None,
 ) -> torch.Tensor:
     """Mean-MaxSim: mean over query tokens of max cosine to any doc token.
 
     Using the mean (not sum) keeps logits O(1) for InfoNCE with temperature
     ~0.07 even when captions are long, avoiding softmax saturation and
     pathological gradient norms with a large memory bank.
+
+    When ``soft_maxsim_temperature`` is set (>0), hard max is replaced by
+    soft MaxSim (τ logsumexp).
     """
     if query.numel() == 0 or doc.numel() == 0:
         return query.new_zeros(())
@@ -61,26 +119,154 @@ def differentiable_late_interaction_score(
     if doc.ndim == 1:
         doc = doc.unsqueeze(0)
     sim = query @ doc.T
-    return sim.max(dim=1).values.mean()
+    per_q = soft_or_hard_maxsim(
+        sim, soft_temperature=soft_maxsim_temperature, dim=1
+    )
+    return per_q.mean()
 
 
 def build_late_interaction_matrix(
     query_tokens: list[torch.Tensor],
     doc_tokens: list[torch.Tensor],
+    *,
+    soft_maxsim_temperature: float | None = None,
 ) -> torch.Tensor:
-    """Pairwise mean-MaxSim matrix of shape ``(len(queries), len(docs))``."""
+    """Pairwise mean-MaxSim matrix of shape ``(len(queries), len(docs))``.
+
+    Vectorized via padded tensors + einsum (same math as the per-pair loop).
+    """
     if not query_tokens or not doc_tokens:
         raise ValueError(
             f"Late-interaction matrix needs non-empty query and doc lists "
             f"(got {len(query_tokens)} queries, {len(doc_tokens)} docs)."
         )
-    rows = []
-    for query in query_tokens:
-        rows.append(torch.stack([
-            differentiable_late_interaction_score(query, doc)
-            for doc in doc_tokens
-        ]))
-    return torch.stack(rows)
+    q_pad, q_mask = pad_token_sequences(query_tokens)  # (Bq, Tq, D), (Bq, Tq)
+    d_pad, d_mask = pad_token_sequences(doc_tokens)  # (Bd, Td, D), (Bd, Td)
+
+    # sim[b_q, b_d, t_q, t_d] = <q, d>
+    # q_pad: (Bq, Tq, D), d_pad: (Bd, Td, D)
+    sim = torch.einsum("qtd,usd->quts", q_pad, d_pad)
+
+    # Invalidate padded doc positions before max / soft-max.
+    neg_large = torch.finfo(sim.dtype).min if sim.dtype.is_floating_point else -1e9
+    # Prefer a large negative that works with fp16/bf16 logsumexp.
+    if not torch.isfinite(torch.tensor(neg_large, dtype=sim.dtype)):
+        neg_large = -1e4
+    else:
+        # Clamp for half precision stability in logsumexp.
+        neg_large = max(float(neg_large), -1e4)
+    sim = sim.masked_fill(~d_mask.unsqueeze(0).unsqueeze(2), neg_large)
+
+    per_q = soft_or_hard_maxsim(
+        sim, soft_temperature=soft_maxsim_temperature, dim=-1
+    )  # (Bq, Bd, Tq)
+
+    q_mask_f = q_mask.to(dtype=per_q.dtype).unsqueeze(1)  # (Bq, 1, Tq)
+    # Zero-out padded query positions; mean over valid query tokens.
+    per_q = per_q * q_mask_f
+    denom = q_mask_f.sum(dim=-1).clamp_min(1.0)  # (Bq, 1)
+    return per_q.sum(dim=-1) / denom
+
+
+def caption_token_jaccard(a: str, b: str) -> float:
+    """Token-bag Jaccard similarity in ``[0, 1]``."""
+    ta = {t for t in str(a).lower().split() if t}
+    tb = {t for t in str(b).lower().split() if t}
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def build_multi_positive_mask(
+    captions: list[str] | None,
+    batch_size: int,
+    *,
+    jaccard_threshold: float = DEFAULT_MULTI_POSITIVE_JACCARD,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.bool,
+) -> torch.Tensor | None:
+    """Build ``(B, B)`` mask of in-batch non-negatives (incl. diagonal).
+
+    Entry ``(i, j)`` is True when caption-i and caption-j are near-duplicates
+    by token Jaccard (or ``i == j``). These pairs are *excluded from the
+    negative set* in InfoNCE (false-negative softening) — they are not forced
+    as extra CE positives.
+    """
+    if captions is None or jaccard_threshold is None or jaccard_threshold <= 0.0:
+        return None
+    if len(captions) != batch_size:
+        raise ValueError(
+            f"captions length {len(captions)} != batch_size {batch_size}"
+        )
+    if batch_size == 0:
+        return None
+    device = device or torch.device("cpu")
+    mask = torch.eye(batch_size, dtype=dtype, device=device)
+    thr = float(jaccard_threshold)
+    for i in range(batch_size):
+        for j in range(i + 1, batch_size):
+            if caption_token_jaccard(captions[i], captions[j]) >= thr:
+                mask[i, j] = True
+                mask[j, i] = True
+    return mask
+
+
+def masked_cross_entropy(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    non_negative_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """CE with optional non-negative masking (false-negatives → -inf logits).
+
+    ``non_negative_mask`` is ``(B, n_docs)`` bool. True means "not a negative":
+    off-diagonal non-negatives are filled with ``-inf`` so CE does not push
+    them away. The labeled positive column is never masked out.
+    """
+    if non_negative_mask is None:
+        return F.cross_entropy(scores, labels)
+    if non_negative_mask.shape != scores.shape:
+        raise ValueError(
+            f"non_negative_mask shape {tuple(non_negative_mask.shape)} != "
+            f"scores shape {tuple(scores.shape)}"
+        )
+    masked = scores.clone()
+    # Exclude true positives from the mask-fill so labels stay finite.
+    eye = torch.zeros_like(non_negative_mask)
+    eye.scatter_(1, labels.view(-1, 1), True)
+    exclude = non_negative_mask & ~eye
+    masked = masked.masked_fill(exclude, float("-inf"))
+    return F.cross_entropy(masked, labels)
+
+
+def keep_top_patches_by_l2(
+    tokens: torch.Tensor,
+    keep_ratio: float = DEFAULT_VISION_PATCH_KEEP_RATIO,
+) -> torch.Tensor:
+    """Keep top-``keep_ratio`` patches by pre-norm L2 (drop background).
+
+    ``tokens`` is ``(P, D)`` *unnormalized* projected patch features. High L2
+    magnitude tends to mark contentful patches; low-L2 patches are often
+    near-uniform background. Ratio ``>= 1`` keeps all patches. Always keeps
+    at least one patch.
+    """
+    if tokens.ndim == 1:
+        tokens = tokens.unsqueeze(0)
+    if tokens.numel() == 0:
+        return tokens
+    ratio = float(keep_ratio)
+    if ratio >= 1.0 or tokens.shape[0] <= 1:
+        return tokens
+    ratio = max(0.0, ratio)
+    k = max(1, int(round(tokens.shape[0] * ratio)))
+    k = min(k, tokens.shape[0])
+    if k >= tokens.shape[0]:
+        return tokens
+    norms = tokens.detach().float().norm(dim=-1)
+    # Stable order: topk then sort indices ascending for deterministic layout.
+    idx = norms.topk(k, largest=True).indices
+    idx, _ = idx.sort()
+    return tokens[idx]
 
 
 @torch.no_grad()
@@ -107,6 +293,10 @@ class EmbeddingMemoryBank:
     prefixes can be re-derived. Entries never receive gradients — they act as
     a MoCo-style memory bank, giving a large effective negative set without
     holding a large micro-batch of activations.
+
+    **Policy B** (stage-1 default): enqueue every micro-batch into the live FIFO,
+    but *score* against a snapshot taken at the start of each gradient-
+    accumulation window (see ``snapshot`` / ``Stage1AlignmentModel.begin_accum_window``).
     """
 
     def __init__(self, capacity: int = 0):
@@ -151,6 +341,13 @@ class EmbeddingMemoryBank:
     def text_raw(self) -> list[torch.Tensor]:
         return list(self._text_raw)
 
+    def snapshot(self) -> dict[str, list[torch.Tensor]]:
+        """Detach-copy of current bank contents for scoring (policy B)."""
+        return {
+            "image_raw": [t.detach().contiguous() for t in self._image_raw],
+            "text_raw": [t.detach().contiguous() for t in self._text_raw],
+        }
+
     def normalized_images(self, dim: int | None = None) -> list[torch.Tensor]:
         return [matryoshka_normalize(t, dim=dim) for t in self._image_raw]
 
@@ -161,6 +358,30 @@ class EmbeddingMemoryBank:
 DEFAULT_MEMORY_BANK_SIZE = 128
 
 
+def _expand_non_negative_mask(
+    batch_mask: torch.Tensor | None,
+    n_docs: int,
+    batch: int,
+) -> torch.Tensor | None:
+    """Pad a ``(B, B)`` in-batch mask to ``(B, n_docs)`` with False for bank cols."""
+    if batch_mask is None:
+        return None
+    if batch_mask.shape != (batch, batch):
+        raise ValueError(
+            f"non_negative_mask expected shape {(batch, batch)}, "
+            f"got {tuple(batch_mask.shape)}"
+        )
+    if n_docs == batch:
+        return batch_mask
+    extra = n_docs - batch
+    if extra < 0:
+        raise ValueError(f"n_docs {n_docs} < batch {batch}")
+    pad = torch.zeros(
+        batch, extra, dtype=batch_mask.dtype, device=batch_mask.device
+    )
+    return torch.cat([batch_mask, pad], dim=1)
+
+
 def contrastive_late_interaction_loss(
     text_tokens: list[torch.Tensor],
     image_tokens: list[torch.Tensor],
@@ -168,6 +389,8 @@ def contrastive_late_interaction_loss(
     *,
     bank_text_tokens: list[torch.Tensor] | None = None,
     bank_image_tokens: list[torch.Tensor] | None = None,
+    soft_maxsim_temperature: float | None = None,
+    non_negative_mask: torch.Tensor | None = None,
     return_metrics: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
     """Bidirectional late-interaction InfoNCE with optional memory-bank negatives.
@@ -176,7 +399,10 @@ def contrastive_late_interaction_loss(
     (t2i on ``S``, i2t on ``S.T``). With a bank, each side scores the live batch
     positives first, then bank docs as extra negatives (labels stay in ``0..B-1``).
 
-    Scores use mean-MaxSim (see ``differentiable_late_interaction_score``).
+    Scores use mean-MaxSim (see ``differentiable_late_interaction_score``),
+    optionally soft MaxSim. ``non_negative_mask`` is an optional ``(B, B)`` bool
+    mask of in-batch pairs that must not act as negatives (false-neg softening).
+
     When ``return_metrics`` is True, also returns mean positive ranks (1 = best)
     averaged over t2i and i2t — useful as a bank-size-invariant health signal.
     """
@@ -198,11 +424,19 @@ def contrastive_late_interaction_loss(
     labels = torch.arange(batch, device=text_tokens[0].device)
     n_image_docs = batch + len(bank_image)
     n_text_docs = batch + len(bank_text)
+    soft_tau = soft_maxsim_temperature
 
     if not bank_text and not bank_image:
-        scores = build_late_interaction_matrix(text_tokens, image_tokens) / temperature
-        loss_t2i = F.cross_entropy(scores, labels)
-        loss_i2t = F.cross_entropy(scores.T, labels)
+        scores = build_late_interaction_matrix(
+            text_tokens,
+            image_tokens,
+            soft_maxsim_temperature=soft_tau,
+        ) / temperature
+        mask = _expand_non_negative_mask(non_negative_mask, batch, batch)
+        loss_t2i = masked_cross_entropy(scores, labels, non_negative_mask=mask)
+        # i2t uses the transpose; mask also transposed.
+        mask_t = mask.T if mask is not None else None
+        loss_i2t = masked_cross_entropy(scores.T, labels, non_negative_mask=mask_t)
         loss = 0.5 * (loss_t2i + loss_i2t)
         if not return_metrics:
             return loss
@@ -218,14 +452,24 @@ def contrastive_late_interaction_loss(
 
     image_docs = list(image_tokens) + list(bank_image)
     text_docs = list(text_tokens) + list(bank_text)
-    scores_t2i = (
-        build_late_interaction_matrix(text_tokens, image_docs) / temperature
+    scores_t2i = build_late_interaction_matrix(
+        text_tokens, image_docs, soft_maxsim_temperature=soft_tau
+    ) / temperature
+    scores_i2t = build_late_interaction_matrix(
+        image_tokens, text_docs, soft_maxsim_temperature=soft_tau
+    ) / temperature
+    mask_t2i = _expand_non_negative_mask(non_negative_mask, n_image_docs, batch)
+    mask_i2t = _expand_non_negative_mask(
+        non_negative_mask.T if non_negative_mask is not None else None,
+        n_text_docs,
+        batch,
     )
-    scores_i2t = (
-        build_late_interaction_matrix(image_tokens, text_docs) / temperature
+    loss_t2i = masked_cross_entropy(
+        scores_t2i, labels, non_negative_mask=mask_t2i
     )
-    loss_t2i = F.cross_entropy(scores_t2i, labels)
-    loss_i2t = F.cross_entropy(scores_i2t, labels)
+    loss_i2t = masked_cross_entropy(
+        scores_i2t, labels, non_negative_mask=mask_i2t
+    )
     loss = 0.5 * (loss_t2i + loss_i2t)
     if not return_metrics:
         return loss
@@ -247,6 +491,8 @@ def text_text_contrastive_loss(
     temperature: float = 0.07,
     *,
     bank_doc_tokens: list[torch.Tensor] | None = None,
+    soft_maxsim_temperature: float | None = None,
+    non_negative_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reward query↔caption matches; penalize wrong captions, distractors, bank."""
     if len(query_tokens) != len(caption_tokens):
@@ -258,10 +504,15 @@ def text_text_contrastive_loss(
         raise ValueError(
             "text-text contrastive loss needs batch_size >= 2 for negatives."
         )
+    batch = len(query_tokens)
     all_docs = list(caption_tokens) + list(distractor_tokens) + list(bank_docs)
-    scores = build_late_interaction_matrix(query_tokens, all_docs) / temperature
+    scores = build_late_interaction_matrix(
+        query_tokens, all_docs, soft_maxsim_temperature=soft_maxsim_temperature
+    ) / temperature
     labels = torch.arange(scores.size(0), device=scores.device)
-    return F.cross_entropy(scores, labels)
+    # Only the in-batch caption columns participate in multi-positive masking.
+    mask = _expand_non_negative_mask(non_negative_mask, scores.size(1), batch)
+    return masked_cross_entropy(scores, labels, non_negative_mask=mask)
 
 
 def text_text_matryoshka_loss(
@@ -273,6 +524,8 @@ def text_text_matryoshka_loss(
     dim_weights: list[float] | None = None,
     *,
     bank_doc_raw: list[torch.Tensor] | None = None,
+    soft_maxsim_temperature: float | None = None,
+    non_negative_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if dim_weights is None:
         dim_weights = [1.0] * len(dims)
@@ -292,6 +545,8 @@ def text_text_matryoshka_loss(
             distractor_prefix,
             temperature=temperature,
             bank_doc_tokens=bank_prefix,
+            soft_maxsim_temperature=soft_maxsim_temperature,
+            non_negative_mask=non_negative_mask,
         )
     return loss / total_weight
 
@@ -305,6 +560,8 @@ def matryoshka_loss(
     *,
     bank_text_raw: list[torch.Tensor] | None = None,
     bank_image_raw: list[torch.Tensor] | None = None,
+    soft_maxsim_temperature: float | None = None,
+    non_negative_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if dim_weights is None:
         dim_weights = [1.0] * len(dims)
@@ -323,6 +580,8 @@ def matryoshka_loss(
             temperature=temperature,
             bank_text_tokens=bank_text_prefix,
             bank_image_tokens=bank_image_prefix,
+            soft_maxsim_temperature=soft_maxsim_temperature,
+            non_negative_mask=non_negative_mask,
         )
     return loss / total_weight
 
@@ -347,6 +606,11 @@ class Stage1AlignmentModel(nn.Module):
         text_text_matryoshka_weight: float = 0.5,
         compute_dtype: torch.dtype = torch.float16,
         memory_bank_size: int = DEFAULT_MEMORY_BANK_SIZE,
+        soft_maxsim: bool = True,
+        soft_maxsim_temperature: float = DEFAULT_SOFT_MAXSIM_TEMPERATURE,
+        multi_positive_jaccard: float = DEFAULT_MULTI_POSITIVE_JACCARD,
+        vision_patch_keep_ratio: float = DEFAULT_VISION_PATCH_KEEP_RATIO,
+        bank_score_policy: str = "accum_window",
     ):
         super().__init__()
         self.vision_device = vision_device
@@ -369,6 +633,19 @@ class Stage1AlignmentModel(nn.Module):
         self.text_text_weight = text_text_weight
         self.text_text_matryoshka_weight = text_text_matryoshka_weight
         self.memory_bank = EmbeddingMemoryBank(memory_bank_size)
+        self.soft_maxsim = bool(soft_maxsim)
+        self.soft_maxsim_temperature = float(soft_maxsim_temperature)
+        self.multi_positive_jaccard = float(multi_positive_jaccard)
+        self.vision_patch_keep_ratio = float(vision_patch_keep_ratio)
+        # "accum_window" = policy B: score snapshot from window start, enqueue every mb.
+        # "live" = score against bank after each prior micro-batch enqueue.
+        if bank_score_policy not in ("accum_window", "live"):
+            raise ValueError(
+                f"bank_score_policy must be 'accum_window' or 'live', "
+                f"got {bank_score_policy!r}"
+            )
+        self.bank_score_policy = bank_score_policy
+        self._score_bank_snapshot: dict[str, list[torch.Tensor]] | None = None
         self._init_projection_heads()
 
     def _init_projection_heads(self):
@@ -377,11 +654,50 @@ class Stage1AlignmentModel(nn.Module):
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
 
+    def _soft_tau(self) -> float | None:
+        if self.soft_maxsim and self.soft_maxsim_temperature > 0.0:
+            return self.soft_maxsim_temperature
+        return None
+
+    def begin_accum_window(self) -> None:
+        """Policy B: freeze bank contents used for scoring for this accum window.
+
+        Live FIFO still receives enqueues every micro-batch; only the scoring
+        view is snapshotted here.
+        """
+        bank = self.memory_bank
+        if bank.enabled and self.bank_score_policy == "accum_window":
+            self._score_bank_snapshot = bank.snapshot()
+        else:
+            self._score_bank_snapshot = None
+
+    def _bank_raw_for_scoring(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        bank = self.memory_bank
+        if not bank.enabled:
+            return [], []
+        if (
+            self.bank_score_policy == "accum_window"
+            and self._score_bank_snapshot is not None
+        ):
+            return (
+                list(self._score_bank_snapshot["text_raw"]),
+                list(self._score_bank_snapshot["image_raw"]),
+            )
+        return bank.text_raw(), bank.image_raw()
+
     def _text_backbone(self):
         return getattr(self.text_model, "model", self.text_model)
 
     def _to_loss(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.to(device=self.loss_device, dtype=self.compute_dtype)
+
+    def _select_vision_patches(
+        self, vision_raw_i: torch.Tensor
+    ) -> torch.Tensor:
+        """Drop background patches by pre-norm L2 before MaxSim / bank store."""
+        return keep_top_patches_by_l2(
+            vision_raw_i, keep_ratio=self.vision_patch_keep_ratio
+        )
 
     def encode_images(self, pixel_values: torch.Tensor) -> list[torch.Tensor]:
         pixel_values = pixel_values.to(self.vision_device, non_blocking=True)
@@ -391,7 +707,11 @@ class Stage1AlignmentModel(nn.Module):
         vision_raw = self.vision_projection(
             vision_hidden.to(self.vision_projection.weight.dtype)
         )
-        return [matryoshka_normalize(vision_raw[i]) for i in range(vision_raw.size(0))]
+        out: list[torch.Tensor] = []
+        for i in range(vision_raw.size(0)):
+            kept = self._select_vision_patches(vision_raw[i])
+            out.append(matryoshka_normalize(kept))
+        return out
 
     def encode_text(
         self,
@@ -442,6 +762,7 @@ class Stage1AlignmentModel(nn.Module):
         query_attention_mask: torch.Tensor | None = None,
         unrelated_input_ids: torch.Tensor | None = None,
         unrelated_attention_mask: torch.Tensor | None = None,
+        captions: list[str] | None = None,
         return_loss: bool = True,
     ) -> dict[str, Any]:
         pixel_values = pixel_values.to(self.vision_device, non_blocking=True)
@@ -461,9 +782,14 @@ class Stage1AlignmentModel(nn.Module):
             text_hidden.to(self.text_projection.weight.dtype)
         )
 
-        image_tokens = [
-            matryoshka_normalize(vision_raw[i]) for i in range(vision_raw.size(0))
-        ]
+        # Vision: drop background patches (pre-norm L2) before normalize / bank.
+        image_raw_kept: list[torch.Tensor] = []
+        image_tokens: list[torch.Tensor] = []
+        for i in range(vision_raw.size(0)):
+            kept = self._select_vision_patches(vision_raw[i])
+            image_raw_kept.append(kept)
+            image_tokens.append(matryoshka_normalize(kept))
+
         text_tokens: list[torch.Tensor] = []
         text_raw_masked: list[torch.Tensor] = []
         for i in range(text_raw.size(0)):
@@ -477,17 +803,17 @@ class Stage1AlignmentModel(nn.Module):
         loss_text_tokens = [self._to_loss(t) for t in text_tokens]
         loss_image_tokens = [self._to_loss(t) for t in image_tokens]
         # Per-sample raw projected tokens (unnormalized) for Matryoshka + bank.
+        # Image raw uses the same L2-kept patch subset as MaxSim scoring.
         loss_text_raw = [self._to_loss(t) for t in text_raw_masked]
-        loss_image_raw = [
-            self._to_loss(vision_raw[i]) for i in range(vision_raw.size(0))
-        ]
+        loss_image_raw = [self._to_loss(t) for t in image_raw_kept]
 
         bank = self.memory_bank
+        score_text_raw, score_image_raw = self._bank_raw_for_scoring()
         bank_text_raw = (
-            [self._to_loss(t) for t in bank.text_raw()] if bank.enabled else []
+            [self._to_loss(t) for t in score_text_raw] if score_text_raw else []
         )
         bank_image_raw = (
-            [self._to_loss(t) for t in bank.image_raw()] if bank.enabled else []
+            [self._to_loss(t) for t in score_image_raw] if score_image_raw else []
         )
         bank_text_tokens = (
             [matryoshka_normalize(t) for t in bank_text_raw] if bank_text_raw else []
@@ -496,12 +822,22 @@ class Stage1AlignmentModel(nn.Module):
             [matryoshka_normalize(t) for t in bank_image_raw] if bank_image_raw else []
         )
 
+        soft_tau = self._soft_tau()
+        non_neg = build_multi_positive_mask(
+            captions,
+            batch_size=len(loss_text_tokens),
+            jaccard_threshold=self.multi_positive_jaccard,
+            device=loss_text_tokens[0].device,
+        )
+
         contrastive, contrastive_metrics = contrastive_late_interaction_loss(
             loss_text_tokens,
             loss_image_tokens,
             temperature=self.temperature,
             bank_text_tokens=bank_text_tokens,
             bank_image_tokens=bank_image_tokens,
+            soft_maxsim_temperature=soft_tau,
+            non_negative_mask=non_neg,
             return_metrics=True,
         )
         matryoshka = matryoshka_loss(
@@ -511,6 +847,8 @@ class Stage1AlignmentModel(nn.Module):
             temperature=self.temperature,
             bank_text_raw=bank_text_raw,
             bank_image_raw=bank_image_raw,
+            soft_maxsim_temperature=soft_tau,
+            non_negative_mask=non_neg,
         )
         loss = (
             self.contrastive_weight * contrastive
@@ -549,6 +887,8 @@ class Stage1AlignmentModel(nn.Module):
                     loss_distractor_tokens,
                     temperature=self.temperature,
                     bank_doc_tokens=bank_text_tokens,
+                    soft_maxsim_temperature=soft_tau,
+                    non_negative_mask=non_neg,
                 )
                 loss = loss + self.text_text_weight * text_text
             if self.text_text_matryoshka_weight > 0.0:
@@ -559,10 +899,13 @@ class Stage1AlignmentModel(nn.Module):
                     dims=self.matryoshka_dims,
                     temperature=self.temperature,
                     bank_doc_raw=bank_text_raw,
+                    soft_maxsim_temperature=soft_tau,
+                    non_negative_mask=non_neg,
                 )
                 loss = loss + self.text_text_matryoshka_weight * text_text_matryoshka
 
         # Enqueue *after* scoring so the current batch is never its own negative.
+        # Policy B: enqueue every micro-batch into the live FIFO.
         if bank.enabled:
             bank.enqueue(image_raw=loss_image_raw, text_raw=loss_text_raw)
 
@@ -1343,8 +1686,14 @@ def run_training(
         print(f"Already at step {start_step} (max_steps={max_steps}); nothing to train.")
         return start_step
 
+    accum = max(int(args.gradient_accumulation_steps), 1)
+
     while True:
         for batch in dataloader:
+            # Policy B: snapshot bank for scoring at the start of each accum window.
+            if micro_step % accum == 0 and hasattr(model, "begin_accum_window"):
+                model.begin_accum_window()
+
             outputs = model(**batch, return_loss=True)
             loss_val = outputs["loss"].detach().float().item()
             if loss_val <= 0.0 or not math.isfinite(loss_val):
@@ -1353,7 +1702,7 @@ def run_training(
                     f"batch={batch['input_ids'].shape[0]} — need batch_size >= 2."
                 )
 
-            (outputs["loss"] / args.gradient_accumulation_steps).backward()
+            (outputs["loss"] / accum).backward()
 
             log_loss += loss_val
             log_contrastive += float(outputs["contrastive_loss"])
@@ -1366,7 +1715,7 @@ def run_training(
             log_batches += 1
             micro_step += 1
 
-            if micro_step % args.gradient_accumulation_steps != 0:
+            if micro_step % accum != 0:
                 continue
 
             text_lr = lr_at(global_step)

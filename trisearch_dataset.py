@@ -1645,6 +1645,8 @@ class ImageCaptionDataset(Dataset):
             "pixel_values": pixel_values,
             "input_ids": text["input_ids"][0],
             "attention_mask": text["attention_mask"][0],
+            # Raw caption string for multi-positive (false-negative) masking.
+            "caption": caption,
         }
         if self.with_text_queries:
             related = self._resolve_related_query(row, caption)
@@ -1683,6 +1685,8 @@ class Stage1Collator:
             "input_ids": torch.stack([f["input_ids"] for f in features]),
             "attention_mask": torch.stack([f["attention_mask"] for f in features]),
         }
+        if all("caption" in f for f in features):
+            batch["captions"] = [f["caption"] for f in features]
         if self.with_text_queries:
             batch["query_input_ids"] = torch.stack(
                 [f["query_input_ids"] for f in features]
