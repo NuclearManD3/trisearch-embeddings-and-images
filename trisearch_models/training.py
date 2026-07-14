@@ -49,6 +49,22 @@ DEFAULT_SOFT_MAXSIM_TEMPERATURE = 0.05
 DEFAULT_MULTI_POSITIVE_JACCARD = 0.5
 # Keep top fraction of SigLIP patches by pre-norm L2 (drop background).
 DEFAULT_VISION_PATCH_KEEP_RATIO = 0.75
+# Embedding geometry regularizer (anti-cone / isotropy). Overall scale.
+DEFAULT_EMBEDDING_GEO_WEIGHT = 0.05
+DEFAULT_GEO_CENTER_WEIGHT = 1.0
+DEFAULT_GEO_VAR_WEIGHT = 1.0
+DEFAULT_GEO_VEC_MEAN_WEIGHT = 0.25
+DEFAULT_GEO_MAG_FLOOR = 0.05
+DEFAULT_GEO_MAG_FLOOR_WEIGHT = 0.1
+# Per-dim std target as fraction of ideal isotropic 1/sqrt(D).
+DEFAULT_GEO_VAR_RATIO = 0.5
+# Soft penalty when |coord| exceeds this * 1/sqrt(D) (stops single-dim domination).
+DEFAULT_GEO_MAX_ABS_RATIO = 4.0
+DEFAULT_GEO_MAX_ABS_WEIGHT = 0.1
+# Also regularize a Matryoshka prefix (re-normalized).
+DEFAULT_GEO_PREFIX_DIM = 256
+DEFAULT_GEO_PREFIX_WEIGHT = 0.5
+DEFAULT_GEO_EMA_MOMENTUM = 0.99
 
 
 def pad_token_sequences(
@@ -267,6 +283,171 @@ def keep_top_patches_by_l2(
     idx = norms.topk(k, largest=True).indices
     idx, _ = idx.sort()
     return tokens[idx]
+
+
+def stack_token_embeddings(
+    token_lists: list[list[torch.Tensor]],
+) -> torch.Tensor | None:
+    """Concatenate multi-token sequences into a single ``(N, D)`` matrix."""
+    parts: list[torch.Tensor] = []
+    for tokens in token_lists:
+        for t in tokens:
+            if t is None or t.numel() == 0:
+                continue
+            if t.ndim == 1:
+                parts.append(t.unsqueeze(0))
+            else:
+                parts.append(t)
+    if not parts:
+        return None
+    return torch.cat(parts, dim=0)
+
+
+def mean_pool_token_list(tokens: list[torch.Tensor]) -> torch.Tensor | None:
+    """Mean-pool each multi-token sequence → ``(B, D)``."""
+    if not tokens:
+        return None
+    rows = []
+    for t in tokens:
+        if t is None or t.numel() == 0:
+            continue
+        if t.ndim == 1:
+            rows.append(t)
+        else:
+            rows.append(t.mean(dim=0))
+    if not rows:
+        return None
+    return torch.stack(rows, dim=0)
+
+
+def embedding_geometry_loss(
+    normalized: torch.Tensor,
+    *,
+    raw: torch.Tensor | None = None,
+    ema_mean: torch.Tensor | None = None,
+    center_weight: float = DEFAULT_GEO_CENTER_WEIGHT,
+    var_weight: float = DEFAULT_GEO_VAR_WEIGHT,
+    vec_mean_weight: float = DEFAULT_GEO_VEC_MEAN_WEIGHT,
+    var_ratio: float = DEFAULT_GEO_VAR_RATIO,
+    mag_floor: float = DEFAULT_GEO_MAG_FLOOR,
+    mag_floor_weight: float = DEFAULT_GEO_MAG_FLOOR_WEIGHT,
+    max_abs_ratio: float = DEFAULT_GEO_MAX_ABS_RATIO,
+    max_abs_weight: float = DEFAULT_GEO_MAX_ABS_WEIGHT,
+    ema_blend: float = 0.5,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Anti-cone / isotropy regularizer on L2-normalized embeddings.
+
+    Parameters
+    ----------
+    normalized
+        ``(N, D)`` unit vectors (token-level and/or mean-pooled). Gradients flow.
+    raw
+        Optional matching ``(N, D)`` *pre-norm* projections for a magnitude floor
+        (stops dead projections before normalize).
+    ema_mean
+        Optional detached running mean ``(D,)`` mixed into the center target so
+        small micro-batches still see a stable cone direction to cancel.
+
+    Terms
+    -----
+    * **center** — ``||μ||²`` pushes batch (and EMA-blended) mean toward 0 so
+      dims are not permanently biased (e.g. all v₀ ≈ 0.05).
+    * **variance** — hinge below ``var_ratio / sqrt(D)`` per dim (VICReg-style).
+    * **vec_mean** — ``E[(mean_d v_d)²]`` soft anti all-positive / all-negative.
+    * **mag_floor** — pre-norm ``ReLU(ε - ||z||)`` so projections do not die.
+    * **max_abs** — soft penalty when any |coord| ≫ isotropic scale.
+    """
+    if normalized.ndim == 1:
+        normalized = normalized.unsqueeze(0)
+    if normalized.numel() == 0 or normalized.shape[0] == 0:
+        zero = normalized.new_zeros(())
+        return zero, {
+            "geo_center": 0.0,
+            "geo_var": 0.0,
+            "geo_vec_mean": 0.0,
+            "geo_mag_floor": 0.0,
+            "geo_max_abs": 0.0,
+            "geo_mu_norm": 0.0,
+            "geo_min_std": 0.0,
+            "geo_mean_abs_mu": 0.0,
+        }
+
+    # Work in fp32 for stable stats; cast loss back to normalized dtype.
+    v = normalized.float()
+    n, dim = v.shape
+    inv_sqrt_d = 1.0 / math.sqrt(max(dim, 1))
+    var_target = float(var_ratio) * inv_sqrt_d
+    max_abs_target = float(max_abs_ratio) * inv_sqrt_d
+
+    batch_mu = v.mean(dim=0)
+    if ema_mean is not None and ema_mean.numel() == dim:
+        # Blend live mean with detached EMA so B=2 still sees the cone.
+        mu = (1.0 - float(ema_blend)) * batch_mu + float(ema_blend) * ema_mean.float().detach()
+    else:
+        mu = batch_mu
+    center = (mu * mu).sum()
+
+    # Unbiased=False: small-N friendly; matches VICReg practice.
+    std = v.std(dim=0, unbiased=False).clamp_min(0.0)
+    var_hinge = F.relu(var_target - std).pow(2).mean()
+
+    vec_mean = v.mean(dim=-1)
+    vec_mean_pen = (vec_mean * vec_mean).mean()
+
+    mag_pen = v.new_zeros(())
+    if (
+        raw is not None
+        and mag_floor_weight > 0.0
+        and mag_floor > 0.0
+        and raw.numel() > 0
+    ):
+        r = raw.float()
+        if r.ndim == 1:
+            r = r.unsqueeze(0)
+        if r.shape[0] == n:
+            norms = r.norm(dim=-1)
+            mag_pen = F.relu(float(mag_floor) - norms).pow(2).mean()
+
+    max_abs_pen = v.new_zeros(())
+    if max_abs_weight > 0.0 and max_abs_target > 0.0:
+        max_abs_pen = F.relu(v.abs().max(dim=-1).values - max_abs_target).pow(2).mean()
+
+    total = (
+        float(center_weight) * center
+        + float(var_weight) * var_hinge
+        + float(vec_mean_weight) * vec_mean_pen
+        + float(mag_floor_weight) * mag_pen
+        + float(max_abs_weight) * max_abs_pen
+    )
+    total = total.to(dtype=normalized.dtype)
+
+    metrics = {
+        "geo_center": float(center.detach()),
+        "geo_var": float(var_hinge.detach()),
+        "geo_vec_mean": float(vec_mean_pen.detach()),
+        "geo_mag_floor": float(mag_pen.detach()) if torch.is_tensor(mag_pen) else 0.0,
+        "geo_max_abs": float(max_abs_pen.detach()) if torch.is_tensor(max_abs_pen) else 0.0,
+        "geo_mu_norm": float(batch_mu.detach().norm()),
+        "geo_min_std": float(std.detach().min()),
+        "geo_mean_abs_mu": float(batch_mu.detach().abs().mean()),
+    }
+    return total, metrics
+
+
+def update_embedding_ema(
+    ema: torch.Tensor,
+    batch_mean: torch.Tensor,
+    momentum: float = DEFAULT_GEO_EMA_MOMENTUM,
+) -> torch.Tensor:
+    """In-place EMA update of the embedding mean; returns the updated buffer."""
+    if ema.shape != batch_mean.shape:
+        raise ValueError(
+            f"EMA shape {tuple(ema.shape)} != batch mean {tuple(batch_mean.shape)}"
+        )
+    m = float(momentum)
+    # ema ← m * ema + (1-m) * batch_mean  (both detached)
+    ema.mul_(m).add_(batch_mean.detach(), alpha=1.0 - m)
+    return ema
 
 
 @torch.no_grad()
@@ -611,6 +792,18 @@ class Stage1AlignmentModel(nn.Module):
         multi_positive_jaccard: float = DEFAULT_MULTI_POSITIVE_JACCARD,
         vision_patch_keep_ratio: float = DEFAULT_VISION_PATCH_KEEP_RATIO,
         bank_score_policy: str = "accum_window",
+        embedding_geo_weight: float = DEFAULT_EMBEDDING_GEO_WEIGHT,
+        geo_center_weight: float = DEFAULT_GEO_CENTER_WEIGHT,
+        geo_var_weight: float = DEFAULT_GEO_VAR_WEIGHT,
+        geo_vec_mean_weight: float = DEFAULT_GEO_VEC_MEAN_WEIGHT,
+        geo_var_ratio: float = DEFAULT_GEO_VAR_RATIO,
+        geo_mag_floor: float = DEFAULT_GEO_MAG_FLOOR,
+        geo_mag_floor_weight: float = DEFAULT_GEO_MAG_FLOOR_WEIGHT,
+        geo_max_abs_ratio: float = DEFAULT_GEO_MAX_ABS_RATIO,
+        geo_max_abs_weight: float = DEFAULT_GEO_MAX_ABS_WEIGHT,
+        geo_prefix_dim: int = DEFAULT_GEO_PREFIX_DIM,
+        geo_prefix_weight: float = DEFAULT_GEO_PREFIX_WEIGHT,
+        geo_ema_momentum: float = DEFAULT_GEO_EMA_MOMENTUM,
     ):
         super().__init__()
         self.vision_device = vision_device
@@ -646,6 +839,31 @@ class Stage1AlignmentModel(nn.Module):
             )
         self.bank_score_policy = bank_score_policy
         self._score_bank_snapshot: dict[str, list[torch.Tensor]] | None = None
+
+        # Geometry / anti-cone regularizer (enabled when embedding_geo_weight > 0).
+        self.embedding_geo_weight = float(embedding_geo_weight)
+        self.geo_center_weight = float(geo_center_weight)
+        self.geo_var_weight = float(geo_var_weight)
+        self.geo_vec_mean_weight = float(geo_vec_mean_weight)
+        self.geo_var_ratio = float(geo_var_ratio)
+        self.geo_mag_floor = float(geo_mag_floor)
+        self.geo_mag_floor_weight = float(geo_mag_floor_weight)
+        self.geo_max_abs_ratio = float(geo_max_abs_ratio)
+        self.geo_max_abs_weight = float(geo_max_abs_weight)
+        self.geo_prefix_dim = int(geo_prefix_dim)
+        self.geo_prefix_weight = float(geo_prefix_weight)
+        self.geo_ema_momentum = float(geo_ema_momentum)
+        # Running mean of normalized token embeds (fp32, loss device).
+        self.register_buffer(
+            "_geo_ema_mean",
+            torch.zeros(embed_dim, dtype=torch.float32, device=vision_device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_geo_ema_initialized",
+            torch.zeros((), dtype=torch.bool, device=vision_device),
+            persistent=False,
+        )
         self._init_projection_heads()
 
     def _init_projection_heads(self):
@@ -698,6 +916,136 @@ class Stage1AlignmentModel(nn.Module):
         return keep_top_patches_by_l2(
             vision_raw_i, keep_ratio=self.vision_patch_keep_ratio
         )
+
+    def _geo_kwargs(self) -> dict[str, float]:
+        return {
+            "center_weight": self.geo_center_weight,
+            "var_weight": self.geo_var_weight,
+            "vec_mean_weight": self.geo_vec_mean_weight,
+            "var_ratio": self.geo_var_ratio,
+            "mag_floor": self.geo_mag_floor,
+            "mag_floor_weight": self.geo_mag_floor_weight,
+            "max_abs_ratio": self.geo_max_abs_ratio,
+            "max_abs_weight": self.geo_max_abs_weight,
+        }
+
+    def _compute_embedding_geometry(
+        self,
+        *,
+        norm_token_lists: list[list[torch.Tensor]],
+        raw_token_lists: list[list[torch.Tensor]],
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Geometry loss on live tokens (+ optional Matryoshka prefix)."""
+        zero = self.vision_projection.weight.new_zeros(())
+        if self.embedding_geo_weight <= 0.0:
+            return zero, {
+                "geo_center": 0.0,
+                "geo_var": 0.0,
+                "geo_vec_mean": 0.0,
+                "geo_mag_floor": 0.0,
+                "geo_max_abs": 0.0,
+                "geo_mu_norm": 0.0,
+                "geo_min_std": 0.0,
+                "geo_mean_abs_mu": 0.0,
+                "geo_loss": 0.0,
+            }
+
+        # Token-level matrix (large N even with micro-batch 2) + sample mean-pools.
+        token_norm = stack_token_embeddings(norm_token_lists)
+        token_raw = stack_token_embeddings(raw_token_lists)
+        pooled_parts = [
+            mean_pool_token_list(lst) for lst in norm_token_lists if lst
+        ]
+        pooled_parts = [p for p in pooled_parts if p is not None]
+        if token_norm is None and not pooled_parts:
+            return zero, {
+                "geo_center": 0.0,
+                "geo_var": 0.0,
+                "geo_vec_mean": 0.0,
+                "geo_mag_floor": 0.0,
+                "geo_max_abs": 0.0,
+                "geo_mu_norm": 0.0,
+                "geo_min_std": 0.0,
+                "geo_mean_abs_mu": 0.0,
+                "geo_loss": 0.0,
+            }
+
+        pieces: list[torch.Tensor] = []
+        if token_norm is not None:
+            pieces.append(token_norm)
+        if pooled_parts:
+            pieces.append(torch.cat(pooled_parts, dim=0))
+        norm_mat = torch.cat(pieces, dim=0)
+
+        raw_mat = None
+        if token_raw is not None and token_norm is not None:
+            # Align raw rows to token_norm only (not pooled rows).
+            if token_raw.shape[0] == token_norm.shape[0]:
+                # Pad raw with zeros for pooled rows so mag_floor only hits tokens.
+                pad_n = norm_mat.shape[0] - token_raw.shape[0]
+                if pad_n > 0:
+                    pad = token_raw.new_zeros((pad_n, token_raw.shape[-1]))
+                    # Use norms above floor so padded rows don't contribute.
+                    pad = pad + float(self.geo_mag_floor) + 1.0
+                    raw_mat = torch.cat([token_raw, pad], dim=0)
+                else:
+                    raw_mat = token_raw
+
+        ema = None
+        if self._geo_ema_initialized.item():
+            ema = self._geo_ema_mean.to(device=norm_mat.device)
+
+        geo_full, metrics = embedding_geometry_loss(
+            norm_mat,
+            raw=raw_mat,
+            ema_mean=ema,
+            **self._geo_kwargs(),
+        )
+        geo = geo_full
+
+        prefix_dim = self.geo_prefix_dim
+        if (
+            self.geo_prefix_weight > 0.0
+            and prefix_dim > 0
+            and prefix_dim < norm_mat.shape[-1]
+        ):
+            prefix = matryoshka_normalize(norm_mat, dim=prefix_dim)
+            # Raw prefix uses same slice when available.
+            raw_prefix = None
+            if raw_mat is not None:
+                raw_prefix = raw_mat[..., :prefix_dim]
+            ema_prefix = None
+            if ema is not None:
+                # Re-normalize EMA prefix as a soft center prior for the prefix space.
+                ema_prefix = F.normalize(ema[:prefix_dim].float(), dim=-1)
+            geo_pref, pref_metrics = embedding_geometry_loss(
+                prefix,
+                raw=raw_prefix,
+                ema_mean=ema_prefix,
+                **self._geo_kwargs(),
+            )
+            geo = geo + float(self.geo_prefix_weight) * geo_pref
+            metrics = {
+                **metrics,
+                "geo_prefix_center": pref_metrics["geo_center"],
+                "geo_prefix_mu_norm": pref_metrics["geo_mu_norm"],
+            }
+
+        # EMA update from live batch mean (no grad).
+        with torch.no_grad():
+            batch_mu = norm_mat.detach().float().mean(dim=0)
+            if batch_mu.device != self._geo_ema_mean.device:
+                batch_mu = batch_mu.to(self._geo_ema_mean.device)
+            if not self._geo_ema_initialized.item():
+                self._geo_ema_mean.copy_(batch_mu)
+                self._geo_ema_initialized.fill_(True)
+            else:
+                update_embedding_ema(
+                    self._geo_ema_mean, batch_mu, momentum=self.geo_ema_momentum
+                )
+
+        metrics["geo_loss"] = float(geo.detach())
+        return geo, metrics
 
     def encode_images(self, pixel_values: torch.Tensor) -> list[torch.Tensor]:
         pixel_values = pixel_values.to(self.vision_device, non_blocking=True)
@@ -857,6 +1205,10 @@ class Stage1AlignmentModel(nn.Module):
 
         text_text = contrastive.new_zeros(())
         text_text_matryoshka = contrastive.new_zeros(())
+        loss_query_tokens: list[torch.Tensor] = []
+        loss_query_raw: list[torch.Tensor] = []
+        loss_distractor_tokens: list[torch.Tensor] = []
+        loss_distractor_raw: list[torch.Tensor] = []
         has_text_text = (
             query_input_ids is not None
             and query_attention_mask is not None
@@ -904,6 +1256,30 @@ class Stage1AlignmentModel(nn.Module):
                 )
                 loss = loss + self.text_text_matryoshka_weight * text_text_matryoshka
 
+        # Geometry / anti-cone: text + image (+ query when available).
+        # Queries showed strong dim-0 bias (~0.05) in retrieval probes.
+        geo_norm_lists: list[list[torch.Tensor]] = [
+            loss_text_tokens,
+            loss_image_tokens,
+        ]
+        geo_raw_lists: list[list[torch.Tensor]] = [
+            loss_text_raw,
+            loss_image_raw,
+        ]
+        if loss_query_tokens:
+            geo_norm_lists.append(loss_query_tokens)
+            geo_raw_lists.append(loss_query_raw)
+        # Detached bank tokens enlarge N for variance/center without polluting
+        # live gradients (concat after stacking inside would need care); we only
+        # use bank via EMA, which already tracks historical means.
+
+        geo_loss, geo_metrics = self._compute_embedding_geometry(
+            norm_token_lists=geo_norm_lists,
+            raw_token_lists=geo_raw_lists,
+        )
+        if self.embedding_geo_weight > 0.0:
+            loss = loss + self.embedding_geo_weight * geo_loss
+
         # Enqueue *after* scoring so the current batch is never its own negative.
         # Policy B: enqueue every micro-batch into the live FIFO.
         if bank.enabled:
@@ -915,6 +1291,14 @@ class Stage1AlignmentModel(nn.Module):
             "matryoshka_loss": matryoshka.detach(),
             "text_text_loss": text_text.detach(),
             "text_text_matryoshka_loss": text_text_matryoshka.detach(),
+            "geo_loss": geo_loss.detach()
+            if torch.is_tensor(geo_loss)
+            else contrastive.new_zeros(()),
+            "geo_mu_norm": geo_metrics.get("geo_mu_norm", 0.0),
+            "geo_min_std": geo_metrics.get("geo_min_std", 0.0),
+            "geo_mean_abs_mu": geo_metrics.get("geo_mean_abs_mu", 0.0),
+            "geo_center": geo_metrics.get("geo_center", 0.0),
+            "geo_var": geo_metrics.get("geo_var", 0.0),
             "memory_bank_size": len(bank),
             "pos_rank": contrastive_metrics["pos_rank"],
             "pos_rank_t2i": contrastive_metrics["pos_rank_t2i"],
@@ -1679,6 +2063,9 @@ def run_training(
     log_matryoshka = 0.0
     log_text_text = 0.0
     log_text_text_matryoshka = 0.0
+    log_geo = 0.0
+    log_geo_mu = 0.0
+    log_geo_min_std = 0.0
     log_pos_rank = 0.0
     log_batches = 0
 
@@ -1711,6 +2098,9 @@ def run_training(
             log_text_text_matryoshka += float(
                 outputs.get("text_text_matryoshka_loss", 0.0)
             )
+            log_geo += float(outputs.get("geo_loss", 0.0))
+            log_geo_mu += float(outputs.get("geo_mu_norm", 0.0))
+            log_geo_min_std += float(outputs.get("geo_min_std", 0.0))
             log_pos_rank += float(outputs.get("pos_rank", 0.0))
             log_batches += 1
             micro_step += 1
@@ -1750,6 +2140,12 @@ def run_training(
                     msg += (
                         f" | text_text_m {log_text_text_matryoshka / log_batches:.4f}"
                     )
+                if log_geo > 0.0 or getattr(args, "embedding_geo_weight", 0.0) > 0.0:
+                    msg += (
+                        f" | geo {log_geo / log_batches:.4f}"
+                        f" (μ={log_geo_mu / log_batches:.4f}"
+                        f" minσ={log_geo_min_std / log_batches:.4f})"
+                    )
                 bank_len = len(getattr(model, "memory_bank", ()))
                 if bank_len or getattr(args, "memory_bank_size", 0):
                     msg += f" | bank {bank_len}"
@@ -1759,6 +2155,7 @@ def run_training(
                 print(msg)
                 log_loss = log_contrastive = log_matryoshka = 0.0
                 log_text_text = log_text_text_matryoshka = 0.0
+                log_geo = log_geo_mu = log_geo_min_std = 0.0
                 log_pos_rank = 0.0
                 log_batches = 0
 

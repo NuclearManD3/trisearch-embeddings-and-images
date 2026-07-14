@@ -77,6 +77,18 @@ from trisearch_models import (
     verify_trained_checkpoint,
 )
 from trisearch_models.training import (
+    DEFAULT_EMBEDDING_GEO_WEIGHT,
+    DEFAULT_GEO_CENTER_WEIGHT,
+    DEFAULT_GEO_EMA_MOMENTUM,
+    DEFAULT_GEO_MAG_FLOOR,
+    DEFAULT_GEO_MAG_FLOOR_WEIGHT,
+    DEFAULT_GEO_MAX_ABS_RATIO,
+    DEFAULT_GEO_MAX_ABS_WEIGHT,
+    DEFAULT_GEO_PREFIX_DIM,
+    DEFAULT_GEO_PREFIX_WEIGHT,
+    DEFAULT_GEO_VAR_RATIO,
+    DEFAULT_GEO_VAR_WEIGHT,
+    DEFAULT_GEO_VEC_MEAN_WEIGHT,
     DEFAULT_MULTI_POSITIVE_JACCARD,
     DEFAULT_SOFT_MAXSIM_TEMPERATURE,
     DEFAULT_VISION_PATCH_KEEP_RATIO,
@@ -208,6 +220,87 @@ def parse_args() -> argparse.Namespace:
         help="Keep top fraction of SigLIP vision patches by pre-norm L2 "
              f"(drop background; default {DEFAULT_VISION_PATCH_KEEP_RATIO}). "
              "1.0 keeps all patches.",
+    )
+    parser.add_argument(
+        "--embedding-geo-weight",
+        type=float,
+        default=DEFAULT_EMBEDDING_GEO_WEIGHT,
+        help="Overall weight for embedding geometry / anti-cone loss "
+             f"(default {DEFAULT_EMBEDDING_GEO_WEIGHT}). Set 0 to disable. "
+             "Pushes batch mean toward 0, keeps per-dim variance above a floor, "
+             "soft anti all-same-sign, pre-norm magnitude floor, soft max-|coord|.",
+    )
+    parser.add_argument(
+        "--geo-center-weight",
+        type=float,
+        default=DEFAULT_GEO_CENTER_WEIGHT,
+        help=f"Relative weight for ||μ||² center term (default {DEFAULT_GEO_CENTER_WEIGHT}).",
+    )
+    parser.add_argument(
+        "--geo-var-weight",
+        type=float,
+        default=DEFAULT_GEO_VAR_WEIGHT,
+        help=f"Relative weight for per-dim variance floor (default {DEFAULT_GEO_VAR_WEIGHT}).",
+    )
+    parser.add_argument(
+        "--geo-vec-mean-weight",
+        type=float,
+        default=DEFAULT_GEO_VEC_MEAN_WEIGHT,
+        help="Relative weight for per-vector mean² (anti all-positive/negative) "
+             f"(default {DEFAULT_GEO_VEC_MEAN_WEIGHT}).",
+    )
+    parser.add_argument(
+        "--geo-var-ratio",
+        type=float,
+        default=DEFAULT_GEO_VAR_RATIO,
+        help="Variance floor as fraction of 1/sqrt(D) "
+             f"(default {DEFAULT_GEO_VAR_RATIO}).",
+    )
+    parser.add_argument(
+        "--geo-mag-floor",
+        type=float,
+        default=DEFAULT_GEO_MAG_FLOOR,
+        help=f"Pre-norm L2 magnitude floor (default {DEFAULT_GEO_MAG_FLOOR}).",
+    )
+    parser.add_argument(
+        "--geo-mag-floor-weight",
+        type=float,
+        default=DEFAULT_GEO_MAG_FLOOR_WEIGHT,
+        help=f"Relative weight for magnitude floor (default {DEFAULT_GEO_MAG_FLOOR_WEIGHT}).",
+    )
+    parser.add_argument(
+        "--geo-max-abs-ratio",
+        type=float,
+        default=DEFAULT_GEO_MAX_ABS_RATIO,
+        help="Soft max-|coord| threshold as multiple of 1/sqrt(D) "
+             f"(default {DEFAULT_GEO_MAX_ABS_RATIO}).",
+    )
+    parser.add_argument(
+        "--geo-max-abs-weight",
+        type=float,
+        default=DEFAULT_GEO_MAX_ABS_WEIGHT,
+        help=f"Relative weight for max-|coord| penalty (default {DEFAULT_GEO_MAX_ABS_WEIGHT}).",
+    )
+    parser.add_argument(
+        "--geo-prefix-dim",
+        type=int,
+        default=DEFAULT_GEO_PREFIX_DIM,
+        help="Also apply geometry loss on this Matryoshka prefix "
+             f"(default {DEFAULT_GEO_PREFIX_DIM}; 0 disables).",
+    )
+    parser.add_argument(
+        "--geo-prefix-weight",
+        type=float,
+        default=DEFAULT_GEO_PREFIX_WEIGHT,
+        help="Relative weight of prefix geometry vs full-dim "
+             f"(default {DEFAULT_GEO_PREFIX_WEIGHT}).",
+    )
+    parser.add_argument(
+        "--geo-ema-momentum",
+        type=float,
+        default=DEFAULT_GEO_EMA_MOMENTUM,
+        help="EMA momentum for running embedding mean used in center blending "
+             f"(default {DEFAULT_GEO_EMA_MOMENTUM}).",
     )
     parser.add_argument("--openrouter-config", default=str(DEFAULT_OPENROUTER_CONFIG),
                         help="YAML file with openrouter.api_key and openrouter.model.")
@@ -370,6 +463,18 @@ def main():
         multi_positive_jaccard=args.multi_positive_jaccard,
         vision_patch_keep_ratio=args.vision_patch_keep_ratio,
         bank_score_policy=args.bank_score_policy,
+        embedding_geo_weight=args.embedding_geo_weight,
+        geo_center_weight=args.geo_center_weight,
+        geo_var_weight=args.geo_var_weight,
+        geo_vec_mean_weight=args.geo_vec_mean_weight,
+        geo_var_ratio=args.geo_var_ratio,
+        geo_mag_floor=args.geo_mag_floor,
+        geo_mag_floor_weight=args.geo_mag_floor_weight,
+        geo_max_abs_ratio=args.geo_max_abs_ratio,
+        geo_max_abs_weight=args.geo_max_abs_weight,
+        geo_prefix_dim=args.geo_prefix_dim,
+        geo_prefix_weight=args.geo_prefix_weight,
+        geo_ema_momentum=args.geo_ema_momentum,
     )
     alignment_model.vision_projection.to(device=vision_device, dtype=compute_dtype)
     alignment_model.text_projection.to(device=text_device, dtype=compute_dtype)
@@ -419,6 +524,12 @@ def main():
     )
     print(f"  multi-pos Jac  : {args.multi_positive_jaccard}")
     print(f"  vision keep    : {args.vision_patch_keep_ratio} (L2 background drop)")
+    print(
+        f"  emb geometry   : weight={args.embedding_geo_weight} "
+        f"(center={args.geo_center_weight}, var={args.geo_var_weight}, "
+        f"vec_mean={args.geo_vec_mean_weight}, mag_floor={args.geo_mag_floor}, "
+        f"prefix={args.geo_prefix_dim}@{args.geo_prefix_weight})"
+    )
     print(f"  max tokens     : {args.max_input_tokens}")
     print(f"  matryoshka dims: {matryoshka_dims}")
     print(f"  text-text train: {with_text_queries}")

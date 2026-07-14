@@ -406,6 +406,8 @@ def create_search_fn(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder):
         query_embeddings = [
             t.detach().float().cpu() for t in text_embedder.embed_text(q)
         ]
+        print('\n'.join(str(i) for i in query_embeddings))
+        print()
         hits = index.search(query_embeddings, top_k=int(top_k))
         gallery_html_parts = []
         lines = []

@@ -322,3 +322,129 @@ class TestTrainStage1CliDefaults(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEmbeddingGeometry(unittest.TestCase):
+    def test_cone_has_higher_center_than_isotropic(self):
+        from trisearch_models.training import embedding_geometry_loss
+
+        g = torch.Generator().manual_seed(0)
+        # Simulate user-observed cone: dim0 ~ +0.05, rest small correlated noise
+        cone = torch.randn(64, 128, generator=g) * 0.01
+        cone[:, 0] = 0.05
+        cone = F.normalize(cone, dim=-1)
+        iso = F.normalize(torch.randn(64, 128, generator=g), dim=-1)
+        loss_cone, m_cone = embedding_geometry_loss(
+            cone, var_weight=0.0, vec_mean_weight=0.0, mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+        )
+        loss_iso, m_iso = embedding_geometry_loss(
+            iso, var_weight=0.0, vec_mean_weight=0.0, mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+        )
+        self.assertGreater(m_cone["geo_mu_norm"], m_iso["geo_mu_norm"])
+        self.assertGreater(float(loss_cone), float(loss_iso))
+
+    def test_variance_floor_hits_collapsed_dims(self):
+        from trisearch_models.training import embedding_geometry_loss
+
+        # All vectors nearly identical → near-zero per-dim std
+        base = F.normalize(torch.randn(1, 64), dim=-1)
+        collapsed = base.expand(32, -1).clone() + torch.randn(32, 64) * 1e-6
+        collapsed = F.normalize(collapsed, dim=-1)
+        _, m = embedding_geometry_loss(
+            collapsed,
+            center_weight=0.0,
+            var_weight=1.0,
+            vec_mean_weight=0.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+            var_ratio=0.5,
+        )
+        self.assertGreater(m["geo_var"], 0.0)
+        self.assertLess(m["geo_min_std"], 0.01)
+
+    def test_all_negative_vec_mean_penalty(self):
+        from trisearch_models.training import embedding_geometry_loss
+
+        # All-negative unit vectors (after renorm still mostly negative)
+        neg = -torch.ones(16, 32)
+        neg = F.normalize(neg, dim=-1)
+        balanced = F.normalize(torch.randn(16, 32), dim=-1)
+        _, m_neg = embedding_geometry_loss(
+            neg,
+            center_weight=0.0,
+            var_weight=0.0,
+            vec_mean_weight=1.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+        )
+        _, m_bal = embedding_geometry_loss(
+            balanced,
+            center_weight=0.0,
+            var_weight=0.0,
+            vec_mean_weight=1.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+        )
+        self.assertGreater(m_neg["geo_vec_mean"], m_bal["geo_vec_mean"])
+
+    def test_mag_floor_on_tiny_raw(self):
+        from trisearch_models.training import embedding_geometry_loss
+
+        raw = torch.randn(20, 16) * 0.001
+        norm = F.normalize(raw, dim=-1)
+        loss, m = embedding_geometry_loss(
+            norm,
+            raw=raw,
+            center_weight=0.0,
+            var_weight=0.0,
+            vec_mean_weight=0.0,
+            mag_floor=0.05,
+            mag_floor_weight=1.0,
+            max_abs_weight=0.0,
+        )
+        self.assertGreater(m["geo_mag_floor"], 0.0)
+        self.assertGreater(float(loss), 0.0)
+
+    def test_gradients_flow(self):
+        from trisearch_models.training import embedding_geometry_loss
+
+        raw = torch.randn(12, 32, requires_grad=True)
+        norm = F.normalize(raw, dim=-1)
+        loss, _ = embedding_geometry_loss(norm, raw=raw)
+        loss.backward()
+        self.assertIsNotNone(raw.grad)
+        self.assertTrue(torch.isfinite(raw.grad).all())
+
+    def test_ema_update(self):
+        from trisearch_models.training import update_embedding_ema
+
+        ema = torch.zeros(4)
+        batch = torch.ones(4)
+        update_embedding_ema(ema, batch, momentum=0.9)
+        self.assertTrue(torch.allclose(ema, torch.full((4,), 0.1)))
+        update_embedding_ema(ema, batch, momentum=0.9)
+        self.assertTrue(torch.allclose(ema, torch.full((4,), 0.19), atol=1e-6))
+
+    def test_stack_and_pool(self):
+        from trisearch_models.training import mean_pool_token_list, stack_token_embeddings
+
+        a = [torch.ones(2, 3), torch.zeros(1, 3)]
+        b = [torch.full((3, 3), 2.0)]
+        stacked = stack_token_embeddings([a, b])
+        self.assertEqual(tuple(stacked.shape), (6, 3))
+        pooled = mean_pool_token_list(a)
+        self.assertEqual(tuple(pooled.shape), (2, 3))
+        self.assertTrue(torch.allclose(pooled[0], torch.ones(3)))
+
+    def test_default_geo_weight_positive(self):
+        from trisearch_models.training import DEFAULT_EMBEDDING_GEO_WEIGHT
+        import inspect
+
+        self.assertGreater(DEFAULT_EMBEDDING_GEO_WEIGHT, 0.0)
+        sig = inspect.signature(Stage1AlignmentModel.__init__)
+        self.assertEqual(
+            sig.parameters["embedding_geo_weight"].default,
+            DEFAULT_EMBEDDING_GEO_WEIGHT,
+        )
