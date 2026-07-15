@@ -109,6 +109,162 @@ def _stack(embeddings):
     return torch.stack([torch.as_tensor(e, dtype=torch.float32) for e in embeddings])
 
 
+def patch_query_affinity(
+    query_embeddings,
+    patch_embeddings,
+    *,
+    reduce: str = "max",
+) -> torch.Tensor:
+    """Per-patch affinity to a multi-token query (for spatial heatmaps).
+
+    Parameters
+    ----------
+    query_embeddings
+        List or ``(n_q, D)`` of L2-normalized query token embeddings.
+    patch_embeddings
+        List or ``(n_p, D)`` of L2-normalized image patch embeddings (raster
+        order from the vision tower).
+    reduce
+        How to collapse the query dimension:
+        * ``"max"`` (default) — for each patch, best cosine over query tokens
+          (answers “how well does any query part hit this region?”).
+        * ``"mean"`` — mean cosine over query tokens.
+
+    Returns
+    -------
+    ``(n_p,)`` float32 tensor of cosine affinities in roughly ``[-1, 1]``.
+    """
+    q = _stack(query_embeddings).to(torch.float32)
+    p = _stack(patch_embeddings).to(torch.float32)
+    if q.ndim == 1:
+        q = q.unsqueeze(0)
+    if p.ndim == 1:
+        p = p.unsqueeze(0)
+    if q.numel() == 0 or p.numel() == 0:
+        return torch.zeros(p.shape[0] if p.ndim > 0 else 0, dtype=torch.float32)
+    sim = q @ p.T  # (n_q, n_p)
+    reduce = (reduce or "max").lower()
+    if reduce == "mean":
+        return sim.mean(dim=0)
+    if reduce != "max":
+        raise ValueError(f"reduce must be 'max' or 'mean', got {reduce!r}")
+    return sim.max(dim=0).values
+
+
+def infer_patch_grid(num_patches: int, grid_hw: tuple[int, int] | None = None) -> tuple[int, int]:
+    """Resolve ``(H, W)`` patch grid for a flat raster of ``num_patches`` tokens."""
+    if grid_hw is not None:
+        gh, gw = int(grid_hw[0]), int(grid_hw[1])
+        if gh * gw != num_patches:
+            raise ValueError(
+                f"grid_hw={grid_hw} has {gh * gw} cells but num_patches={num_patches}"
+            )
+        return gh, gw
+    side = int(round(num_patches ** 0.5))
+    if side * side != num_patches:
+        raise ValueError(
+            f"Cannot infer square patch grid from num_patches={num_patches}; "
+            "pass grid_hw=(H, W) explicitly."
+        )
+    return side, side
+
+
+def patch_affinity_grid(
+    query_embeddings,
+    patch_embeddings,
+    *,
+    grid_hw: tuple[int, int] | None = None,
+    reduce: str = "max",
+) -> torch.Tensor:
+    """``patch_query_affinity`` reshaped to ``(grid_h, grid_w)``."""
+    scores = patch_query_affinity(
+        query_embeddings, patch_embeddings, reduce=reduce
+    )
+    gh, gw = infer_patch_grid(int(scores.numel()), grid_hw=grid_hw)
+    return scores.reshape(gh, gw)
+
+
+def _jet_colormap_rgb(t: float) -> tuple[int, int, int]:
+    """Classic jet-like RGB for ``t`` in ``[0, 1]`` (no matplotlib dependency)."""
+    t = max(0.0, min(1.0, float(t)))
+    # Piecewise linear approximation of jet.
+    if t < 0.25:
+        r, g, b = 0.0, 4.0 * t, 1.0
+    elif t < 0.5:
+        r, g, b = 0.0, 1.0, 1.0 - 4.0 * (t - 0.25)
+    elif t < 0.75:
+        r, g, b = 4.0 * (t - 0.5), 1.0, 0.0
+    else:
+        r, g, b = 1.0, 1.0 - 4.0 * (t - 0.75), 0.0
+    return (
+        int(max(0, min(255, round(r * 255)))),
+        int(max(0, min(255, round(g * 255)))),
+        int(max(0, min(255, round(b * 255)))),
+    )
+
+
+def overlay_patch_heatmap(
+    image,
+    patch_scores,
+    *,
+    grid_hw: tuple[int, int] | None = None,
+    alpha: float = 0.5,
+    percentile_low: float = 5.0,
+    percentile_high: float = 95.0,
+):
+    """Overlay a patch-affinity heatmap on a PIL image (center-crop square space).
+
+    ``patch_scores`` is a flat ``(n_p,)`` or ``(H, W)`` tensor of affinities.
+    Scores are robustly normalized with percentiles then mapped with a jet
+    colormap and alpha-blended onto ``image``.
+
+    Returns a new RGB ``PIL.Image``.
+    """
+    from PIL import Image as PILImage
+
+    if not isinstance(image, PILImage.Image):
+        raise TypeError(f"image must be PIL.Image, got {type(image)}")
+    scores = torch.as_tensor(patch_scores, dtype=torch.float32).detach().cpu()
+    if scores.ndim == 1:
+        gh, gw = infer_patch_grid(int(scores.numel()), grid_hw=grid_hw)
+        grid = scores.reshape(gh, gw)
+    elif scores.ndim == 2:
+        grid = scores
+        if grid_hw is not None and tuple(grid.shape) != (
+            int(grid_hw[0]),
+            int(grid_hw[1]),
+        ):
+            raise ValueError(
+                f"2-D patch_scores shape {tuple(grid.shape)} != grid_hw={grid_hw}"
+            )
+    else:
+        raise ValueError(f"patch_scores must be 1-D or 2-D, got shape {tuple(scores.shape)}")
+
+    flat = grid.reshape(-1)
+    if flat.numel() == 0:
+        return image.convert("RGB")
+    lo = float(torch.quantile(flat, percentile_low / 100.0))
+    hi = float(torch.quantile(flat, percentile_high / 100.0))
+    if hi <= lo:
+        lo = float(flat.min())
+        hi = float(flat.max())
+        if hi <= lo:
+            hi = lo + 1e-6
+    norm = ((grid - lo) / (hi - lo)).clamp(0.0, 1.0)
+
+    gh, gw = int(norm.shape[0]), int(norm.shape[1])
+    heat = PILImage.new("RGB", (gw, gh))
+    px = heat.load()
+    for y in range(gh):
+        for x in range(gw):
+            px[x, y] = _jet_colormap_rgb(float(norm[y, x]))
+
+    base = image.convert("RGB")
+    heat_up = heat.resize(base.size, PILImage.Resampling.BILINEAR)
+    a = max(0.0, min(1.0, float(alpha)))
+    return PILImage.blend(base, heat_up, a)
+
+
 def _valid_config_path(path):
     import json
     from pathlib import Path

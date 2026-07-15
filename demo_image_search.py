@@ -3,6 +3,10 @@
 Index a sample of the **TriSearch curated dataset**, embed with SigLIP, search
 with Qwen3 text (ColBERT-style late interaction).
 
+For each hit, optionally overlay a **query heatmap**: per-patch MaxSim
+(max cosine of that SigLIP patch vs any query token), reshaped to the vision
+patch grid and blended onto the image. Shows which regions support the match.
+
 Project data
 ------------
 Uses **only** ``NuclearManD/trisearch-dataset-64k-v0.0.1`` (or a local curated
@@ -52,6 +56,8 @@ from trisearch_models import (
     SiglipEmbedder,
     describe_phase,
     late_interaction_score,
+    overlay_patch_heatmap,
+    patch_query_affinity,
     resolve_inference_checkpoint,
 )
 
@@ -394,9 +400,44 @@ def build_or_load_index(
     return index
 
 
-def create_search_fn(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder):
+def _vision_patch_grid(vision: SiglipEmbedder) -> tuple[int, int]:
+    """``(H, W)`` patch grid from the loaded SigLIP config."""
+    cfg = vision.model.config
+    image_size = int(getattr(cfg, "image_size", 0) or 0)
+    patch_size = int(getattr(cfg, "patch_size", 0) or 0)
+    if image_size > 0 and patch_size > 0 and image_size % patch_size == 0:
+        side = image_size // patch_size
+        return side, side
+    # Fallback: infer from a dummy if config is incomplete.
+    return (0, 0)
+
+
+def _thumb_b64(image: Image.Image, *, max_side: int = 220, quality: int = 80) -> str:
+    img = image.convert("RGB")
+    w, h = img.size
+    scale = min(1.0, float(max_side) / max(w, h, 1))
+    if scale < 1.0:
+        img = img.resize(
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            Image.Resampling.BILINEAR,
+        )
+    return base64.b64encode(_pil_to_jpeg_bytes(img, quality=quality)).decode("ascii")
+
+
+def create_search_fn(
+    index: ImageSearchIndex,
+    text_embedder: Qwen3MoeEmbedder,
+    *,
+    patch_grid: tuple[int, int] | None = None,
+):
+    """Build Gradio search callback.
+
+    When heatmaps are enabled, each hit shows original + MaxSim patch overlay
+    (per-patch max cosine over query tokens — same matrix as late interaction).
+    """
+
     @torch.no_grad()
-    def search(query: str, top_k: int):
+    def search(query: str, top_k: int, show_heatmap: bool, heatmap_alpha: float):
         q = (query or "").strip()
         if not q:
             return (
@@ -411,18 +452,57 @@ def create_search_fn(index: ImageSearchIndex, text_embedder: Qwen3MoeEmbedder):
         hits = index.search(query_embeddings, top_k=int(top_k))
         gallery_html_parts = []
         lines = []
+        alpha = float(heatmap_alpha)
         for rank, (score, entry) in enumerate(hits, 1):
             cap = normalize_training_text(entry.caption)
             lines.append(f"{rank}. [{score:.3f}] {cap[:120]}")
             # Decode **only** hit images (top-k), not the full index.
             img = index.get_image(entry)
-            b64 = base64.b64encode(_pil_to_jpeg_bytes(img, quality=80)).decode("ascii")
+            orig_b64 = _thumb_b64(img)
+
+            cell_imgs = [
+                (
+                    f'<img src="data:image/jpeg;base64,{orig_b64}" '
+                    f'title="original" '
+                    f'style="max-width:180px;max-height:180px;border-radius:6px;'
+                    f'display:block;margin:0 auto"/>'
+                )
+            ]
+            if show_heatmap:
+                try:
+                    n_p = int(entry.embeddings.shape[0])
+                    gh, gw = patch_grid if patch_grid and patch_grid[0] > 0 else (0, 0)
+                    grid_hw = (gh, gw) if gh * gw == n_p else None
+                    aff = patch_query_affinity(
+                        query_embeddings, entry.embeddings, reduce="max"
+                    )
+                    heat = overlay_patch_heatmap(
+                        img,
+                        aff,
+                        grid_hw=grid_hw,
+                        alpha=alpha,
+                    )
+                    heat_b64 = _thumb_b64(heat)
+                    cell_imgs.append(
+                        f'<img src="data:image/jpeg;base64,{heat_b64}" '
+                        f'title="query patch MaxSim heatmap" '
+                        f'style="max-width:180px;max-height:180px;border-radius:6px;'
+                        f'display:block;margin:0 auto"/>'
+                    )
+                except Exception as exc:
+                    lines.append(f"   (heatmap failed: {exc})")
+
+            width = 190 * len(cell_imgs) + 12
             gallery_html_parts.append(
-                f'<div style="display:inline-block;margin:6px;text-align:center">'
-                f'<img src="data:image/jpeg;base64,{b64}" '
-                f'style="max-width:180px;max-height:180px;border-radius:6px"/>'
-                f'<div style="font-size:12px;max-width:180px">'
-                f"{rank}. {html.escape(cap[:80])}</div></div>"
+                f'<div style="display:inline-block;margin:8px;text-align:center;'
+                f'vertical-align:top;max-width:{width}px">'
+                f'<div style="display:flex;gap:4px;justify-content:center">'
+                f'{"".join(cell_imgs)}</div>'
+                f'<div style="font-size:12px;max-width:{width}px;margin-top:4px">'
+                f"{rank}. [{score:.3f}] {html.escape(cap[:80])}</div>"
+                f'<div style="font-size:10px;color:#666">'
+                f'{"orig | heatmap" if show_heatmap and len(cell_imgs) > 1 else "orig"}'
+                f"</div></div>"
             )
         return "".join(gallery_html_parts), "\n".join(lines)
 
@@ -435,27 +515,47 @@ def build_ui(
     *,
     phase: int,
     data_desc: str,
+    patch_grid: tuple[int, int] | None = None,
 ):
-    search_fn = create_search_fn(index, text_embedder)
+    search_fn = create_search_fn(index, text_embedder, patch_grid=patch_grid)
+    grid_note = ""
+    if patch_grid and patch_grid[0] > 0:
+        grid_note = (
+            f" Heatmaps: MaxSim per SigLIP patch "
+            f"({patch_grid[0]}×{patch_grid[1]} grid → image regions)."
+        )
     with gr.Blocks(title="TriSearch image search") as demo:
         gr.Markdown(
             f"## TriSearch image search\n"
             f"Phase **{phase}** · **{len(index):,}** indexed · {data_desc}\n\n"
             f"_Lazy map dataset: images decode per embed-batch / top-k only._"
+            f"{grid_note}"
         )
         query = gr.Textbox(
             label="Search query",
             placeholder="e.g. aerial view of airport runways",
         )
-        top_k = gr.Slider(1, 24, value=12, step=1, label="Top-k")
+        with gr.Row():
+            top_k = gr.Slider(1, 24, value=12, step=1, label="Top-k")
+            show_heatmap = gr.Checkbox(
+                value=True,
+                label="Show query heatmaps",
+                info="Overlay MaxSim per image patch (which regions match the query).",
+            )
+            heatmap_alpha = gr.Slider(
+                0.15,
+                0.85,
+                value=0.5,
+                step=0.05,
+                label="Heatmap opacity",
+            )
         btn = gr.Button("Search", variant="primary")
         gallery = gr.HTML()
         results = gr.Textbox(label="Scores", lines=12)
         _evt = dict(api_name=False)
-        btn.click(search_fn, inputs=[query, top_k], outputs=[gallery, results], **_evt)
-        query.submit(
-            search_fn, inputs=[query, top_k], outputs=[gallery, results], **_evt
-        )
+        inputs = [query, top_k, show_heatmap, heatmap_alpha]
+        btn.click(search_fn, inputs=inputs, outputs=[gallery, results], **_evt)
+        query.submit(search_fn, inputs=inputs, outputs=[gallery, results], **_evt)
         gr.Examples(
             examples=[
                 ["agricultural fields and farmland", 12],
@@ -585,8 +685,25 @@ def main():
         f"· ckpt={ckpt_tag}"
     )
     print(f"Text embedder ready ({text_device}); checkpoint tag={ckpt_tag}")
+    patch_grid = _vision_patch_grid(vision)
+    if patch_grid[0] > 0:
+        print(
+            f"Patch heatmap grid: {patch_grid[0]}×{patch_grid[1]} "
+            f"(image_size={vision.model.config.image_size}, "
+            f"patch_size={vision.model.config.patch_size})"
+        )
+    # Free vision GPU memory after indexing (text tower still needed for search).
+    del vision
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    demo = build_ui(index, text_embedder, phase=args.phase, data_desc=data_desc)
+    demo = build_ui(
+        index,
+        text_embedder,
+        phase=args.phase,
+        data_desc=data_desc,
+        patch_grid=patch_grid if patch_grid[0] > 0 else None,
+    )
     print(f"\nOpening search UI at http://{args.host}:{args.port}")
     demo.launch(
         server_name=args.host,

@@ -17,17 +17,28 @@ import torch
 import torch.nn.functional as F
 
 from trisearch_models.training import (
+    DEFAULT_MATRYOSHKA_DIMS,
     DEFAULT_SOFT_MAXSIM_TEMPERATURE,
+    DEFAULT_VISION_PATCH_DROP_PROB,
     EmbeddingMemoryBank,
     Stage1AlignmentModel,
+    apply_hard_bank_mining,
     build_late_interaction_matrix,
     build_multi_positive_mask,
     caption_token_jaccard,
+    combine_full_and_matryoshka,
     contrastive_late_interaction_loss,
     differentiable_late_interaction_score,
+    heatmap_sparsity_loss,
     keep_top_patches_by_l2,
     masked_cross_entropy,
+    matryoshka_prefix_dims,
+    mean_task_losses,
+    apply_train_image_augmentations,
+    random_drop_patches,
+    random_shift_pixel_values,
     soft_or_hard_maxsim,
+    train_image_geometric_augment,
 )
 
 
@@ -296,6 +307,127 @@ class TestBackgroundPatchDrop(unittest.TestCase):
         self.assertEqual(kept.shape[0], 1)
 
 
+class TestRandomPatchDropAndShift(unittest.TestCase):
+    def test_default_drop_prob(self):
+        self.assertAlmostEqual(DEFAULT_VISION_PATCH_DROP_PROB, 0.40)
+
+    def test_random_drop_reduces_count_when_training(self):
+        tokens = torch.randn(100, 8)
+        kept = random_drop_patches(tokens, drop_prob=0.4, training=True)
+        self.assertEqual(kept.shape[0], 60)
+        self.assertEqual(kept.shape[1], 8)
+
+    def test_random_drop_noop_eval(self):
+        tokens = torch.randn(20, 4)
+        kept = random_drop_patches(tokens, drop_prob=0.4, training=False)
+        self.assertTrue(torch.equal(kept, tokens))
+
+    def test_random_drop_keeps_at_least_one(self):
+        tokens = torch.randn(3, 2)
+        kept = random_drop_patches(tokens, drop_prob=0.99, training=True)
+        self.assertGreaterEqual(kept.shape[0], 1)
+
+    def test_shift_preserves_shape(self):
+        x = torch.randn(2, 3, 32, 32)
+        y = random_shift_pixel_values(x, max_shift=18)
+        self.assertEqual(tuple(y.shape), (2, 3, 32, 32))
+
+    def test_shift_zero_is_noop(self):
+        x = torch.randn(1, 3, 16, 16)
+        y = random_shift_pixel_values(x, max_shift=0)
+        self.assertTrue(torch.equal(x, y))
+
+
+class TestTrainImageGeometricAugment(unittest.TestCase):
+    def test_preserves_batch_shape(self):
+        x = torch.randn(3, 3, 64, 64)
+        y = train_image_geometric_augment(
+            x,
+            hflip_prob=1.0,
+            max_rotate_deg=30.0,
+            scale_min=0.85,
+            scale_max=1.05,
+            fill_mode="random",
+        )
+        self.assertEqual(tuple(y.shape), (3, 3, 64, 64))
+        self.assertTrue(torch.isfinite(y).all())
+
+    def test_mean_fill_mode(self):
+        x = torch.randn(2, 3, 48, 48)
+        y = train_image_geometric_augment(
+            x,
+            hflip_prob=0.0,
+            max_rotate_deg=25.0,
+            scale_min=0.9,
+            scale_max=1.0,
+            fill_mode="mean",
+        )
+        self.assertEqual(tuple(y.shape), tuple(x.shape))
+
+    def test_full_stack_with_shift(self):
+        x = torch.randn(2, 3, 40, 40)
+        y = apply_train_image_augmentations(
+            x,
+            hflip_prob=0.5,
+            max_rotate_deg=15.0,
+            scale_min=0.85,
+            scale_max=1.05,
+            fill_mode="random",
+            max_shift=8,
+            enabled=True,
+        )
+        self.assertEqual(tuple(y.shape), tuple(x.shape))
+        z = apply_train_image_augmentations(x, enabled=False)
+        self.assertTrue(torch.equal(z, x))
+
+    def test_hflip_changes_image_when_forced(self):
+        # Asymmetric image so flip is detectable.
+        x = torch.zeros(1, 3, 32, 32)
+        x[:, :, :, :8] = 1.0
+        y = train_image_geometric_augment(
+            x,
+            hflip_prob=1.0,
+            max_rotate_deg=0.0,
+            scale_min=1.0,
+            scale_max=1.0,
+            fill_mode="mean",
+        )
+        # Left strip should move to the right.
+        self.assertGreater(float(y[0, 0, 16, 28]), 0.5)
+        self.assertLess(float(y[0, 0, 16, 2]), 0.5)
+
+
+class TestHeatmapSparsityLoss(unittest.TestCase):
+    def test_uniform_higher_than_peaked(self):
+        # One query token; image patches: peaked vs flat similarities.
+        q = F.normalize(torch.ones(1, 8), dim=-1)
+        # Peaked: one patch = q, others orthogonal-ish
+        peaked = F.normalize(torch.randn(16, 8), dim=-1)
+        peaked[0] = q[0]
+        # Uniform-ish: all patches similar to q
+        flat = F.normalize(q[0].unsqueeze(0) + 0.05 * torch.randn(16, 8), dim=-1)
+        loss_peak = heatmap_sparsity_loss([q], [peaked], temperature=0.07)
+        loss_flat = heatmap_sparsity_loss([q], [flat], temperature=0.07)
+        self.assertLess(float(loss_peak), float(loss_flat))
+
+    def test_gradients_flow(self):
+        q = F.normalize(torch.randn(3, 8, requires_grad=True), dim=-1)
+        # re-enable grad after normalize
+        q = q.detach().requires_grad_(True)
+        d = F.normalize(torch.randn(12, 8), dim=-1).detach().requires_grad_(True)
+        # Use unnormalized with grad
+        q_raw = torch.randn(3, 8, requires_grad=True)
+        d_raw = torch.randn(12, 8, requires_grad=True)
+        qn = F.normalize(q_raw, dim=-1)
+        dn = F.normalize(d_raw, dim=-1)
+        loss = heatmap_sparsity_loss([qn], [dn], temperature=0.1)
+        loss.backward()
+        self.assertIsNotNone(q_raw.grad)
+        self.assertIsNotNone(d_raw.grad)
+        self.assertTrue(torch.isfinite(q_raw.grad).all())
+        self.assertTrue(torch.isfinite(d_raw.grad).all())
+
+
 class TestTrainStage1CliDefaults(unittest.TestCase):
     def test_soft_maxsim_default_enabled(self):
         # Import parse_args without running main.
@@ -310,12 +442,22 @@ class TestTrainStage1CliDefaults(unittest.TestCase):
             # Just check the module constants / defaults via parser construction.
             # Re-build parser by calling parse_args with minimal required-safe args
             # is hard (loads models); inspect source defaults instead.
-            src = open(train_stage1.__file__, encoding="utf-8").read()
+            with open(train_stage1.__file__, encoding="utf-8") as f:
+                src = f.read()
             self.assertIn('default=True', src)
             self.assertIn("--soft-maxsim", src)
             self.assertIn('default="accum_window"', src)
             self.assertIn("--vision-patch-keep-ratio", src)
             self.assertIn("--multi-positive-jaccard", src)
+            self.assertIn("--hard-bank-negatives", src)
+            self.assertIn("--query-image-weight", src)
+            self.assertIn('default="64,128,256,512"', src)
+            self.assertIn("--vision-patch-drop-prob", src)
+            self.assertIn("--image-shift-max", src)
+            self.assertIn("--heatmap-sparsity-weight", src)
+            self.assertIn("--image-max-rotate-deg", src)
+            self.assertIn("--image-hflip-prob", src)
+            self.assertIn("--no-image-aug", src)
         finally:
             sys.argv = old
 
@@ -448,3 +590,95 @@ class TestEmbeddingGeometry(unittest.TestCase):
             sig.parameters["embedding_geo_weight"].default,
             DEFAULT_EMBEDDING_GEO_WEIGHT,
         )
+
+
+class TestMatryoshkaPrefixes(unittest.TestCase):
+    def test_default_dims_exclude_full_embed(self):
+        self.assertNotIn(1024, DEFAULT_MATRYOSHKA_DIMS)
+        self.assertEqual(matryoshka_prefix_dims(DEFAULT_MATRYOSHKA_DIMS), DEFAULT_MATRYOSHKA_DIMS)
+
+    def test_strips_full_dim_and_invalid(self):
+        got = matryoshka_prefix_dims((64, 128, 1024, 0, 2048, 64), embed_dim=1024)
+        self.assertEqual(got, (64, 128))
+
+    def test_combine_full_and_mrl_equal_share(self):
+        full = torch.tensor(2.0)
+        mrl = torch.tensor(4.0)
+        # weight 1 → (2+4)/2 = 3
+        self.assertAlmostEqual(
+            float(combine_full_and_matryoshka(full, mrl, 1.0)), 3.0
+        )
+        # no prefixes → full only
+        self.assertAlmostEqual(
+            float(combine_full_and_matryoshka(full, mrl, 1.0, has_prefixes=False)),
+            2.0,
+        )
+
+
+class TestHardBankMining(unittest.TestCase):
+    def test_keeps_top_k_bank_per_row(self):
+        # B=2, n_live=2, n_bank=4
+        scores = torch.tensor(
+            [
+                [0.0, 1.0,  5.0, 4.0, 3.0, 2.0],  # bank ranks: 5,4,3,2 → top2 = 5,4
+                [0.0, 1.0,  1.0, 9.0, 8.0, 0.5],  # top2 = 9,8
+            ]
+        )
+        out = apply_hard_bank_mining(scores, n_live=2, hard_k=2)
+        # live unchanged
+        self.assertTrue(torch.equal(out[:, :2], scores[:, :2]))
+        # row0 bank: keep 5 and 4, mask 3 and 2
+        self.assertTrue(torch.isfinite(out[0, 2]))
+        self.assertTrue(torch.isfinite(out[0, 3]))
+        self.assertTrue(torch.isinf(out[0, 4]) and out[0, 4] < 0)
+        self.assertTrue(torch.isinf(out[0, 5]) and out[0, 5] < 0)
+        # row1 bank: keep 9 and 8
+        self.assertTrue(torch.isinf(out[1, 2]) and out[1, 2] < 0)
+        self.assertTrue(torch.isfinite(out[1, 3]))
+        self.assertTrue(torch.isfinite(out[1, 4]))
+        self.assertTrue(torch.isinf(out[1, 5]) and out[1, 5] < 0)
+
+    def test_hard_k_zero_is_noop(self):
+        scores = torch.randn(3, 10)
+        out = apply_hard_bank_mining(scores, n_live=3, hard_k=0)
+        self.assertTrue(torch.equal(out, scores))
+
+    def test_contrastive_with_hard_bank_finite(self):
+        texts = _rand_tokens(2, [3, 2], dim=8, seed=20)
+        images = _rand_tokens(2, [4, 3], dim=8, seed=21)
+        bank_t = _rand_tokens(5, [2, 2, 2, 2, 2], dim=8, seed=22)
+        bank_i = _rand_tokens(5, [3, 3, 3, 3, 3], dim=8, seed=23)
+        loss = contrastive_late_interaction_loss(
+            texts,
+            images,
+            temperature=0.07,
+            bank_text_tokens=bank_t,
+            bank_image_tokens=bank_i,
+            hard_bank_k=2,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(float(loss), 0.0)
+
+
+class TestMeanTaskLossesErrorAtOutputs(unittest.TestCase):
+    def test_mean_equals_average(self):
+        a = torch.tensor(2.0, requires_grad=True)
+        b = torch.tensor(4.0, requires_grad=True)
+        total = mean_task_losses([(a, 1.0), (b, 1.0)])
+        self.assertAlmostEqual(float(total), 3.0)
+
+    def test_gradients_add_at_shared_embedding(self):
+        """Mean of task CEs adds ∂L_i/∂E on a shared embedding (not detach)."""
+        e = torch.randn(4, requires_grad=True)
+        l1 = (e * e).sum()
+        l2 = (e - 1.0).pow(2).sum()
+        total = mean_task_losses([(l1, 1.0), (l2, 1.0)])
+        total.backward()
+        # total = 0.5*l1 + 0.5*l2 → grad = e + (e-1) = 2e-1
+        self.assertTrue(
+            torch.allclose(e.grad, 2 * e.detach() - 1.0, atol=1e-5),
+            (e.grad, 2 * e.detach() - 1.0),
+        )
+        e2 = e.detach().clone().requires_grad_(True)
+        (0.5 * (e2 * e2).sum() + 0.5 * (e2 - 1.0).pow(2).sum()).backward()
+        self.assertTrue(torch.allclose(e.grad, e2.grad))

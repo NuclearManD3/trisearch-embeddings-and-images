@@ -89,8 +89,18 @@ from trisearch_models.training import (
     DEFAULT_GEO_VAR_RATIO,
     DEFAULT_GEO_VAR_WEIGHT,
     DEFAULT_GEO_VEC_MEAN_WEIGHT,
+    DEFAULT_HARD_BANK_NEGATIVES,
+    DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
+    DEFAULT_HEATMAP_SPARSITY_WEIGHT,
+    DEFAULT_IMAGE_FILL_MODE,
+    DEFAULT_IMAGE_HFLIP_PROB,
+    DEFAULT_IMAGE_MAX_ROTATE_DEG,
+    DEFAULT_IMAGE_SCALE_MAX,
+    DEFAULT_IMAGE_SCALE_MIN,
+    DEFAULT_IMAGE_SHIFT_MAX,
     DEFAULT_MULTI_POSITIVE_JACCARD,
     DEFAULT_SOFT_MAXSIM_TEMPERATURE,
+    DEFAULT_VISION_PATCH_DROP_PROB,
     DEFAULT_VISION_PATCH_KEEP_RATIO,
 )
 
@@ -163,16 +173,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-general-samples", type=int, default=None)
     parser.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
 
-    parser.add_argument("--matryoshka-dims", default="64,128,256,512,1024")
+    parser.add_argument(
+        "--matryoshka-dims",
+        default="64,128,256,512",
+        help="Prefix dims for Matryoshka CE (full embed dim is trained by the "
+             "main contrastive terms and is stripped if listed).",
+    )
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--contrastive-weight", type=float, default=2.0)
-    parser.add_argument("--matryoshka-weight", type=float, default=0.5)
-    parser.add_argument("--text-text-weight", type=float, default=1.0,
-                        help="Weight for query↔caption text-text contrastive loss.")
-    parser.add_argument("--text-text-matryoshka-weight", type=float, default=0.5,
-                        help="Weight for Matryoshka text-text contrastive loss.")
+    parser.add_argument(
+        "--contrastive-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight of the caption↔image retrieval task in the "
+             "mean task loss (default 1.0).",
+    )
+    parser.add_argument(
+        "--matryoshka-weight",
+        type=float,
+        default=1.0,
+        help="Within each retrieval task, relative weight of mean prefix CE "
+             "vs full-dim CE (default 1.0 → equal share). 0 disables prefixes.",
+    )
+    parser.add_argument(
+        "--text-text-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight of the query→caption retrieval task (default 1.0).",
+    )
+    parser.add_argument(
+        "--text-text-matryoshka-weight",
+        type=float,
+        default=None,
+        help="Deprecated alias; Matryoshka uses --matryoshka-weight for all tasks.",
+    )
+    parser.add_argument(
+        "--query-image-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight of the query↔image retrieval task (default 1.0). "
+             "0 disables query→image training.",
+    )
+    parser.add_argument(
+        "--hard-bank-negatives",
+        type=int,
+        default=DEFAULT_HARD_BANK_NEGATIVES,
+        help="Top-k hardest memory-bank docs kept per query as InfoNCE "
+             f"negatives (default {DEFAULT_HARD_BANK_NEGATIVES}). "
+             "0 uses the full bank.",
+    )
     parser.add_argument("--no-text-text-training", action="store_true",
-                        help="Disable text-to-text semantic similarity training.")
+                        help="Disable query→caption and query↔image text-query training.")
     parser.add_argument(
         "--memory-bank-size",
         type=int,
@@ -220,6 +270,76 @@ def parse_args() -> argparse.Namespace:
         help="Keep top fraction of SigLIP vision patches by pre-norm L2 "
              f"(drop background; default {DEFAULT_VISION_PATCH_KEEP_RATIO}). "
              "1.0 keeps all patches.",
+    )
+    parser.add_argument(
+        "--vision-patch-drop-prob",
+        type=float,
+        default=DEFAULT_VISION_PATCH_DROP_PROB,
+        help="Train-only: randomly drop this fraction of remaining patches "
+             f"after L2 keep (default {DEFAULT_VISION_PATCH_DROP_PROB}). "
+             "0 disables. Eval/demo keep all selected patches.",
+    )
+    parser.add_argument(
+        "--image-shift-max",
+        type=int,
+        default=DEFAULT_IMAGE_SHIFT_MAX,
+        help="Train-only: random per-image shift in [-N, N] pixels with "
+             f"reflect pad (default {DEFAULT_IMAGE_SHIFT_MAX}). 0 disables.",
+    )
+    parser.add_argument(
+        "--no-image-aug",
+        action="store_true",
+        help="Disable all train-time geometric image augs (flip/rotate/scale/shift).",
+    )
+    parser.add_argument(
+        "--image-hflip-prob",
+        type=float,
+        default=DEFAULT_IMAGE_HFLIP_PROB,
+        help=f"Train-only horizontal flip probability (default {DEFAULT_IMAGE_HFLIP_PROB}).",
+    )
+    parser.add_argument(
+        "--image-max-rotate-deg",
+        type=float,
+        default=DEFAULT_IMAGE_MAX_ROTATE_DEG,
+        help="Train-only max rotation in degrees, uniform in [-N, N] "
+             f"(default {DEFAULT_IMAGE_MAX_ROTATE_DEG}). 0 disables rotate.",
+    )
+    parser.add_argument(
+        "--image-scale-min",
+        type=float,
+        default=DEFAULT_IMAGE_SCALE_MIN,
+        help="Train-only min anisotropic scale (default "
+             f"{DEFAULT_IMAGE_SCALE_MIN}). Shrink pads with fill.",
+    )
+    parser.add_argument(
+        "--image-scale-max",
+        type=float,
+        default=DEFAULT_IMAGE_SCALE_MAX,
+        help="Train-only max anisotropic scale (default "
+             f"{DEFAULT_IMAGE_SCALE_MAX}). Mild expand center-crops; keep near 1.05.",
+    )
+    parser.add_argument(
+        "--image-fill-mode",
+        choices=("random", "mean", "reflect"),
+        default=DEFAULT_IMAGE_FILL_MODE,
+        help="Fill for rotate/scale gaps: random channel noise, image mean, "
+             f"or mean-as-reflect fallback (default {DEFAULT_IMAGE_FILL_MODE}).",
+    )
+    parser.add_argument(
+        "--heatmap-sparsity-weight",
+        type=float,
+        default=DEFAULT_HEATMAP_SPARSITY_WEIGHT,
+        help="Weight for positive-pair heatmap sparsity loss (normalized "
+             f"entropy of patch MaxSim; default {DEFAULT_HEATMAP_SPARSITY_WEIGHT}). "
+             "Punishes noisy/uniform heatmaps so the model selects few blocks. "
+             "0 disables.",
+    )
+    parser.add_argument(
+        "--heatmap-sparsity-temperature",
+        type=float,
+        default=DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
+        help="Softmax temperature for heatmap sparsity "
+             f"(default {DEFAULT_HEATMAP_SPARSITY_TEMPERATURE}).",
     )
     parser.add_argument(
         "--embedding-geo-weight",
@@ -441,6 +561,7 @@ def main():
         with_text_queries=with_text_queries,
     )
 
+    query_task_w = 1.0 if with_text_queries else 0.0
     alignment_model = Stage1AlignmentModel(
         vision_model=vision_model,
         text_model=text_model,
@@ -452,16 +573,30 @@ def main():
         temperature=args.temperature,
         contrastive_weight=args.contrastive_weight,
         matryoshka_weight=args.matryoshka_weight,
-        text_text_weight=args.text_text_weight if with_text_queries else 0.0,
-        text_text_matryoshka_weight=(
-            args.text_text_matryoshka_weight if with_text_queries else 0.0
+        text_text_weight=(
+            args.text_text_weight * query_task_w if with_text_queries else 0.0
         ),
+        text_text_matryoshka_weight=args.text_text_matryoshka_weight,
+        query_image_weight=(
+            args.query_image_weight * query_task_w if with_text_queries else 0.0
+        ),
+        hard_bank_negatives=args.hard_bank_negatives,
         compute_dtype=compute_dtype,
         memory_bank_size=args.memory_bank_size,
         soft_maxsim=args.soft_maxsim,
         soft_maxsim_temperature=args.soft_maxsim_temperature,
         multi_positive_jaccard=args.multi_positive_jaccard,
         vision_patch_keep_ratio=args.vision_patch_keep_ratio,
+        vision_patch_drop_prob=args.vision_patch_drop_prob,
+        image_shift_max=args.image_shift_max,
+        image_hflip_prob=args.image_hflip_prob,
+        image_max_rotate_deg=args.image_max_rotate_deg,
+        image_scale_min=args.image_scale_min,
+        image_scale_max=args.image_scale_max,
+        image_fill_mode=args.image_fill_mode,
+        image_aug_enabled=not args.no_image_aug,
+        heatmap_sparsity_weight=args.heatmap_sparsity_weight,
+        heatmap_sparsity_temperature=args.heatmap_sparsity_temperature,
         bank_score_policy=args.bank_score_policy,
         embedding_geo_weight=args.embedding_geo_weight,
         geo_center_weight=args.geo_center_weight,
@@ -515,7 +650,8 @@ def main():
     print(f"  effective batch: {args.batch_size * args.gradient_accumulation_steps}")
     print(
         f"  memory bank    : {args.memory_bank_size} "
-        f"(contrastive negatives ≈ micro-batch-1 + bank)"
+        f"(hard top-{args.hard_bank_negatives} bank negs/query; "
+        f"in-batch always kept)"
     )
     print(f"  bank policy    : {args.bank_score_policy}")
     print(
@@ -525,17 +661,43 @@ def main():
     print(f"  multi-pos Jac  : {args.multi_positive_jaccard}")
     print(f"  vision keep    : {args.vision_patch_keep_ratio} (L2 background drop)")
     print(
+        f"  patch dropout  : {args.vision_patch_drop_prob} "
+        f"(train-only random drop after L2 keep)"
+    )
+    if args.no_image_aug:
+        print("  image aug      : disabled (--no-image-aug)")
+    else:
+        print(
+            f"  image aug      : flip p={args.image_hflip_prob}, "
+            f"rotate ±{args.image_max_rotate_deg}°, "
+            f"scale [{args.image_scale_min}, {args.image_scale_max}] "
+            f"(anisotropic), fill={args.image_fill_mode}, "
+            f"shift ±{args.image_shift_max} px (train-only)"
+        )
+    print(
+        f"  heatmap sparse : weight={args.heatmap_sparsity_weight} "
+        f"(τ={args.heatmap_sparsity_temperature}; "
+        f"entropy of patch MaxSim → select blocks)"
+    )
+    print(
         f"  emb geometry   : weight={args.embedding_geo_weight} "
         f"(center={args.geo_center_weight}, var={args.geo_var_weight}, "
         f"vec_mean={args.geo_vec_mean_weight}, mag_floor={args.geo_mag_floor}, "
         f"prefix={args.geo_prefix_dim}@{args.geo_prefix_weight})"
     )
     print(f"  max tokens     : {args.max_input_tokens}")
-    print(f"  matryoshka dims: {matryoshka_dims}")
-    print(f"  text-text train: {with_text_queries}")
+    print(
+        f"  matryoshka     : prefixes={alignment_model.matryoshka_dims} "
+        f"(full dim via main CE; mrl_w={args.matryoshka_weight})"
+    )
+    print(
+        f"  tasks (equal mean of CE errors at embeddings): "
+        f"caption↔image w={args.contrastive_weight}"
+    )
+    print(f"  query training : {with_text_queries}")
     if with_text_queries:
-        print(f"  text-text w    : {args.text_text_weight}")
-        print(f"  text-text m w  : {args.text_text_matryoshka_weight}")
+        print(f"  query↔image w  : {args.query_image_weight}")
+        print(f"  query→caption w: {args.text_text_weight}")
         print(f"  query cache    : {args.query_cache}")
         print(
             f"  query parallel : {args.query_parallelism} "

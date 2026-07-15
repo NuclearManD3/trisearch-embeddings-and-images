@@ -42,13 +42,31 @@ PROJECTION_FILE = "projection_heads.pt"
 TRAINING_STATE_FILE = "training_state.pt"
 CONFIG_FILE = "stage1_config.json"
 DEFAULT_MAX_INPUT_TOKENS = 256
-DEFAULT_MATRYOSHKA_DIMS = (64, 128, 256, 512, 1024)
+# Prefix dims only — full embed dim is trained by the main contrastive terms.
+# Including 1024 here double-counted full-dim CE and starved small prefixes.
+DEFAULT_MATRYOSHKA_DIMS = (64, 128, 256, 512)
 # Soft MaxSim: τ_s * logsumexp(sim / τ_s). Smaller τ_s → closer to hard max.
 DEFAULT_SOFT_MAXSIM_TEMPERATURE = 0.05
 # Caption token-Jaccard above this → treat as non-negative (not a false neg).
 DEFAULT_MULTI_POSITIVE_JACCARD = 0.5
 # Keep top fraction of SigLIP patches by pre-norm L2 (drop background).
 DEFAULT_VISION_PATCH_KEEP_RATIO = 0.75
+# Train-only: randomly drop this fraction of remaining patches after L2 keep.
+DEFAULT_VISION_PATCH_DROP_PROB = 0.40
+# Train-only: random integer translate in [-max, max] pixels (reflect pad).
+DEFAULT_IMAGE_SHIFT_MAX = 18
+# Train-only geometric aug (flip / rotate / mild scale-stretch + pad fill).
+DEFAULT_IMAGE_HFLIP_PROB = 0.5
+DEFAULT_IMAGE_MAX_ROTATE_DEG = 30.0
+DEFAULT_IMAGE_SCALE_MIN = 0.85
+DEFAULT_IMAGE_SCALE_MAX = 1.05
+# "random" | "mean" | "reflect" fill for rotate/scale gaps.
+DEFAULT_IMAGE_FILL_MODE = "random"
+# Penalize diffuse positive-pair heatmaps (normalized entropy of patch MaxSim).
+DEFAULT_HEATMAP_SPARSITY_WEIGHT = 0.1
+DEFAULT_HEATMAP_SPARSITY_TEMPERATURE = 0.07
+# Top-k hardest bank docs kept per query as InfoNCE negatives (0 = use full bank).
+DEFAULT_HARD_BANK_NEGATIVES = 32
 # Embedding geometry regularizer (anti-cone / isotropy). Overall scale.
 DEFAULT_EMBEDDING_GEO_WEIGHT = 0.05
 DEFAULT_GEO_CENTER_WEIGHT = 1.0
@@ -283,6 +301,302 @@ def keep_top_patches_by_l2(
     idx = norms.topk(k, largest=True).indices
     idx, _ = idx.sort()
     return tokens[idx]
+
+
+def random_drop_patches(
+    tokens: torch.Tensor,
+    drop_prob: float = DEFAULT_VISION_PATCH_DROP_PROB,
+    *,
+    training: bool = True,
+) -> torch.Tensor:
+    """Randomly drop a fraction of patches (train-time spatial dropout).
+
+    Keeps ``round(n * (1 - drop_prob))`` patches (at least 1), in sorted index
+    order so layout stays raster-stable for any remaining spatial logic.
+    """
+    if not training or tokens.numel() == 0:
+        return tokens
+    if tokens.ndim == 1:
+        tokens = tokens.unsqueeze(0)
+    prob = float(drop_prob)
+    if prob <= 0.0 or tokens.shape[0] <= 1:
+        return tokens
+    prob = min(prob, 1.0 - 1e-6)
+    n = int(tokens.shape[0])
+    k = max(1, int(round(n * (1.0 - prob))))
+    k = min(k, n)
+    if k >= n:
+        return tokens
+    idx = torch.randperm(n, device=tokens.device)[:k]
+    idx, _ = idx.sort()
+    return tokens[idx]
+
+
+def random_shift_pixel_values(
+    pixel_values: torch.Tensor,
+    max_shift: int = DEFAULT_IMAGE_SHIFT_MAX,
+) -> torch.Tensor:
+    """Per-image integer shift in ``[-max_shift, max_shift]`` with reflect pad.
+
+    ``pixel_values`` is ``(B, C, H, W)``. Each sample draws independent ``(dy, dx)``.
+    Used only during training to reduce grid-position memorization (sub-patch /
+    one-patch scale when max_shift ≈ patch size).
+    """
+    if max_shift is None or int(max_shift) <= 0:
+        return pixel_values
+    if pixel_values.ndim != 4:
+        raise ValueError(
+            f"pixel_values must be (B,C,H,W), got shape {tuple(pixel_values.shape)}"
+        )
+    max_shift = int(max_shift)
+    b, _, h, w = pixel_values.shape
+    pad = max_shift
+    # (left, right, top, bottom)
+    padded = F.pad(pixel_values, (pad, pad, pad, pad), mode="reflect")
+    out = pixel_values.new_empty(pixel_values.shape)
+    for i in range(b):
+        dy = int(torch.randint(-max_shift, max_shift + 1, (1,)).item())
+        dx = int(torch.randint(-max_shift, max_shift + 1, (1,)).item())
+        y0 = pad + dy
+        x0 = pad + dx
+        out[i] = padded[i, :, y0 : y0 + h, x0 : x0 + w]
+    return out
+
+
+def _sample_fill_color(
+    image_chw: torch.Tensor,
+    mode: str = DEFAULT_IMAGE_FILL_MODE,
+) -> list[float]:
+    """Per-channel fill for gaps (normalized tensor space).
+
+    * ``random`` — uniform in an expanded range around the image min/max
+    * ``mean`` — channel means of the image
+    * ``reflect`` — unused here (caller uses reflect pad); falls back to mean
+    """
+    c = int(image_chw.shape[0])
+    mode = (mode or "random").lower()
+    if mode == "reflect":
+        mode = "mean"
+    if mode == "mean":
+        return [float(image_chw[ch].mean()) for ch in range(c)]
+    # random: sample per channel in [lo-margin, hi+margin]
+    fills: list[float] = []
+    for ch in range(c):
+        lo = float(image_chw[ch].min())
+        hi = float(image_chw[ch].max())
+        span = max(hi - lo, 1e-3)
+        lo_e, hi_e = lo - 0.25 * span, hi + 0.25 * span
+        fills.append(float(lo_e + (hi_e - lo_e) * torch.rand(1).item()))
+    return fills
+
+
+def _fit_chw_to_size(
+    image_chw: torch.Tensor,
+    out_h: int,
+    out_w: int,
+    fill: list[float],
+) -> torch.Tensor:
+    """Center-pad (shrink) or center-crop (mild expand) a ``(C,H,W)`` tensor."""
+    c, h, w = image_chw.shape
+    # Pad if smaller.
+    pad_top = max(0, (out_h - h) // 2)
+    pad_bottom = max(0, out_h - h - pad_top)
+    pad_left = max(0, (out_w - w) // 2)
+    pad_right = max(0, out_w - w - pad_left)
+    if pad_top or pad_bottom or pad_left or pad_right:
+        # F.pad on (C,H,W) uses last dims: (left, right, top, bottom)
+        # pad value: use mean fill broadcast — pad with zeros then paint.
+        image_chw = F.pad(
+            image_chw,
+            (pad_left, pad_right, pad_top, pad_bottom),
+            mode="constant",
+            value=0.0,
+        )
+        if pad_top:
+            for ch, v in enumerate(fill):
+                image_chw[ch, :pad_top, :] = v
+        if pad_bottom:
+            for ch, v in enumerate(fill):
+                image_chw[ch, image_chw.shape[1] - pad_bottom :, :] = v
+        if pad_left:
+            for ch, v in enumerate(fill):
+                image_chw[ch, :, :pad_left] = v
+        if pad_right:
+            for ch, v in enumerate(fill):
+                image_chw[ch, :, image_chw.shape[2] - pad_right :] = v
+        h, w = image_chw.shape[1], image_chw.shape[2]
+    # Center-crop if larger (limited expand path).
+    if h > out_h or w > out_w:
+        top = max(0, (h - out_h) // 2)
+        left = max(0, (w - out_w) // 2)
+        image_chw = image_chw[:, top : top + out_h, left : left + out_w]
+    # Exact size guard (rounding).
+    if image_chw.shape[1] != out_h or image_chw.shape[2] != out_w:
+        image_chw = F.interpolate(
+            image_chw.unsqueeze(0),
+            size=(out_h, out_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    return image_chw
+
+
+def train_image_geometric_augment(
+    pixel_values: torch.Tensor,
+    *,
+    hflip_prob: float = DEFAULT_IMAGE_HFLIP_PROB,
+    max_rotate_deg: float = DEFAULT_IMAGE_MAX_ROTATE_DEG,
+    scale_min: float = DEFAULT_IMAGE_SCALE_MIN,
+    scale_max: float = DEFAULT_IMAGE_SCALE_MAX,
+    fill_mode: str = DEFAULT_IMAGE_FILL_MODE,
+) -> torch.Tensor:
+    """Train-time geometric aug: H-flip, rotate, anisotropic scale, pad/crop.
+
+    ``pixel_values`` is ``(B, C, H, W)`` (typically processor-normalized).
+
+    Design (content-preserving):
+    * Horizontal flip with probability ``hflip_prob``.
+    * Rotation uniform in ``[-max_rotate_deg, max_rotate_deg]`` (same output size;
+      corners filled).
+    * Independent ``scale_x, scale_y`` in ``[scale_min, scale_max]``. Shrink pads
+      with fill; mild expand center-crops so labels stay mostly valid
+      (``scale_max`` should stay near 1.05–1.10).
+    * Fill: ``random`` / ``mean`` channel colors in tensor space (not raw RGB).
+
+    Does **not** apply integer pixel shift — compose with
+    ``random_shift_pixel_values`` separately.
+    """
+    if pixel_values.ndim != 4:
+        raise ValueError(
+            f"pixel_values must be (B,C,H,W), got shape {tuple(pixel_values.shape)}"
+        )
+    b, c, h, w = pixel_values.shape
+    smin = float(scale_min)
+    smax = float(scale_max)
+    if smin <= 0 or smax <= 0 or smin > smax:
+        raise ValueError(f"invalid scale range [{smin}, {smax}]")
+    max_rot = abs(float(max_rotate_deg))
+    hflip_p = float(hflip_prob)
+
+    # torchvision is the clean path for rotate on CHW batches.
+    try:
+        import torchvision.transforms.functional as tvf
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "train_image_geometric_augment requires torchvision"
+        ) from exc
+
+    out = pixel_values.new_empty(pixel_values.shape)
+    for i in range(b):
+        img = pixel_values[i]
+        fill = _sample_fill_color(img, mode=fill_mode)
+
+        if hflip_p > 0.0 and torch.rand(1).item() < hflip_p:
+            img = tvf.hflip(img)
+
+        if max_rot > 0.0:
+            angle = float((-max_rot) + (2.0 * max_rot) * torch.rand(1).item())
+            if abs(angle) > 1e-6:
+                # fill: sequence length C for multi-channel.
+                img = tvf.rotate(
+                    img,
+                    angle=angle,
+                    interpolation=tvf.InterpolationMode.BILINEAR,
+                    expand=False,
+                    fill=fill,
+                )
+
+        # Anisotropic scale (independent x/y).
+        sx = float(smin + (smax - smin) * torch.rand(1).item())
+        sy = float(smin + (smax - smin) * torch.rand(1).item())
+        if abs(sx - 1.0) > 1e-6 or abs(sy - 1.0) > 1e-6:
+            new_w = max(1, int(round(w * sx)))
+            new_h = max(1, int(round(h * sy)))
+            img = tvf.resize(
+                img,
+                [new_h, new_w],
+                interpolation=tvf.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            img = _fit_chw_to_size(img, h, w, fill=fill)
+
+        out[i] = img
+    return out
+
+
+def apply_train_image_augmentations(
+    pixel_values: torch.Tensor,
+    *,
+    hflip_prob: float = DEFAULT_IMAGE_HFLIP_PROB,
+    max_rotate_deg: float = DEFAULT_IMAGE_MAX_ROTATE_DEG,
+    scale_min: float = DEFAULT_IMAGE_SCALE_MIN,
+    scale_max: float = DEFAULT_IMAGE_SCALE_MAX,
+    fill_mode: str = DEFAULT_IMAGE_FILL_MODE,
+    max_shift: int = DEFAULT_IMAGE_SHIFT_MAX,
+    enabled: bool = True,
+) -> torch.Tensor:
+    """Full train-time vision aug stack: geometric → integer shift."""
+    if not enabled:
+        return pixel_values
+    x = train_image_geometric_augment(
+        pixel_values,
+        hflip_prob=hflip_prob,
+        max_rotate_deg=max_rotate_deg,
+        scale_min=scale_min,
+        scale_max=scale_max,
+        fill_mode=fill_mode,
+    )
+    if max_shift and int(max_shift) > 0:
+        x = random_shift_pixel_values(x, max_shift=int(max_shift))
+    return x
+
+
+def heatmap_sparsity_loss(
+    query_tokens: list[torch.Tensor],
+    image_tokens: list[torch.Tensor],
+    *,
+    temperature: float = DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
+) -> torch.Tensor:
+    """Punish diffuse positive-pair heatmaps; force selection of few patches.
+
+    For each pair ``(q_i, d_i)`` with L2-normalized tokens:
+      ``aff_p = max_q cos(q, p)``  (same patch affinity as demo heatmaps)
+      ``p = softmax(aff / τ)`` over patches
+      loss_i = H(p) / log(n_p)   (1 = uniform/noisy, 0 = one-hot peak)
+
+    Gradients flow into both query and image embeddings (select blocks on the
+    image side and sharper query tokens). Returns 0 if lists are empty/mismatched.
+    """
+    if not query_tokens or not image_tokens:
+        raise ValueError("heatmap_sparsity_loss needs non-empty token lists")
+    if len(query_tokens) != len(image_tokens):
+        raise ValueError(
+            f"query/image batch mismatch: {len(query_tokens)} vs {len(image_tokens)}"
+        )
+    tau = max(float(temperature), 1e-6)
+    losses: list[torch.Tensor] = []
+    for q, d in zip(query_tokens, image_tokens):
+        if q is None or d is None or q.numel() == 0 or d.numel() == 0:
+            continue
+        if q.ndim == 1:
+            q = q.unsqueeze(0)
+        if d.ndim == 1:
+            d = d.unsqueeze(0)
+        # (n_q, n_p) → max over query tokens → (n_p,)
+        aff = (q @ d.T).max(dim=0).values
+        n_p = int(aff.numel())
+        if n_p <= 1:
+            losses.append(aff.new_zeros(()))
+            continue
+        log_p = F.log_softmax(aff.float() / tau, dim=0)
+        p = log_p.exp()
+        entropy = -(p * log_p).sum()
+        max_h = math.log(n_p)
+        losses.append((entropy / max_h).to(dtype=q.dtype))
+    if not losses:
+        ref = query_tokens[0]
+        return ref.new_zeros(()) if torch.is_tensor(ref) else torch.zeros(())
+    return torch.stack(losses).mean()
 
 
 def stack_token_embeddings(
@@ -539,12 +853,72 @@ class EmbeddingMemoryBank:
 DEFAULT_MEMORY_BANK_SIZE = 128
 
 
+def matryoshka_prefix_dims(
+    dims: tuple[int, ...] | list[int],
+    embed_dim: int = EMBED_DIM,
+) -> tuple[int, ...]:
+    """Keep only strict prefixes ``0 < d < embed_dim`` (no full-dim double count)."""
+    out: list[int] = []
+    seen: set[int] = set()
+    for d in dims:
+        d_int = int(d)
+        if d_int <= 0 or d_int >= int(embed_dim) or d_int in seen:
+            continue
+        seen.add(d_int)
+        out.append(d_int)
+    return tuple(out)
+
+
+def apply_hard_bank_mining(
+    scores: torch.Tensor,
+    n_live: int,
+    hard_k: int,
+) -> torch.Tensor:
+    """Keep only the top-``hard_k`` hardest *bank* columns per row.
+
+    ``scores`` is ``(B, n_live + n_bank)`` with live docs in ``[:, :n_live]``.
+    Live columns are always kept (in-batch negatives + the labeled positive).
+    Bank columns outside each row's top-k hardest scores are set to ``-inf`` so
+    they drop out of InfoNCE — easy bank negatives no longer dilute the softmax.
+
+    ``hard_k <= 0`` or ``hard_k >= n_bank`` leaves scores unchanged.
+    """
+    if hard_k is None or int(hard_k) <= 0:
+        return scores
+    if scores.ndim != 2:
+        raise ValueError(f"scores must be 2-D, got shape {tuple(scores.shape)}")
+    batch, n_docs = scores.shape
+    if n_live < 0 or n_live > n_docs:
+        raise ValueError(f"n_live={n_live} invalid for n_docs={n_docs}")
+    n_bank = n_docs - n_live
+    if n_bank <= 0:
+        return scores
+    k = min(int(hard_k), n_bank)
+    if k >= n_bank:
+        return scores
+
+    live = scores[:, :n_live]
+    bank = scores[:, n_live:]
+    topk_idx = torch.topk(bank, k=k, dim=1).indices  # (B, k)
+    keep = torch.zeros_like(bank, dtype=torch.bool)
+    keep.scatter_(1, topk_idx, True)
+    bank = bank.masked_fill(~keep, float("-inf"))
+    return torch.cat([live, bank], dim=1)
+
+
 def _expand_non_negative_mask(
     batch_mask: torch.Tensor | None,
     n_docs: int,
     batch: int,
+    *,
+    n_live: int | None = None,
 ) -> torch.Tensor | None:
-    """Pad a ``(B, B)`` in-batch mask to ``(B, n_docs)`` with False for bank cols."""
+    """Pad a ``(B, B)`` in-batch mask to ``(B, n_docs)`` with False for extra cols.
+
+    When ``n_live`` is set (e.g. captions + distractors for query→text), the mask
+    only covers the first ``batch`` columns; columns ``batch:n_live`` and bank
+    columns stay False (always eligible as negatives).
+    """
     if batch_mask is None:
         return None
     if batch_mask.shape != (batch, batch):
@@ -554,9 +928,13 @@ def _expand_non_negative_mask(
         )
     if n_docs == batch:
         return batch_mask
+    live = n_live if n_live is not None else batch
+    if live < batch or live > n_docs:
+        raise ValueError(f"n_live={live} invalid for batch={batch}, n_docs={n_docs}")
     extra = n_docs - batch
     if extra < 0:
         raise ValueError(f"n_docs {n_docs} < batch {batch}")
+    # Pad after the B×B block: distractors (if any) + bank are never multi-pos.
     pad = torch.zeros(
         batch, extra, dtype=batch_mask.dtype, device=batch_mask.device
     )
@@ -572,6 +950,7 @@ def contrastive_late_interaction_loss(
     bank_image_tokens: list[torch.Tensor] | None = None,
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
+    hard_bank_k: int = 0,
     return_metrics: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
     """Bidirectional late-interaction InfoNCE with optional memory-bank negatives.
@@ -583,6 +962,9 @@ def contrastive_late_interaction_loss(
     Scores use mean-MaxSim (see ``differentiable_late_interaction_score``),
     optionally soft MaxSim. ``non_negative_mask`` is an optional ``(B, B)`` bool
     mask of in-batch pairs that must not act as negatives (false-neg softening).
+
+    ``hard_bank_k`` keeps only the top-k hardest bank docs per query (see
+    ``apply_hard_bank_mining``); live in-batch columns are always kept.
 
     When ``return_metrics`` is True, also returns mean positive ranks (1 = best)
     averaged over t2i and i2t — useful as a bank-size-invariant health signal.
@@ -639,6 +1021,8 @@ def contrastive_late_interaction_loss(
     scores_i2t = build_late_interaction_matrix(
         image_tokens, text_docs, soft_maxsim_temperature=soft_tau
     ) / temperature
+    scores_t2i = apply_hard_bank_mining(scores_t2i, batch, hard_bank_k)
+    scores_i2t = apply_hard_bank_mining(scores_i2t, batch, hard_bank_k)
     mask_t2i = _expand_non_negative_mask(non_negative_mask, n_image_docs, batch)
     mask_i2t = _expand_non_negative_mask(
         non_negative_mask.T if non_negative_mask is not None else None,
@@ -674,8 +1058,13 @@ def text_text_contrastive_loss(
     bank_doc_tokens: list[torch.Tensor] | None = None,
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
+    hard_bank_k: int = 0,
 ) -> torch.Tensor:
-    """Reward query↔caption matches; penalize wrong captions, distractors, bank."""
+    """Query→caption InfoNCE: match own caption; not other captions / distractors / bank.
+
+    Docs are ``[captions | distractors | bank]``. Labels are diagonal into the
+    caption block. Multi-positive mask only softens near-duplicate *captions*.
+    """
     if len(query_tokens) != len(caption_tokens):
         raise ValueError(
             "query_tokens and caption_tokens must have the same batch size."
@@ -686,13 +1075,17 @@ def text_text_contrastive_loss(
             "text-text contrastive loss needs batch_size >= 2 for negatives."
         )
     batch = len(query_tokens)
+    n_live = batch + len(distractor_tokens)
     all_docs = list(caption_tokens) + list(distractor_tokens) + list(bank_docs)
     scores = build_late_interaction_matrix(
         query_tokens, all_docs, soft_maxsim_temperature=soft_maxsim_temperature
     ) / temperature
+    scores = apply_hard_bank_mining(scores, n_live, hard_bank_k)
     labels = torch.arange(scores.size(0), device=scores.device)
     # Only the in-batch caption columns participate in multi-positive masking.
-    mask = _expand_non_negative_mask(non_negative_mask, scores.size(1), batch)
+    mask = _expand_non_negative_mask(
+        non_negative_mask, scores.size(1), batch, n_live=n_live
+    )
     return masked_cross_entropy(scores, labels, non_negative_mask=mask)
 
 
@@ -707,13 +1100,21 @@ def text_text_matryoshka_loss(
     bank_doc_raw: list[torch.Tensor] | None = None,
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
+    hard_bank_k: int = 0,
+    embed_dim: int = EMBED_DIM,
 ) -> torch.Tensor:
+    """Mean of prefix-only query→caption CE (full dim handled by the main term)."""
+    prefix_dims = matryoshka_prefix_dims(dims, embed_dim=embed_dim)
+    if not prefix_dims:
+        return query_raw[0].new_zeros(())
     if dim_weights is None:
-        dim_weights = [1.0] * len(dims)
-    total_weight = sum(dim_weights)
+        dim_weights = [1.0] * len(prefix_dims)
+    if len(dim_weights) != len(prefix_dims):
+        dim_weights = [1.0] * len(prefix_dims)
+    total_weight = sum(dim_weights) or 1.0
     bank_raw = bank_doc_raw or []
     loss = query_raw[0].new_zeros(())
-    for dim, weight in zip(dims, dim_weights):
+    for dim, weight in zip(prefix_dims, dim_weights):
         query_prefix = [matryoshka_normalize(t, dim=dim) for t in query_raw]
         caption_prefix = [matryoshka_normalize(t, dim=dim) for t in caption_raw]
         distractor_prefix = [
@@ -728,6 +1129,7 @@ def text_text_matryoshka_loss(
             bank_doc_tokens=bank_prefix,
             soft_maxsim_temperature=soft_maxsim_temperature,
             non_negative_mask=non_negative_mask,
+            hard_bank_k=hard_bank_k,
         )
     return loss / total_weight
 
@@ -743,14 +1145,22 @@ def matryoshka_loss(
     bank_image_raw: list[torch.Tensor] | None = None,
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
+    hard_bank_k: int = 0,
+    embed_dim: int = EMBED_DIM,
 ) -> torch.Tensor:
+    """Mean of prefix-only bidirectional CE (full dim handled by the main term)."""
+    prefix_dims = matryoshka_prefix_dims(dims, embed_dim=embed_dim)
+    if not prefix_dims:
+        return text_raw[0].new_zeros(())
     if dim_weights is None:
-        dim_weights = [1.0] * len(dims)
-    total_weight = sum(dim_weights)
+        dim_weights = [1.0] * len(prefix_dims)
+    if len(dim_weights) != len(prefix_dims):
+        dim_weights = [1.0] * len(prefix_dims)
+    total_weight = sum(dim_weights) or 1.0
     bank_text = bank_text_raw or []
     bank_image = bank_image_raw or []
     loss = text_raw[0].new_zeros(())
-    for dim, weight in zip(dims, dim_weights):
+    for dim, weight in zip(prefix_dims, dim_weights):
         text_prefix = [matryoshka_normalize(t, dim=dim) for t in text_raw]
         image_prefix = [matryoshka_normalize(t, dim=dim) for t in image_raw]
         bank_text_prefix = [matryoshka_normalize(t, dim=dim) for t in bank_text]
@@ -763,8 +1173,48 @@ def matryoshka_loss(
             bank_image_tokens=bank_image_prefix,
             soft_maxsim_temperature=soft_maxsim_temperature,
             non_negative_mask=non_negative_mask,
+            hard_bank_k=hard_bank_k,
         )
     return loss / total_weight
+
+
+def combine_full_and_matryoshka(
+    full: torch.Tensor,
+    matryoshka: torch.Tensor,
+    matryoshka_weight: float,
+    *,
+    has_prefixes: bool = True,
+) -> torch.Tensor:
+    """Blend full-dim and prefix CE for one retrieval task.
+
+    Gradients from both terms flow into the *same* raw embeddings (prefixes via
+    truncate→renormalize). This is error addition at the embedding outputs, not
+    a separate multi-task optimizer. ``matryoshka_weight`` scales prefix CE
+    relative to full; result is normalized so default weight 1.0 → equal share.
+    """
+    w = float(matryoshka_weight)
+    if w <= 0.0 or not has_prefixes:
+        return full
+    return (full + w * matryoshka) / (1.0 + w)
+
+
+def mean_task_losses(
+    task_losses: list[tuple[torch.Tensor, float]],
+) -> torch.Tensor:
+    """Weighted mean of task CEs (default weights 1 → equal error at embeddings).
+
+    ``total = sum_i w_i * L_i / sum_i w_i``. Autograd yields
+    ``∂total/∂E = sum_i (w_i/Z) ∂L_i/∂E`` — additive task errors on shared
+    embeddings, not independent optimizers.
+    """
+    active = [(loss, float(w)) for loss, w in task_losses if float(w) > 0.0]
+    if not active:
+        raise ValueError("mean_task_losses requires at least one positive-weight task")
+    z = sum(w for _, w in active)
+    acc = active[0][0].new_zeros(())
+    for loss, w in active:
+        acc = acc + (w / z) * loss
+    return acc
 
 
 class Stage1AlignmentModel(nn.Module):
@@ -782,15 +1232,27 @@ class Stage1AlignmentModel(nn.Module):
         matryoshka_dims: tuple[int, ...] = DEFAULT_MATRYOSHKA_DIMS,
         temperature: float = 0.07,
         contrastive_weight: float = 1.0,
-        matryoshka_weight: float = 0.5,
+        matryoshka_weight: float = 1.0,
         text_text_weight: float = 1.0,
-        text_text_matryoshka_weight: float = 0.5,
+        text_text_matryoshka_weight: float | None = None,
+        query_image_weight: float = 1.0,
+        hard_bank_negatives: int = DEFAULT_HARD_BANK_NEGATIVES,
         compute_dtype: torch.dtype = torch.float16,
         memory_bank_size: int = DEFAULT_MEMORY_BANK_SIZE,
         soft_maxsim: bool = True,
         soft_maxsim_temperature: float = DEFAULT_SOFT_MAXSIM_TEMPERATURE,
         multi_positive_jaccard: float = DEFAULT_MULTI_POSITIVE_JACCARD,
         vision_patch_keep_ratio: float = DEFAULT_VISION_PATCH_KEEP_RATIO,
+        vision_patch_drop_prob: float = DEFAULT_VISION_PATCH_DROP_PROB,
+        image_shift_max: int = DEFAULT_IMAGE_SHIFT_MAX,
+        image_hflip_prob: float = DEFAULT_IMAGE_HFLIP_PROB,
+        image_max_rotate_deg: float = DEFAULT_IMAGE_MAX_ROTATE_DEG,
+        image_scale_min: float = DEFAULT_IMAGE_SCALE_MIN,
+        image_scale_max: float = DEFAULT_IMAGE_SCALE_MAX,
+        image_fill_mode: str = DEFAULT_IMAGE_FILL_MODE,
+        image_aug_enabled: bool = True,
+        heatmap_sparsity_weight: float = DEFAULT_HEATMAP_SPARSITY_WEIGHT,
+        heatmap_sparsity_temperature: float = DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
         bank_score_policy: str = "accum_window",
         embedding_geo_weight: float = DEFAULT_EMBEDDING_GEO_WEIGHT,
         geo_center_weight: float = DEFAULT_GEO_CENTER_WEIGHT,
@@ -819,17 +1281,42 @@ class Stage1AlignmentModel(nn.Module):
         self.text_projection = nn.Linear(
             text_hidden, embed_dim, device=text_device, dtype=compute_dtype
         )
-        self.matryoshka_dims = matryoshka_dims
+        self.embed_dim = int(embed_dim)
+        # Prefix-only dims (full dim trained by main contrastive terms).
+        self.matryoshka_dims = matryoshka_prefix_dims(matryoshka_dims, embed_dim=embed_dim)
         self.temperature = temperature
-        self.contrastive_weight = contrastive_weight
-        self.matryoshka_weight = matryoshka_weight
-        self.text_text_weight = text_text_weight
-        self.text_text_matryoshka_weight = text_text_matryoshka_weight
+        # Relative task weights in mean_task_losses (default 1 → equal embed errors).
+        self.contrastive_weight = float(contrastive_weight)
+        self.matryoshka_weight = float(matryoshka_weight)
+        self.text_text_weight = float(text_text_weight)
+        # Legacy alias: if set, kept for logging only; MRL uses matryoshka_weight.
+        self.text_text_matryoshka_weight = (
+            float(text_text_matryoshka_weight)
+            if text_text_matryoshka_weight is not None
+            else float(matryoshka_weight)
+        )
+        self.query_image_weight = float(query_image_weight)
+        self.hard_bank_negatives = int(hard_bank_negatives)
         self.memory_bank = EmbeddingMemoryBank(memory_bank_size)
         self.soft_maxsim = bool(soft_maxsim)
         self.soft_maxsim_temperature = float(soft_maxsim_temperature)
         self.multi_positive_jaccard = float(multi_positive_jaccard)
         self.vision_patch_keep_ratio = float(vision_patch_keep_ratio)
+        self.vision_patch_drop_prob = float(vision_patch_drop_prob)
+        self.image_shift_max = int(image_shift_max)
+        self.image_hflip_prob = float(image_hflip_prob)
+        self.image_max_rotate_deg = float(image_max_rotate_deg)
+        self.image_scale_min = float(image_scale_min)
+        self.image_scale_max = float(image_scale_max)
+        fill_mode = str(image_fill_mode or DEFAULT_IMAGE_FILL_MODE).lower()
+        if fill_mode not in ("random", "mean", "reflect"):
+            raise ValueError(
+                f"image_fill_mode must be random|mean|reflect, got {image_fill_mode!r}"
+            )
+        self.image_fill_mode = fill_mode
+        self.image_aug_enabled = bool(image_aug_enabled)
+        self.heatmap_sparsity_weight = float(heatmap_sparsity_weight)
+        self.heatmap_sparsity_temperature = float(heatmap_sparsity_temperature)
         # "accum_window" = policy B: score snapshot from window start, enqueue every mb.
         # "live" = score against bank after each prior micro-batch enqueue.
         if bank_score_policy not in ("accum_window", "live"):
@@ -912,9 +1399,14 @@ class Stage1AlignmentModel(nn.Module):
     def _select_vision_patches(
         self, vision_raw_i: torch.Tensor
     ) -> torch.Tensor:
-        """Drop background patches by pre-norm L2 before MaxSim / bank store."""
-        return keep_top_patches_by_l2(
+        """L2 background keep, then train-only random patch dropout."""
+        kept = keep_top_patches_by_l2(
             vision_raw_i, keep_ratio=self.vision_patch_keep_ratio
+        )
+        return random_drop_patches(
+            kept,
+            drop_prob=self.vision_patch_drop_prob,
+            training=self.training,
         )
 
     def _geo_kwargs(self) -> dict[str, float]:
@@ -1047,8 +1539,24 @@ class Stage1AlignmentModel(nn.Module):
         metrics["geo_loss"] = float(geo.detach())
         return geo, metrics
 
+    def _maybe_augment_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Train-only geometric + shift aug; identity in eval."""
+        if not self.training or not self.image_aug_enabled:
+            return pixel_values
+        return apply_train_image_augmentations(
+            pixel_values,
+            hflip_prob=self.image_hflip_prob,
+            max_rotate_deg=self.image_max_rotate_deg,
+            scale_min=self.image_scale_min,
+            scale_max=self.image_scale_max,
+            fill_mode=self.image_fill_mode,
+            max_shift=self.image_shift_max,
+            enabled=True,
+        )
+
     def encode_images(self, pixel_values: torch.Tensor) -> list[torch.Tensor]:
         pixel_values = pixel_values.to(self.vision_device, non_blocking=True)
+        pixel_values = self._maybe_augment_images(pixel_values)
         vision_hidden = self.vision_model(
             pixel_values=pixel_values
         ).last_hidden_state.to(dtype=self.compute_dtype)
@@ -1117,6 +1625,9 @@ class Stage1AlignmentModel(nn.Module):
         input_ids = input_ids.to(self.text_device, non_blocking=True)
         attention_mask = attention_mask.to(self.text_device, non_blocking=True)
 
+        # Train-only: flip / rotate / mild scale-stretch + pad fill + pixel shift.
+        pixel_values = self._maybe_augment_images(pixel_values)
+
         vision_hidden = self.vision_model(
             pixel_values=pixel_values
         ).last_hidden_state.to(dtype=self.compute_dtype)
@@ -1171,6 +1682,7 @@ class Stage1AlignmentModel(nn.Module):
         )
 
         soft_tau = self._soft_tau()
+        hard_k = self.hard_bank_negatives
         non_neg = build_multi_positive_mask(
             captions,
             batch_size=len(loss_text_tokens),
@@ -1178,6 +1690,19 @@ class Stage1AlignmentModel(nn.Module):
             device=loss_text_tokens[0].device,
         )
 
+        # ------------------------------------------------------------------
+        # Retrieval tasks (all InfoNCE on shared live embeddings):
+        #   1) caption ↔ image  — every caption matches its image, not others
+        #   2) query  ↔ image   — query finds the matching image
+        #   3) query  → caption — query finds the matching caption
+        # Within each task, full-dim CE + prefix Matryoshka CE both backprop into
+        # the *same* raw projected tokens (error addition at embedding outputs).
+        # Tasks are then mean-combined (default equal weights) so
+        #   ∂L/∂E = mean_i ∂L_i/∂E
+        # — still one backward, not a weighted soup of unrelated scales.
+        # Bank vectors are detached (hard top-k mining selects which bank cols
+        # enter the softmax).
+        # ------------------------------------------------------------------
         contrastive, contrastive_metrics = contrastive_late_interaction_loss(
             loss_text_tokens,
             loss_image_tokens,
@@ -1186,6 +1711,7 @@ class Stage1AlignmentModel(nn.Module):
             bank_image_tokens=bank_image_tokens,
             soft_maxsim_temperature=soft_tau,
             non_negative_mask=non_neg,
+            hard_bank_k=hard_k,
             return_metrics=True,
         )
         matryoshka = matryoshka_loss(
@@ -1197,29 +1723,37 @@ class Stage1AlignmentModel(nn.Module):
             bank_image_raw=bank_image_raw,
             soft_maxsim_temperature=soft_tau,
             non_negative_mask=non_neg,
+            hard_bank_k=hard_k,
+            embed_dim=self.embed_dim,
         )
-        loss = (
-            self.contrastive_weight * contrastive
-            + self.matryoshka_weight * matryoshka
+        has_prefixes = bool(self.matryoshka_dims)
+        caption_image_task = combine_full_and_matryoshka(
+            contrastive,
+            matryoshka,
+            self.matryoshka_weight,
+            has_prefixes=has_prefixes,
         )
 
-        text_text = contrastive.new_zeros(())
-        text_text_matryoshka = contrastive.new_zeros(())
+        zero = contrastive.new_zeros(())
+        text_text = zero
+        text_text_matryoshka = zero
+        query_image = zero
+        query_image_matryoshka = zero
         loss_query_tokens: list[torch.Tensor] = []
         loss_query_raw: list[torch.Tensor] = []
         loss_distractor_tokens: list[torch.Tensor] = []
         loss_distractor_raw: list[torch.Tensor] = []
-        has_text_text = (
+
+        has_queries = (
             query_input_ids is not None
             and query_attention_mask is not None
             and unrelated_input_ids is not None
             and unrelated_attention_mask is not None
-            and (
-                self.text_text_weight > 0.0
-                or self.text_text_matryoshka_weight > 0.0
-            )
         )
-        if has_text_text:
+        want_query_image = has_queries and self.query_image_weight > 0.0
+        want_query_caption = has_queries and self.text_text_weight > 0.0
+
+        if has_queries and (want_query_image or want_query_caption):
             query_tokens, query_raw = self._encode_text_batch(
                 query_input_ids, query_attention_mask
             )
@@ -1227,23 +1761,48 @@ class Stage1AlignmentModel(nn.Module):
                 unrelated_input_ids, unrelated_attention_mask
             )
             loss_query_tokens = [self._to_loss(t) for t in query_tokens]
-            loss_caption_tokens = loss_text_tokens
             loss_distractor_tokens = [self._to_loss(t) for t in distractor_tokens]
             loss_query_raw = [self._to_loss(t) for t in query_raw]
             loss_distractor_raw = [self._to_loss(t) for t in distractor_raw]
 
-            if self.text_text_weight > 0.0:
+            if want_query_image:
+                # Bidirectional query↔image: query finds matching image (and reverse).
+                query_image = contrastive_late_interaction_loss(
+                    loss_query_tokens,
+                    loss_image_tokens,
+                    temperature=self.temperature,
+                    bank_text_tokens=bank_text_tokens,
+                    bank_image_tokens=bank_image_tokens,
+                    soft_maxsim_temperature=soft_tau,
+                    non_negative_mask=non_neg,
+                    hard_bank_k=hard_k,
+                    return_metrics=False,
+                )
+                query_image_matryoshka = matryoshka_loss(
+                    loss_query_raw,
+                    loss_image_raw,
+                    dims=self.matryoshka_dims,
+                    temperature=self.temperature,
+                    bank_text_raw=bank_text_raw,
+                    bank_image_raw=bank_image_raw,
+                    soft_maxsim_temperature=soft_tau,
+                    non_negative_mask=non_neg,
+                    hard_bank_k=hard_k,
+                    embed_dim=self.embed_dim,
+                )
+
+            if want_query_caption:
+                # Query → matching caption; not other captions / distractors / bank.
                 text_text = text_text_contrastive_loss(
                     loss_query_tokens,
-                    loss_caption_tokens,
+                    loss_text_tokens,
                     loss_distractor_tokens,
                     temperature=self.temperature,
                     bank_doc_tokens=bank_text_tokens,
                     soft_maxsim_temperature=soft_tau,
                     non_negative_mask=non_neg,
+                    hard_bank_k=hard_k,
                 )
-                loss = loss + self.text_text_weight * text_text
-            if self.text_text_matryoshka_weight > 0.0:
                 text_text_matryoshka = text_text_matryoshka_loss(
                     loss_query_raw,
                     loss_text_raw,
@@ -1253,8 +1812,32 @@ class Stage1AlignmentModel(nn.Module):
                     bank_doc_raw=bank_text_raw,
                     soft_maxsim_temperature=soft_tau,
                     non_negative_mask=non_neg,
+                    hard_bank_k=hard_k,
+                    embed_dim=self.embed_dim,
                 )
-                loss = loss + self.text_text_matryoshka_weight * text_text_matryoshka
+
+        query_image_task = combine_full_and_matryoshka(
+            query_image,
+            query_image_matryoshka,
+            self.matryoshka_weight,
+            has_prefixes=has_prefixes,
+        )
+        query_caption_task = combine_full_and_matryoshka(
+            text_text,
+            text_text_matryoshka,
+            self.matryoshka_weight,
+            has_prefixes=has_prefixes,
+        )
+
+        task_losses: list[tuple[torch.Tensor, float]] = [
+            (caption_image_task, self.contrastive_weight),
+        ]
+        if want_query_image:
+            task_losses.append((query_image_task, self.query_image_weight))
+        if want_query_caption:
+            task_losses.append((query_caption_task, self.text_text_weight))
+
+        retrieval_loss = mean_task_losses(task_losses)
 
         # Geometry / anti-cone: text + image (+ query when available).
         # Queries showed strong dim-0 bias (~0.05) in retrieval probes.
@@ -1270,15 +1853,40 @@ class Stage1AlignmentModel(nn.Module):
             geo_norm_lists.append(loss_query_tokens)
             geo_raw_lists.append(loss_query_raw)
         # Detached bank tokens enlarge N for variance/center without polluting
-        # live gradients (concat after stacking inside would need care); we only
-        # use bank via EMA, which already tracks historical means.
+        # live gradients; we only use bank via EMA, which tracks historical means.
 
         geo_loss, geo_metrics = self._compute_embedding_geometry(
             norm_token_lists=geo_norm_lists,
             raw_token_lists=geo_raw_lists,
         )
+        # Geo is a regularizer on the same embeddings (adds ∂geo/∂E), scaled
+        # separately because its numeric scale is not InfoNCE-comparable.
+        loss = retrieval_loss
         if self.embedding_geo_weight > 0.0:
             loss = loss + self.embedding_geo_weight * geo_loss
+
+        # Heatmap sparsity: punish uniform patch MaxSim on positive pairs so
+        # gradients favor a few “selected blocks” (cleaner demo heatmaps).
+        sparsity = zero
+        if self.heatmap_sparsity_weight > 0.0:
+            sp_terms: list[torch.Tensor] = [
+                heatmap_sparsity_loss(
+                    loss_text_tokens,
+                    loss_image_tokens,
+                    temperature=self.heatmap_sparsity_temperature,
+                )
+            ]
+            # Query heatmaps are what the demo shows — include when queries exist.
+            if loss_query_tokens:
+                sp_terms.append(
+                    heatmap_sparsity_loss(
+                        loss_query_tokens,
+                        loss_image_tokens,
+                        temperature=self.heatmap_sparsity_temperature,
+                    )
+                )
+            sparsity = torch.stack(sp_terms).mean()
+            loss = loss + self.heatmap_sparsity_weight * sparsity
 
         # Enqueue *after* scoring so the current batch is never its own negative.
         # Policy B: enqueue every micro-batch into the live FIFO.
@@ -1287,10 +1895,16 @@ class Stage1AlignmentModel(nn.Module):
 
         return {
             "loss": loss,
+            "retrieval_loss": retrieval_loss.detach(),
             "contrastive_loss": contrastive.detach(),
             "matryoshka_loss": matryoshka.detach(),
+            "caption_image_loss": caption_image_task.detach(),
+            "query_image_loss": query_image.detach(),
+            "query_image_matryoshka_loss": query_image_matryoshka.detach(),
             "text_text_loss": text_text.detach(),
             "text_text_matryoshka_loss": text_text_matryoshka.detach(),
+            "query_caption_loss": query_caption_task.detach(),
+            "heatmap_sparsity_loss": sparsity.detach(),
             "geo_loss": geo_loss.detach()
             if torch.is_tensor(geo_loss)
             else contrastive.new_zeros(()),
@@ -2010,6 +2624,7 @@ def sanity_check_loss(model: Stage1AlignmentModel, dataloader: DataLoader):
     loss = float(outputs["loss"])
     contrastive = float(outputs["contrastive_loss"])
     matryoshka = float(outputs["matryoshka_loss"])
+    query_image = float(outputs.get("query_image_loss", 0.0))
     text_text = float(outputs.get("text_text_loss", 0.0))
     text_text_matryoshka = float(outputs.get("text_text_matryoshka_loss", 0.0))
     pos_rank = float(outputs.get("pos_rank", float("nan")))
@@ -2017,8 +2632,9 @@ def sanity_check_loss(model: Stage1AlignmentModel, dataloader: DataLoader):
     model.train()
     print(
         f"Sanity check (batch={batch['input_ids'].shape[0]}): "
-        f"loss={loss:.4f} contrastive={contrastive:.4f} matryoshka={matryoshka:.4f} "
-        f"text_text={text_text:.4f} text_text_matryoshka={text_text_matryoshka:.4f} "
+        f"loss={loss:.4f} cap↔img={contrastive:.4f} mrl={matryoshka:.4f} "
+        f"q↔img={query_image:.4f} q→cap={text_text:.4f} "
+        f"q→cap_mrl={text_text_matryoshka:.4f} "
         f"pos_rank={pos_rank:.2f}/{n_docs}"
     )
     if loss <= 0.0 or not math.isfinite(loss):
@@ -2061,8 +2677,10 @@ def run_training(
     log_loss = 0.0
     log_contrastive = 0.0
     log_matryoshka = 0.0
+    log_query_image = 0.0
     log_text_text = 0.0
     log_text_text_matryoshka = 0.0
+    log_heatmap_sparsity = 0.0
     log_geo = 0.0
     log_geo_mu = 0.0
     log_geo_min_std = 0.0
@@ -2094,9 +2712,13 @@ def run_training(
             log_loss += loss_val
             log_contrastive += float(outputs["contrastive_loss"])
             log_matryoshka += float(outputs["matryoshka_loss"])
+            log_query_image += float(outputs.get("query_image_loss", 0.0))
             log_text_text += float(outputs.get("text_text_loss", 0.0))
             log_text_text_matryoshka += float(
                 outputs.get("text_text_matryoshka_loss", 0.0)
+            )
+            log_heatmap_sparsity += float(
+                outputs.get("heatmap_sparsity_loss", 0.0)
             )
             log_geo += float(outputs.get("geo_loss", 0.0))
             log_geo_mu += float(outputs.get("geo_mu_norm", 0.0))
@@ -2128,17 +2750,26 @@ def run_training(
                 msg = (
                     f"step {global_step:5d} | "
                     f"loss {log_loss / log_batches:.4f} | "
-                    f"contrastive {log_contrastive / log_batches:.4f} | "
-                    f"matryoshka {log_matryoshka / log_batches:.4f}"
+                    f"cap↔img {log_contrastive / log_batches:.4f} | "
+                    f"mrl {log_matryoshka / log_batches:.4f}"
                 )
+                if log_query_image > 0.0 or getattr(args, "query_image_weight", 0.0) > 0.0:
+                    msg += f" | q↔img {log_query_image / log_batches:.4f}"
                 if log_text_text > 0.0 or getattr(args, "text_text_weight", 0.0) > 0.0:
-                    msg += f" | text_text {log_text_text / log_batches:.4f}"
+                    msg += f" | q→cap {log_text_text / log_batches:.4f}"
                 if (
                     log_text_text_matryoshka > 0.0
-                    or getattr(args, "text_text_matryoshka_weight", 0.0) > 0.0
+                    or getattr(args, "matryoshka_weight", 0.0) > 0.0
                 ):
                     msg += (
-                        f" | text_text_m {log_text_text_matryoshka / log_batches:.4f}"
+                        f" | q→cap_mrl {log_text_text_matryoshka / log_batches:.4f}"
+                    )
+                if (
+                    log_heatmap_sparsity > 0.0
+                    or getattr(args, "heatmap_sparsity_weight", 0.0) > 0.0
+                ):
+                    msg += (
+                        f" | heat_sparse {log_heatmap_sparsity / log_batches:.4f}"
                     )
                 if log_geo > 0.0 or getattr(args, "embedding_geo_weight", 0.0) > 0.0:
                     msg += (
@@ -2154,7 +2785,9 @@ def run_training(
                 msg += f" | grad_norm {float(grad_norm):.4f} | lr {text_lr:.2e}"
                 print(msg)
                 log_loss = log_contrastive = log_matryoshka = 0.0
+                log_query_image = 0.0
                 log_text_text = log_text_text_matryoshka = 0.0
+                log_heatmap_sparsity = 0.0
                 log_geo = log_geo_mu = log_geo_min_std = 0.0
                 log_pos_rank = 0.0
                 log_batches = 0
