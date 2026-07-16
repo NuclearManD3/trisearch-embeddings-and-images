@@ -1,0 +1,2 @@
+python3 train_stage1.py --max-steps 5000 --batch-size 4 --gradient-accumulation-steps 16 --learning-rate 1e-4 --projection-learning-rate 1e-4 --max-input-tokens 64 --memory-bank-size 64 --embedding-geo-weight 2.5 --contrastive-weight 0.1 --matryoshka-weight 0.2 --heatmap-sparsity-weight 2.5 --image-scale-min 0.6 --vision-patch-drop-prob 0.2
+python3 train_stage1.py --max-steps 1000 --memory-bank-size 128 --embedding-geo-weight 1.0 --heatmap-sparsity-weight 0.75 --image-scale-min 0.75 # <-- this works

@@ -10,6 +10,7 @@ Covers:
 
 from __future__ import annotations
 
+import math
 import unittest
 from types import SimpleNamespace
 
@@ -17,23 +18,32 @@ import torch
 import torch.nn.functional as F
 
 from trisearch_models.training import (
+    DEFAULT_GEO_AFTER_UNFREEZE,
+    DEFAULT_HEATMAP_SPARSITY_WEIGHT,
     DEFAULT_MATRYOSHKA_DIMS,
+    DEFAULT_SCORE_CENTER,
     DEFAULT_SOFT_MAXSIM_TEMPERATURE,
+    DEFAULT_VISION_MERGE_TOKENS,
     DEFAULT_VISION_PATCH_DROP_PROB,
     EmbeddingMemoryBank,
     Stage1AlignmentModel,
     apply_hard_bank_mining,
+    apply_score_center,
     build_late_interaction_matrix,
     build_multi_positive_mask,
     caption_token_jaccard,
     combine_full_and_matryoshka,
     contrastive_late_interaction_loss,
+    contrastive_score_margin_metrics,
     differentiable_late_interaction_score,
     heatmap_sparsity_loss,
     keep_top_patches_by_l2,
     masked_cross_entropy,
     matryoshka_prefix_dims,
+    mean_positive_rank,
     mean_task_losses,
+    mean_unit_token_center,
+    merge_tokens_by_similarity,
     apply_train_image_augmentations,
     random_drop_patches,
     random_shift_pixel_values,
@@ -205,6 +215,204 @@ class TestSoftMaxSimDefault(unittest.TestCase):
         )
 
 
+class TestContrastiveRankAndMargin(unittest.TestCase):
+    def test_collapsed_scores_mid_rank_is_chance(self):
+        """Full collapse must not report pos_rank=1 (old optimistic-ties bug)."""
+        n_docs = 132
+        scores = torch.ones(4, n_docs)
+        rank = mean_positive_rank(scores)
+        self.assertAlmostEqual(rank, (n_docs + 1) / 2.0, places=4)
+
+    def test_unique_best_positive_rank_one(self):
+        scores = torch.zeros(3, 10)
+        scores[0, 0] = 5.0
+        scores[1, 1] = 5.0
+        scores[2, 2] = 5.0
+        self.assertAlmostEqual(mean_positive_rank(scores), 1.0, places=4)
+
+    def test_score_gap_zero_when_collapsed(self):
+        scores = torch.ones(4, 36) * 3.5
+        labels = torch.arange(4)
+        m = contrastive_score_margin_metrics(scores, labels)
+        self.assertAlmostEqual(m["score_gap"], 0.0, places=5)
+
+    def test_score_gap_positive_when_pos_wins(self):
+        scores = torch.zeros(2, 4)
+        scores[0, 0] = 2.0
+        scores[1, 1] = 2.0
+        labels = torch.arange(2)
+        m = contrastive_score_margin_metrics(scores, labels)
+        self.assertGreater(m["score_gap"], 1.0)
+
+    def test_contrastive_metrics_include_gap(self):
+        texts = _rand_tokens(3, [2, 2, 2], dim=8, seed=20)
+        images = _rand_tokens(3, [3, 3, 3], dim=8, seed=21)
+        loss, metrics = contrastive_late_interaction_loss(
+            texts, images, temperature=0.07, return_metrics=True
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("score_gap", metrics)
+        self.assertTrue(math.isfinite(metrics["score_gap"]))
+        self.assertLess(metrics["pos_rank"], 3.0)
+
+    def test_heatmap_sparsity_default_off(self):
+        self.assertEqual(DEFAULT_HEATMAP_SPARSITY_WEIGHT, 0.0)
+
+    def test_geo_active_during_freeze_by_default(self):
+        self.assertFalse(DEFAULT_GEO_AFTER_UNFREEZE)
+
+    def test_score_center_default_on(self):
+        self.assertTrue(DEFAULT_SCORE_CENTER)
+
+    def test_vision_merge_default_positive(self):
+        self.assertGreater(DEFAULT_VISION_MERGE_TOKENS, 0)
+
+
+class TestScoreCenterAndMerge(unittest.TestCase):
+    def test_merge_reduces_count(self):
+        t = F.normalize(torch.randn(40, 16), dim=-1)
+        m = merge_tokens_by_similarity(t, k=5)
+        self.assertEqual(tuple(m.shape), (5, 16))
+
+    def test_score_center_restores_gap_under_domain_cone(self):
+        """Domain-shared patches collapse MaxSim gap; centering restores it."""
+        g = torch.Generator().manual_seed(0)
+        domain = F.normalize(torch.randn(32, generator=g), dim=0)
+        B = 4
+        texts, imgs = [], []
+        for _ in range(B):
+            u = F.normalize(torch.randn(32, generator=g), dim=0)
+            t = F.normalize(
+                domain + 0.3 * u + 0.05 * torch.randn(10, 32, generator=g), dim=-1
+            )
+            ct = F.normalize(
+                domain + 0.3 * u + 0.05 * torch.randn(4, 32, generator=g), dim=-1
+            )
+            bg = F.normalize(
+                domain + 0.02 * torch.randn(30, 32, generator=g), dim=-1
+            )
+            texts.append(t)
+            imgs.append(torch.cat([ct, bg], 0))
+
+        S0 = build_late_interaction_matrix(texts, imgs)
+        gap0 = float(
+            S0.diag().mean() - (S0.sum() - S0.diag().sum()) / (B * (B - 1))
+        )
+        center = mean_unit_token_center(texts, imgs)
+        tc = apply_score_center(texts, center)
+        ic = apply_score_center(imgs, center)
+        S1 = build_late_interaction_matrix(tc, ic, query_topk=6)
+        gap1 = float(
+            S1.diag().mean() - (S1.sum() - S1.diag().sum()) / (B * (B - 1))
+        )
+        self.assertLess(gap0, 0.02)
+        self.assertGreater(gap1, gap0 + 0.03)
+
+    def test_contrastive_with_score_center_beats_unccentered(self):
+        g = torch.Generator().manual_seed(1)
+        domain = F.normalize(torch.randn(24, generator=g), dim=0)
+        B = 4
+        texts, imgs = [], []
+        for _ in range(B):
+            u = F.normalize(torch.randn(24, generator=g), dim=0)
+            texts.append(
+                F.normalize(
+                    domain + 0.25 * u + 0.05 * torch.randn(8, 24, generator=g),
+                    dim=-1,
+                )
+            )
+            imgs.append(
+                F.normalize(
+                    domain + 0.25 * u + 0.05 * torch.randn(16, 24, generator=g),
+                    dim=-1,
+                )
+            )
+        loss0 = contrastive_late_interaction_loss(
+            texts, imgs, temperature=0.07, score_center=False, query_topk=0
+        )
+        loss1 = contrastive_late_interaction_loss(
+            texts, imgs, temperature=0.07, score_center=True, query_topk=4
+        )
+        self.assertLess(float(loss1), float(loss0))
+
+    def test_query_topk_matrix_finite(self):
+        q = _rand_tokens(2, [6, 4], dim=8, seed=3)
+        d = _rand_tokens(3, [5, 5, 2], dim=8, seed=4)
+        S = build_late_interaction_matrix(q, d, query_topk=2)
+        self.assertEqual(tuple(S.shape), (2, 3))
+        self.assertTrue(torch.isfinite(S).all())
+
+
+class TestGapHingeLoss(unittest.TestCase):
+    def test_zero_when_gap_above_margin(self):
+        from trisearch_models.training import gap_hinge_loss
+
+        # Positives on diagonal clearly best
+        scores = torch.full((3, 3), -1.0)
+        scores.fill_diagonal_(5.0)
+        labels = torch.arange(3)
+        self.assertAlmostEqual(
+            float(gap_hinge_loss(scores, labels, margin=0.0)), 0.0, places=5
+        )
+
+    def test_positive_when_gap_negative(self):
+        from trisearch_models.training import gap_hinge_loss
+
+        # Positive is worst column
+        scores = torch.zeros(2, 4)
+        scores[:, 0] = -2.0
+        scores[0, 1] = 3.0
+        scores[1, 2] = 3.0
+        labels = torch.zeros(2, dtype=torch.long)
+        loss = gap_hinge_loss(scores, labels, margin=0.0)
+        self.assertGreater(float(loss), 0.0)
+
+    def test_gap_weight_improves_negative_gap_setup(self):
+        """CE alone may leave neg gap; gap hinge should reduce it under SGD."""
+        g = torch.Generator().manual_seed(0)
+        domain = F.normalize(torch.randn(32, generator=g), dim=0)
+        B = 4
+        # Free centers: start with slight mismatch structure
+        centers = F.normalize(
+            domain + 0.05 * torch.randn(B, 32, generator=g), dim=-1
+        ).clone().requires_grad_(True)
+        opt = torch.optim.SGD([centers], lr=2.0)
+
+        def tokens_from(c):
+            t = [
+                F.normalize(c[i] + 0.05 * torch.randn(6, 32), dim=-1)
+                for i in range(B)
+            ]
+            im = [
+                F.normalize(c[i] + 0.05 * torch.randn(8, 32), dim=-1)
+                for i in range(B)
+            ]
+            return t, im
+
+        t0, i0 = tokens_from(centers.detach())
+        _, m0 = contrastive_late_interaction_loss(
+            t0, i0, temperature=0.07, score_center=True,
+            gap_weight=0.0, return_metrics=True,
+        )
+        for _ in range(40):
+            opt.zero_grad()
+            t, im = tokens_from(centers)
+            loss = contrastive_late_interaction_loss(
+                t, im, temperature=0.07, score_center=True,
+                gap_weight=2.0, gap_margin=0.0, return_metrics=False,
+            )
+            loss.backward()
+            opt.step()
+        t1, i1 = tokens_from(centers.detach())
+        _, m1 = contrastive_late_interaction_loss(
+            t1, i1, temperature=0.07, score_center=True,
+            gap_weight=0.0, return_metrics=True,
+        )
+        self.assertGreater(m1["score_gap"], m0["score_gap"] - 0.5)
+        # After training with gap hinge, gap should be non-negative for easy free case
+        self.assertGreater(m1["score_gap"], -0.1)
+
+
 class TestBankPolicyB(unittest.TestCase):
     def test_snapshot_is_independent_of_later_enqueues(self):
         bank = EmbeddingMemoryBank(capacity=8)
@@ -309,7 +517,7 @@ class TestBackgroundPatchDrop(unittest.TestCase):
 
 class TestRandomPatchDropAndShift(unittest.TestCase):
     def test_default_drop_prob(self):
-        self.assertAlmostEqual(DEFAULT_VISION_PATCH_DROP_PROB, 0.40)
+        self.assertAlmostEqual(DEFAULT_VISION_PATCH_DROP_PROB, 0.15)
 
     def test_random_drop_reduces_count_when_training(self):
         tokens = torch.randn(100, 8)
@@ -478,11 +686,11 @@ class TestEmbeddingGeometry(unittest.TestCase):
         iso = F.normalize(torch.randn(64, 128, generator=g), dim=-1)
         loss_cone, m_cone = embedding_geometry_loss(
             cone, var_weight=0.0, vec_mean_weight=0.0, mag_floor_weight=0.0,
-            max_abs_weight=0.0,
+            max_abs_weight=0.0, uniformity_weight=0.0,
         )
         loss_iso, m_iso = embedding_geometry_loss(
             iso, var_weight=0.0, vec_mean_weight=0.0, mag_floor_weight=0.0,
-            max_abs_weight=0.0,
+            max_abs_weight=0.0, uniformity_weight=0.0,
         )
         self.assertGreater(m_cone["geo_mu_norm"], m_iso["geo_mu_norm"])
         self.assertGreater(float(loss_cone), float(loss_iso))
@@ -501,6 +709,7 @@ class TestEmbeddingGeometry(unittest.TestCase):
             vec_mean_weight=0.0,
             mag_floor_weight=0.0,
             max_abs_weight=0.0,
+            uniformity_weight=0.0,
             var_ratio=0.5,
         )
         self.assertGreater(m["geo_var"], 0.0)
@@ -520,6 +729,7 @@ class TestEmbeddingGeometry(unittest.TestCase):
             vec_mean_weight=1.0,
             mag_floor_weight=0.0,
             max_abs_weight=0.0,
+            uniformity_weight=0.0,
         )
         _, m_bal = embedding_geometry_loss(
             balanced,
@@ -528,6 +738,7 @@ class TestEmbeddingGeometry(unittest.TestCase):
             vec_mean_weight=1.0,
             mag_floor_weight=0.0,
             max_abs_weight=0.0,
+            uniformity_weight=0.0,
         )
         self.assertGreater(m_neg["geo_vec_mean"], m_bal["geo_vec_mean"])
 
@@ -545,9 +756,128 @@ class TestEmbeddingGeometry(unittest.TestCase):
             mag_floor=0.05,
             mag_floor_weight=1.0,
             max_abs_weight=0.0,
+            uniformity_weight=0.0,
         )
         self.assertGreater(m["geo_mag_floor"], 0.0)
         self.assertGreater(float(loss), 0.0)
+
+    def test_uniformity_lower_when_spread(self):
+        from trisearch_models.training import embedding_geometry_loss
+
+        g = torch.Generator().manual_seed(1)
+        # Collapsed: all near same direction → uniformity closer to 0
+        base = F.normalize(torch.randn(1, 64, generator=g), dim=-1)
+        collapsed = F.normalize(
+            base.expand(48, -1) + 1e-3 * torch.randn(48, 64, generator=g), dim=-1
+        )
+        spread = F.normalize(torch.randn(48, 64, generator=g), dim=-1)
+        loss_c, m_c = embedding_geometry_loss(
+            collapsed,
+            center_weight=0.0,
+            var_weight=0.0,
+            vec_mean_weight=0.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+            uniformity_weight=1.0,
+        )
+        loss_s, m_s = embedding_geometry_loss(
+            spread,
+            center_weight=0.0,
+            var_weight=0.0,
+            vec_mean_weight=0.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+            uniformity_weight=1.0,
+        )
+        # Raw W&I: more spread → more negative
+        self.assertLess(m_s["geo_uniformity"], m_c["geo_uniformity"])
+        # Non-neg pen: collapsed ≈1, spread ≪1; loss uses pen (always ≥ 0)
+        self.assertGreater(m_c["geo_uniformity_pen"], m_s["geo_uniformity_pen"])
+        self.assertGreaterEqual(float(loss_c), 0.0)
+        self.assertGreaterEqual(float(loss_s), 0.0)
+        self.assertGreater(float(loss_c), float(loss_s))
+
+    def test_geo_loss_never_negative(self):
+        from trisearch_models.training import embedding_geometry_loss
+
+        for seed in range(5):
+            g = torch.Generator().manual_seed(seed)
+            v = F.normalize(torch.randn(32, 64, generator=g), dim=-1)
+            loss, _ = embedding_geometry_loss(v)
+            self.assertGreaterEqual(float(loss), 0.0)
+
+    def test_geo_square_soft_when_small(self):
+        """Squaring: tiny badness → negligible; large badness → amplified."""
+        raw_small = torch.tensor(0.2)
+        raw_large = torch.tensor(2.0)
+        self.assertLess(float(raw_small**2), float(raw_small))
+        self.assertGreater(float(raw_large**2), float(raw_large))
+
+    def test_prefix_ema_not_unit_normalized(self):
+        """Raw EMA prefix must not be L2-normalized (would floor center ~0.25)."""
+        from trisearch_models.training import embedding_geometry_loss
+
+        g = torch.Generator().manual_seed(2)
+        iso = F.normalize(torch.randn(64, 256, generator=g), dim=-1)
+        # Small raw mean (isotropic history)
+        ema_raw = iso.mean(0) * 0.05
+        # Buggy unit EMA
+        ema_unit = F.normalize(ema_raw, dim=-1)
+        _, m_raw = embedding_geometry_loss(
+            iso,
+            ema_mean=ema_raw,
+            var_weight=0.0,
+            vec_mean_weight=0.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+            uniformity_weight=0.0,
+        )
+        _, m_unit = embedding_geometry_loss(
+            iso,
+            ema_mean=ema_unit,
+            var_weight=0.0,
+            vec_mean_weight=0.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+            uniformity_weight=0.0,
+        )
+        self.assertLess(m_raw["geo_center"], 0.05)
+        self.assertGreater(m_unit["geo_center"], 0.2)
+
+    def test_renormed_pool_detects_sample_cone(self):
+        """Mean-pool without renorm understates sample-level cone; renorm fixes it."""
+        from trisearch_models.training import (
+            embedding_geometry_loss,
+            mean_pool_token_list,
+        )
+
+        g = torch.Generator().manual_seed(3)
+        c = F.normalize(torch.randn(1, 128, generator=g), dim=-1)
+        seqs = [
+            F.normalize(c + 0.1 * torch.randn(40, 128, generator=g), dim=-1)
+            for _ in range(4)
+        ]
+        pooled_raw = mean_pool_token_list(seqs)
+        assert pooled_raw is not None
+        pooled_unit = F.normalize(pooled_raw.float(), dim=-1)
+        _, m_raw = embedding_geometry_loss(
+            pooled_raw,
+            var_weight=0.0,
+            vec_mean_weight=0.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+            uniformity_weight=0.0,
+        )
+        _, m_unit = embedding_geometry_loss(
+            pooled_unit,
+            var_weight=0.0,
+            vec_mean_weight=0.0,
+            mag_floor_weight=0.0,
+            max_abs_weight=0.0,
+            uniformity_weight=0.0,
+        )
+        self.assertGreater(m_unit["geo_mu_norm"], m_raw["geo_mu_norm"])
+        self.assertGreater(m_unit["geo_mu_norm"], 0.8)
 
     def test_gradients_flow(self):
         from trisearch_models.training import embedding_geometry_loss
@@ -590,6 +920,7 @@ class TestEmbeddingGeometry(unittest.TestCase):
             sig.parameters["embedding_geo_weight"].default,
             DEFAULT_EMBEDDING_GEO_WEIGHT,
         )
+        self.assertFalse(sig.parameters["geo_after_unfreeze"].default)
 
 
 class TestMatryoshkaPrefixes(unittest.TestCase):

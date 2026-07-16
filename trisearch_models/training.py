@@ -41,36 +41,57 @@ TEXT_COMPONENT = "text_model"
 PROJECTION_FILE = "projection_heads.pt"
 TRAINING_STATE_FILE = "training_state.pt"
 CONFIG_FILE = "stage1_config.json"
-DEFAULT_MAX_INPUT_TOKENS = 256
+# Stage-1 captions are short; 64 avoids mean-MaxSim dilution from long generic tails.
+DEFAULT_MAX_INPUT_TOKENS = 64
 # Prefix dims only — full embed dim is trained by the main contrastive terms.
 # Including 1024 here double-counted full-dim CE and starved small prefixes.
 DEFAULT_MATRYOSHKA_DIMS = (64, 128, 256, 512)
 # Soft MaxSim: τ_s * logsumexp(sim / τ_s). Smaller τ_s → closer to hard max.
-DEFAULT_SOFT_MAXSIM_TEMPERATURE = 0.05
+DEFAULT_SOFT_MAXSIM_TEMPERATURE = 0.03
 # Caption token-Jaccard above this → treat as non-negative (not a false neg).
 DEFAULT_MULTI_POSITIVE_JACCARD = 0.5
 # Keep top fraction of SigLIP patches by pre-norm L2 (drop background).
 DEFAULT_VISION_PATCH_KEEP_RATIO = 0.75
-# Train-only: randomly drop this fraction of remaining patches after L2 keep.
-DEFAULT_VISION_PATCH_DROP_PROB = 0.40
+# Mild spatial dropout; high values (0.3–0.4) weakened content signal in collapse runs.
+DEFAULT_VISION_PATCH_DROP_PROB = 0.15
+# Merge vision patches into this many similarity centroids before MaxSim (0 = off).
+# Cuts redundant background tokens that make MaxSim match every image equally.
+DEFAULT_VISION_MERGE_TOKENS = 8
+# Softmax temperature for soft assignment into merge centroids.
+DEFAULT_VISION_MERGE_ASSIGN_TEMPERATURE = 0.05
+# Subtract detached batch mean of unit tokens before InfoNCE (kills domain cone).
+DEFAULT_SCORE_CENTER = True
+# Mean only the top-k query-token MaxSims (0 = mean all). Drops stopword-like tokens.
+DEFAULT_QUERY_MAXSIM_TOPK = 8
 # Train-only: random integer translate in [-max, max] pixels (reflect pad).
 DEFAULT_IMAGE_SHIFT_MAX = 18
 # Train-only geometric aug (flip / rotate / mild scale-stretch + pad fill).
 DEFAULT_IMAGE_HFLIP_PROB = 0.5
 DEFAULT_IMAGE_MAX_ROTATE_DEG = 30.0
-DEFAULT_IMAGE_SCALE_MIN = 0.85
+DEFAULT_IMAGE_SCALE_MIN = 0.75
 DEFAULT_IMAGE_SCALE_MAX = 1.05
 # "random" | "mean" | "reflect" fill for rotate/scale gaps.
 DEFAULT_IMAGE_FILL_MODE = "random"
-# Penalize diffuse positive-pair heatmaps (normalized entropy of patch MaxSim).
-DEFAULT_HEATMAP_SPARSITY_WEIGHT = 0.1
+# Heatmap sparsity stuck ~1.0 and added noise; off unless debugging demos.
+DEFAULT_HEATMAP_SPARSITY_WEIGHT = 0.0
 DEFAULT_HEATMAP_SPARSITY_TEMPERATURE = 0.07
+# Square normalized-entropy badness (same idea as geo_square): soft when already
+# sparse, quadratic shove on diffuse MaxSim heatmaps. Entropy is already in [0,1].
+DEFAULT_HEATMAP_SPARSITY_SQUARE = True
 # Top-k hardest bank docs kept per query as InfoNCE negatives (0 = use full bank).
 DEFAULT_HARD_BANK_NEGATIVES = 32
-# Embedding geometry regularizer (anti-cone / isotropy). Overall scale.
-DEFAULT_EMBEDDING_GEO_WEIGHT = 0.05
-DEFAULT_GEO_CENTER_WEIGHT = 1.0
-DEFAULT_GEO_VAR_WEIGHT = 1.0
+# Flush FIFO bank periodically so a collapsed stretch cannot poison all negatives.
+DEFAULT_BANK_CLEAR_STEPS = 250
+# Direct margin on score_gap = mean(pos) - mean(finite negs) after /temp + hard-k.
+# Hinge ReLU(margin - gap): 0 when gap ≥ margin; pushes out of negative-gap regime.
+DEFAULT_GAP_LOSS_WEIGHT = 1.0
+DEFAULT_GAP_MARGIN = 0.0
+
+# Embedding geometry regularizer (anti-cone / isotropy).
+# InfoNCE alone does *not* absolute-repel embeddings — only ranks pos vs negs.
+DEFAULT_EMBEDDING_GEO_WEIGHT = 0.4
+DEFAULT_GEO_CENTER_WEIGHT = 2.0
+DEFAULT_GEO_VAR_WEIGHT = 4.0
 DEFAULT_GEO_VEC_MEAN_WEIGHT = 0.25
 DEFAULT_GEO_MAG_FLOOR = 0.05
 DEFAULT_GEO_MAG_FLOOR_WEIGHT = 0.1
@@ -79,10 +100,34 @@ DEFAULT_GEO_VAR_RATIO = 0.5
 # Soft penalty when |coord| exceeds this * 1/sqrt(D) (stops single-dim domination).
 DEFAULT_GEO_MAX_ABS_RATIO = 4.0
 DEFAULT_GEO_MAX_ABS_WEIGHT = 0.1
+# Wang & Isola uniformity: log E exp(-t ||xi-xj||²) on the unit sphere.
+DEFAULT_GEO_UNIFORMITY_WEIGHT = 1.0
+DEFAULT_GEO_UNIFORMITY_T = 2.0
+DEFAULT_GEO_UNIFORMITY_MAX_SAMPLES = 256
+# Prefer sample-level (renormed sequence means) over token-row dilution.
+DEFAULT_GEO_TOKEN_WEIGHT = 0.3
+DEFAULT_GEO_POOL_WEIGHT = 0.7
 # Also regularize a Matryoshka prefix (re-normalized).
 DEFAULT_GEO_PREFIX_DIM = 256
 DEFAULT_GEO_PREFIX_WEIGHT = 0.5
 DEFAULT_GEO_EMA_MOMENTUM = 0.99
+# Geo during freeze is OK for monitoring + weak proj shaping; set True to defer.
+DEFAULT_GEO_AFTER_UNFREEZE = False
+# Square non-negative geo badness: soft when near-isotropic, hard shove on cones.
+# Guarantees geo term ≥ 0 so total loss cannot crash from negative geo.
+DEFAULT_GEO_SQUARE = True
+
+# Optimizer / schedule defaults (wired by train_stage1 CLI).
+DEFAULT_BATCH_SIZE = 4
+DEFAULT_GRAD_ACCUM_STEPS = 8  # effective batch 32
+DEFAULT_LEARNING_RATE = 1e-5
+DEFAULT_PROJECTION_LEARNING_RATE = 5e-5
+DEFAULT_MAX_STEPS = 5000
+DEFAULT_MATRYOSHKA_WEIGHT = 0.25
+DEFAULT_TEMPERATURE = 0.07
+DEFAULT_FREEZE_BACKBONE_RATIO = 0.05
+DEFAULT_SAVE_STEPS = 200
+DEFAULT_LOGGING_STEPS = 10
 
 
 def pad_token_sequences(
@@ -131,11 +176,154 @@ def soft_or_hard_maxsim(
     return tau * torch.logsumexp(sim / tau, dim=dim)
 
 
+def _mean_topk_query_maxsim(
+    per_q: torch.Tensor,
+    q_mask: torch.Tensor,
+    query_topk: int,
+) -> torch.Tensor:
+    """Mean of top-``query_topk`` per-query MaxSims; ignore padded query slots.
+
+    ``per_q``: ``(Bq, Bd, Tq)``, ``q_mask``: ``(Bq, Tq)``.
+    """
+    if query_topk is None or int(query_topk) <= 0:
+        q_mask_f = q_mask.to(dtype=per_q.dtype).unsqueeze(1)  # (Bq, 1, Tq)
+        per_q = per_q * q_mask_f
+        denom = q_mask_f.sum(dim=-1).clamp_min(1.0)
+        return per_q.sum(dim=-1) / denom
+
+    k = int(query_topk)
+    # Mask padded query positions so they never enter the top-k.
+    neg = torch.finfo(per_q.dtype).min
+    if not torch.isfinite(torch.tensor(neg, dtype=per_q.dtype)):
+        neg = -1e4
+    else:
+        neg = max(float(neg), -1e4)
+    masked = per_q.masked_fill(~q_mask.unsqueeze(1), neg)
+    # k cannot exceed Tq; also cannot exceed valid count per row.
+    tq = masked.shape[-1]
+    k_eff = min(k, tq)
+    topv = masked.topk(k_eff, dim=-1).values  # (Bq, Bd, k_eff)
+    # Valid top entries are finite and not the pad fill (use q_mask counts).
+    n_valid = q_mask.to(dtype=per_q.dtype).sum(dim=-1).clamp_min(1.0)  # (Bq,)
+    k_row = n_valid.clamp_max(float(k_eff)).unsqueeze(1)  # (Bq, 1)
+    # Zero-out slots beyond n_valid for short sequences (topk may pull pad).
+    # Count how many topv are real: topv > neg/2 roughly.
+    real = topv > (0.5 * neg)
+    # Prefer exact: rank among valid only — sum real values / min(k, n_valid)
+    topv = topv.masked_fill(~real, 0.0)
+    denom = real.to(dtype=per_q.dtype).sum(dim=-1).clamp_min(1.0)
+    # Also clamp denom by k_row for safety
+    denom = torch.minimum(denom, k_row.expand_as(denom))
+    return topv.sum(dim=-1) / denom
+
+
+def farthest_point_sample_indices(
+    unit_tokens: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    """Greedy FPS indices on unit vectors ``(N, D)`` → ``(k,)`` long."""
+    n = unit_tokens.shape[0]
+    k = min(max(int(k), 1), n)
+    # Start from max L2 of *pre-unit* proxy: use first dim energy of unit (stable).
+    # Prefer token farthest from 0 in original if we only have units: max ||x|| is 1;
+    # start from index 0 after sorting by max pairwise diversity seed = argmax variance.
+    # Use token with largest coordinate span as seed.
+    seed = int(unit_tokens.detach().float().abs().max(dim=-1).values.argmax().item())
+    chosen: list[int] = [seed]
+    # sims[i,j] = cos
+    sims = unit_tokens @ unit_tokens.T
+    for _ in range(k - 1):
+        # For each point, similarity to nearest chosen; pick the smallest.
+        max_sim = sims[:, chosen].max(dim=1).values.clone()
+        for c in chosen:
+            max_sim[c] = 2.0  # exclude
+        chosen.append(int(max_sim.argmin().item()))
+    return torch.tensor(chosen, device=unit_tokens.device, dtype=torch.long)
+
+
+def merge_tokens_by_similarity(
+    tokens: torch.Tensor,
+    k: int = DEFAULT_VISION_MERGE_TOKENS,
+    *,
+    assign_temperature: float = DEFAULT_VISION_MERGE_ASSIGN_TEMPERATURE,
+) -> torch.Tensor:
+    """Reduce ``(N, D)`` tokens to ``(k, D)`` similarity centroids.
+
+    Farthest-point seeds (detached) + soft assignment so gradients flow into
+    all patches. Merges redundant background patches that otherwise dominate
+    MaxSim against every image equally.
+    """
+    if tokens.ndim == 1:
+        tokens = tokens.unsqueeze(0)
+    if tokens.numel() == 0:
+        return tokens
+    n = tokens.shape[0]
+    k = min(max(int(k), 1), n)
+    if k >= n:
+        return tokens
+
+    raw = tokens.float()
+    x = F.normalize(raw, dim=-1)
+    with torch.no_grad():
+        idx = farthest_point_sample_indices(x, k)
+        anchors = x.index_select(0, idx).clone()  # (k, D)
+    # Soft assignment over clusters for each token.
+    tau = max(float(assign_temperature), 1e-4)
+    logits = (x @ anchors.T) / tau  # (N, k)
+    weights = torch.softmax(logits, dim=1)
+    # Pool in *raw* space so bank/Matryoshka still see pre-norm magnitudes.
+    centroids = weights.T @ raw  # (k, D)
+    return centroids.to(dtype=tokens.dtype)
+
+
+def mean_unit_token_center(
+    *token_lists: list[torch.Tensor],
+) -> torch.Tensor | None:
+    """Detached mean of all unit tokens across the given lists (domain cone)."""
+    parts: list[torch.Tensor] = []
+    for tokens in token_lists:
+        for t in tokens:
+            if t is None or t.numel() == 0:
+                continue
+            x = t.detach()
+            if x.ndim == 1:
+                x = x.unsqueeze(0)
+            parts.append(x.float().reshape(-1, x.shape[-1]))
+    if not parts:
+        return None
+    return torch.cat(parts, dim=0).mean(dim=0)
+
+
+def apply_score_center(
+    tokens: list[torch.Tensor],
+    center: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Spherical center: ``normalize(v - μ)`` per token row (μ detached)."""
+    if center is None:
+        return tokens
+    c = center.detach().float()
+    out: list[torch.Tensor] = []
+    for t in tokens:
+        if t is None or t.numel() == 0:
+            out.append(t)
+            continue
+        x = t.float()
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+            single = True
+        else:
+            single = False
+        y = F.normalize(x - c.to(device=x.device), dim=-1).to(dtype=t.dtype)
+        out.append(y.squeeze(0) if single else y)
+    return out
+
+
 def differentiable_late_interaction_score(
     query: torch.Tensor,
     doc: torch.Tensor,
     *,
     soft_maxsim_temperature: float | None = None,
+    query_topk: int = 0,
 ) -> torch.Tensor:
     """Mean-MaxSim: mean over query tokens of max cosine to any doc token.
 
@@ -145,6 +333,9 @@ def differentiable_late_interaction_score(
 
     When ``soft_maxsim_temperature`` is set (>0), hard max is replaced by
     soft MaxSim (τ logsumexp).
+
+    ``query_topk`` > 0 averages only the top-k query-token MaxSims (drops
+    stopword-like tokens that match every document's background).
     """
     if query.numel() == 0 or doc.numel() == 0:
         return query.new_zeros(())
@@ -156,6 +347,9 @@ def differentiable_late_interaction_score(
     per_q = soft_or_hard_maxsim(
         sim, soft_temperature=soft_maxsim_temperature, dim=1
     )
+    k = int(query_topk) if query_topk else 0
+    if k > 0 and k < per_q.numel():
+        per_q = per_q.topk(k).values
     return per_q.mean()
 
 
@@ -164,10 +358,12 @@ def build_late_interaction_matrix(
     doc_tokens: list[torch.Tensor],
     *,
     soft_maxsim_temperature: float | None = None,
+    query_topk: int = 0,
 ) -> torch.Tensor:
     """Pairwise mean-MaxSim matrix of shape ``(len(queries), len(docs))``.
 
     Vectorized via padded tensors + einsum (same math as the per-pair loop).
+    ``query_topk`` > 0 → mean only the strongest query-token MaxSims.
     """
     if not query_tokens or not doc_tokens:
         raise ValueError(
@@ -195,11 +391,7 @@ def build_late_interaction_matrix(
         sim, soft_temperature=soft_maxsim_temperature, dim=-1
     )  # (Bq, Bd, Tq)
 
-    q_mask_f = q_mask.to(dtype=per_q.dtype).unsqueeze(1)  # (Bq, 1, Tq)
-    # Zero-out padded query positions; mean over valid query tokens.
-    per_q = per_q * q_mask_f
-    denom = q_mask_f.sum(dim=-1).clamp_min(1.0)  # (Bq, 1)
-    return per_q.sum(dim=-1) / denom
+    return _mean_topk_query_maxsim(per_q, q_mask, int(query_topk or 0))
 
 
 def caption_token_jaccard(a: str, b: str) -> float:
@@ -647,6 +839,9 @@ def embedding_geometry_loss(
     mag_floor_weight: float = DEFAULT_GEO_MAG_FLOOR_WEIGHT,
     max_abs_ratio: float = DEFAULT_GEO_MAX_ABS_RATIO,
     max_abs_weight: float = DEFAULT_GEO_MAX_ABS_WEIGHT,
+    uniformity_weight: float = DEFAULT_GEO_UNIFORMITY_WEIGHT,
+    uniformity_t: float = DEFAULT_GEO_UNIFORMITY_T,
+    uniformity_max_samples: int = DEFAULT_GEO_UNIFORMITY_MAX_SAMPLES,
     ema_blend: float = 0.5,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Anti-cone / isotropy regularizer on L2-normalized embeddings.
@@ -654,13 +849,15 @@ def embedding_geometry_loss(
     Parameters
     ----------
     normalized
-        ``(N, D)`` unit vectors (token-level and/or mean-pooled). Gradients flow.
+        ``(N, D)`` **unit** vectors. Gradients flow. Callers must L2-normalize
+        mean-pooled rows before passing them here.
     raw
         Optional matching ``(N, D)`` *pre-norm* projections for a magnitude floor
         (stops dead projections before normalize).
     ema_mean
         Optional detached running mean ``(D,)`` mixed into the center target so
         small micro-batches still see a stable cone direction to cancel.
+        Must be a **raw mean of unit vectors** (not itself unit-normalized).
 
     Terms
     -----
@@ -668,23 +865,32 @@ def embedding_geometry_loss(
       dims are not permanently biased (e.g. all v₀ ≈ 0.05).
     * **variance** — hinge below ``var_ratio / sqrt(D)`` per dim (VICReg-style).
     * **vec_mean** — ``E[(mean_d v_d)²]`` soft anti all-positive / all-negative.
+    * **uniformity** — non-negative collapse penalty ``exp(L_W&I)`` where
+      ``L_W&I = log E_{i≠j} exp(-t ||xi-xj||²)`` (≈1 when collapsed, ≈0 when spread).
+      Always ≥ 0 so geo cannot drive total train loss negative.
     * **mag_floor** — pre-norm ``ReLU(ε - ||z||)`` so projections do not die.
     * **max_abs** — soft penalty when any |coord| ≫ isotropic scale.
+
+    All terms are ≥ 0 (a "badness" score). Callers may square the aggregate for
+    soft-when-small / hard-when-large behaviour.
     """
+    empty_metrics = {
+        "geo_center": 0.0,
+        "geo_var": 0.0,
+        "geo_vec_mean": 0.0,
+        "geo_uniformity": 0.0,
+        "geo_uniformity_pen": 0.0,
+        "geo_mag_floor": 0.0,
+        "geo_max_abs": 0.0,
+        "geo_mu_norm": 0.0,
+        "geo_min_std": 0.0,
+        "geo_mean_abs_mu": 0.0,
+    }
     if normalized.ndim == 1:
         normalized = normalized.unsqueeze(0)
     if normalized.numel() == 0 or normalized.shape[0] == 0:
         zero = normalized.new_zeros(())
-        return zero, {
-            "geo_center": 0.0,
-            "geo_var": 0.0,
-            "geo_vec_mean": 0.0,
-            "geo_mag_floor": 0.0,
-            "geo_max_abs": 0.0,
-            "geo_mu_norm": 0.0,
-            "geo_min_std": 0.0,
-            "geo_mean_abs_mu": 0.0,
-        }
+        return zero, dict(empty_metrics)
 
     # Work in fp32 for stable stats; cast loss back to normalized dtype.
     v = normalized.float()
@@ -696,6 +902,7 @@ def embedding_geometry_loss(
     batch_mu = v.mean(dim=0)
     if ema_mean is not None and ema_mean.numel() == dim:
         # Blend live mean with detached EMA so B=2 still sees the cone.
+        # EMA is a raw mean of unit vectors (‖ema‖ ≤ 1), not a unit direction.
         mu = (1.0 - float(ema_blend)) * batch_mu + float(ema_blend) * ema_mean.float().detach()
     else:
         mu = batch_mu
@@ -703,10 +910,37 @@ def embedding_geometry_loss(
 
     # Unbiased=False: small-N friendly; matches VICReg practice.
     std = v.std(dim=0, unbiased=False).clamp_min(0.0)
-    var_hinge = F.relu(var_target - std).pow(2).mean()
+    # Mean hinge over dims under-taxes a few dead axes; also hinge on min std.
+    var_per_dim = F.relu(var_target - std).pow(2)
+    var_hinge = var_per_dim.mean() + var_per_dim.max()
 
     vec_mean = v.mean(dim=-1)
     vec_mean_pen = (vec_mean * vec_mean).mean()
+
+    # Uniformity (Wang & Isola 2020) raw log-exp is ≤ 0 when spread and ~0 when
+    # collapsed — that drove total train loss negative. Convert to a non-negative
+    # collapse penalty: exp(L_W&I) ∈ (0, 1], ≈1 collapsed, ≈0 well-spread.
+    unif_raw = v.new_zeros(())
+    unif_pen = v.new_zeros(())
+    if float(uniformity_weight) > 0.0 and n >= 2:
+        max_s = max(int(uniformity_max_samples), 2)
+        if n > max_s:
+            # Deterministic stride subsample (grad-safe; no randperm graph issues).
+            idx = torch.linspace(0, n - 1, steps=max_s, device=v.device).long()
+            v_u = v.index_select(0, idx)
+        else:
+            v_u = v
+        n_u = v_u.shape[0]
+        # ||xi-xj||² = 2 - 2 xi·xj for unit vectors.
+        sim = v_u @ v_u.T
+        sq = (2.0 - 2.0 * sim).clamp_min(0.0)
+        eye = torch.eye(n_u, dtype=torch.bool, device=v.device)
+        t = float(uniformity_t)
+        unif_raw = torch.log(
+            torch.exp((-t) * sq.masked_select(~eye)).mean().clamp_min(1e-8)
+        )
+        # Clamp before exp for bf16 safety; still non-negative.
+        unif_pen = torch.exp(unif_raw.clamp(max=20.0))
 
     mag_pen = v.new_zeros(())
     if (
@@ -726,10 +960,12 @@ def embedding_geometry_loss(
     if max_abs_weight > 0.0 and max_abs_target > 0.0:
         max_abs_pen = F.relu(v.abs().max(dim=-1).values - max_abs_target).pow(2).mean()
 
+    # All terms ≥ 0: a pure "geometry badness" score (no negative free lunch).
     total = (
         float(center_weight) * center
         + float(var_weight) * var_hinge
         + float(vec_mean_weight) * vec_mean_pen
+        + float(uniformity_weight) * unif_pen
         + float(mag_floor_weight) * mag_pen
         + float(max_abs_weight) * max_abs_pen
     )
@@ -739,6 +975,9 @@ def embedding_geometry_loss(
         "geo_center": float(center.detach()),
         "geo_var": float(var_hinge.detach()),
         "geo_vec_mean": float(vec_mean_pen.detach()),
+        # Raw W&I (can be negative) for debugging; pen is what enters the loss.
+        "geo_uniformity": float(unif_raw.detach()) if torch.is_tensor(unif_raw) else 0.0,
+        "geo_uniformity_pen": float(unif_pen.detach()) if torch.is_tensor(unif_pen) else 0.0,
         "geo_mag_floor": float(mag_pen.detach()) if torch.is_tensor(mag_pen) else 0.0,
         "geo_max_abs": float(max_abs_pen.detach()) if torch.is_tensor(max_abs_pen) else 0.0,
         "geo_mu_norm": float(batch_mu.detach().norm()),
@@ -769,16 +1008,97 @@ def mean_positive_rank(
     scores: torch.Tensor,
     labels: torch.Tensor | None = None,
 ) -> float:
-    """1-based mean rank of the positive class (1 = best). Lower is better."""
+    """1-based mean rank of the positive class (1 = best). Lower is better.
+
+    Uses **mid-rank for ties**: when many docs share the positive's score
+    (including full collapse where every logit is equal), rank → ``(N+1)/2``
+    instead of optimistically reporting 1. Non-finite scores (``-inf`` from hard
+    bank mining) are ignored so they neither beat nor tie the positive.
+    """
     if scores.ndim != 2 or scores.size(0) == 0:
         return float("nan")
     batch = scores.size(0)
     if labels is None:
         labels = torch.arange(batch, device=scores.device)
     pos = scores.gather(1, labels.view(-1, 1)).squeeze(1)
-    # Ties: count strictly better scores only (optimistic rank).
-    ranks = 1 + (scores > pos.unsqueeze(1)).sum(dim=1).to(dtype=torch.float32)
+    finite = torch.isfinite(scores)
+    # Treat non-finite as "not comparable" (hard-mined bank columns).
+    cmp = scores.masked_fill(~finite, float("-inf"))
+    pos_col = pos.unsqueeze(1)
+    better = (finite & (cmp > pos_col)).sum(dim=1).to(dtype=torch.float32)
+    # Ties include the positive column itself when it is finite.
+    tied = (finite & (cmp == pos_col)).sum(dim=1).to(dtype=torch.float32)
+    # Average rank of a tied group: better + (tied + 1) / 2.
+    ranks = better + (tied + 1.0) * 0.5
     return float(ranks.mean().item())
+
+
+def score_gap_per_row(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiable per-row gap: ``pos - mean(finite negs)`` on logits ``(B, N)``.
+
+    Non-finite scores (hard-mined bank ``-inf``) are excluded from the neg mean.
+    """
+    if scores.ndim != 2 or scores.size(0) == 0:
+        return scores.new_zeros(())
+    pos = scores.gather(1, labels.view(-1, 1)).squeeze(1)
+    eye = torch.zeros_like(scores, dtype=torch.bool)
+    eye.scatter_(1, labels.view(-1, 1), True)
+    neg_mask = torch.isfinite(scores) & ~eye
+    # Zero masked entries; divide by count (grad-safe, no nanmean).
+    neg_sum = scores.masked_fill(~neg_mask, 0.0).sum(dim=1)
+    neg_count = neg_mask.to(dtype=scores.dtype).sum(dim=1).clamp_min(1.0)
+    neg_mean = neg_sum / neg_count
+    return pos - neg_mean
+
+
+def gap_hinge_loss(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    margin: float = DEFAULT_GAP_MARGIN,
+) -> torch.Tensor:
+    """``mean ReLU(margin - gap_i)`` — 0 iff every row has gap ≥ margin.
+
+    Directly trains the logged ``score_gap`` signal (pos above mean hard negs).
+    """
+    gap = score_gap_per_row(scores, labels)
+    if gap.ndim == 0:
+        return gap
+    return F.relu(float(margin) - gap).mean()
+
+
+@torch.no_grad()
+def contrastive_score_margin_metrics(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+) -> dict[str, float]:
+    """Pos vs mean-neg logit stats (after /temperature, after hard-bank mask).
+
+    ``score_gap = mean(pos) - mean(finite off-diagonal)``. Near 0 with high CE
+    means the contrastive head has no ranking signal (collapse / chance).
+    """
+    if scores.ndim != 2 or scores.size(0) == 0:
+        return {
+            "pos_score": float("nan"),
+            "neg_score": float("nan"),
+            "score_gap": float("nan"),
+        }
+    gap = score_gap_per_row(scores, labels)
+    pos = scores.gather(1, labels.view(-1, 1)).squeeze(1)
+    eye = torch.zeros_like(scores, dtype=torch.bool)
+    eye.scatter_(1, labels.view(-1, 1), True)
+    neg_mask = torch.isfinite(scores) & ~eye
+    neg_sum = scores.masked_fill(~neg_mask, 0.0).sum(dim=1)
+    neg_count = neg_mask.to(dtype=scores.dtype).sum(dim=1).clamp_min(1.0)
+    neg_mean = neg_sum / neg_count
+    return {
+        "pos_score": float(pos.mean().item()),
+        "neg_score": float(neg_mean.mean().item()),
+        "score_gap": float(gap.mean().item()),
+    }
 
 
 class EmbeddingMemoryBank:
@@ -941,6 +1261,33 @@ def _expand_non_negative_mask(
     return torch.cat([batch_mask, pad], dim=1)
 
 
+def _maybe_score_center_pair(
+    text_tokens: list[torch.Tensor],
+    image_tokens: list[torch.Tensor],
+    bank_text: list[torch.Tensor],
+    bank_image: list[torch.Tensor],
+    *,
+    score_center: bool,
+) -> tuple[
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[torch.Tensor],
+]:
+    """Subtract detached live-batch mean so MaxSim cannot match a domain cone."""
+    if not score_center:
+        return text_tokens, image_tokens, bank_text, bank_image
+    center = mean_unit_token_center(text_tokens, image_tokens)
+    if center is None:
+        return text_tokens, image_tokens, bank_text, bank_image
+    return (
+        apply_score_center(text_tokens, center),
+        apply_score_center(image_tokens, center),
+        apply_score_center(bank_text, center) if bank_text else bank_text,
+        apply_score_center(bank_image, center) if bank_image else bank_image,
+    )
+
+
 def contrastive_late_interaction_loss(
     text_tokens: list[torch.Tensor],
     image_tokens: list[torch.Tensor],
@@ -951,6 +1298,10 @@ def contrastive_late_interaction_loss(
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
     hard_bank_k: int = 0,
+    query_topk: int = 0,
+    score_center: bool = DEFAULT_SCORE_CENTER,
+    gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
+    gap_margin: float = DEFAULT_GAP_MARGIN,
     return_metrics: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
     """Bidirectional late-interaction InfoNCE with optional memory-bank negatives.
@@ -965,6 +1316,14 @@ def contrastive_late_interaction_loss(
 
     ``hard_bank_k`` keeps only the top-k hardest bank docs per query (see
     ``apply_hard_bank_mining``); live in-batch columns are always kept.
+
+    ``score_center`` subtracts the detached mean of live unit tokens before
+    scoring (removes domain cone so background MaxSim cannot equate all pairs).
+
+    ``query_topk`` averages only the strongest query-token MaxSims.
+
+    ``gap_weight`` / ``gap_margin`` add ``ReLU(margin - score_gap)`` on the same
+    logits as CE (direct training signal for the logged gap).
 
     When ``return_metrics`` is True, also returns mean positive ranks (1 = best)
     averaged over t2i and i2t — useful as a bank-size-invariant health signal.
@@ -984,42 +1343,80 @@ def contrastive_late_interaction_loss(
     if batch < 1:
         raise ValueError("Contrastive loss needs a non-empty batch.")
 
+    text_tokens, image_tokens, bank_text, bank_image = _maybe_score_center_pair(
+        text_tokens,
+        image_tokens,
+        bank_text,
+        bank_image,
+        score_center=score_center,
+    )
+
     labels = torch.arange(batch, device=text_tokens[0].device)
     n_image_docs = batch + len(bank_image)
     n_text_docs = batch + len(bank_text)
     soft_tau = soft_maxsim_temperature
+    q_topk = int(query_topk or 0)
+
+    def _combine_ce_and_gap(
+        scores_a: torch.Tensor,
+        scores_b: torch.Tensor,
+        ce: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gap_w = float(gap_weight)
+        if gap_w <= 0.0:
+            return ce, ce.new_zeros(())
+        g = 0.5 * (
+            gap_hinge_loss(scores_a, labels, margin=gap_margin)
+            + gap_hinge_loss(scores_b, labels, margin=gap_margin)
+        )
+        return ce + gap_w * g, g
 
     if not bank_text and not bank_image:
         scores = build_late_interaction_matrix(
             text_tokens,
             image_tokens,
             soft_maxsim_temperature=soft_tau,
+            query_topk=q_topk,
         ) / temperature
         mask = _expand_non_negative_mask(non_negative_mask, batch, batch)
         loss_t2i = masked_cross_entropy(scores, labels, non_negative_mask=mask)
         # i2t uses the transpose; mask also transposed.
         mask_t = mask.T if mask is not None else None
         loss_i2t = masked_cross_entropy(scores.T, labels, non_negative_mask=mask_t)
-        loss = 0.5 * (loss_t2i + loss_i2t)
+        ce = 0.5 * (loss_t2i + loss_i2t)
+        loss, gap_l = _combine_ce_and_gap(scores, scores.T, ce)
         if not return_metrics:
             return loss
         rank_t2i = mean_positive_rank(scores.detach(), labels)
         rank_i2t = mean_positive_rank(scores.T.detach(), labels)
+        m_t2i = contrastive_score_margin_metrics(scores.detach(), labels)
+        m_i2t = contrastive_score_margin_metrics(scores.T.detach(), labels)
         return loss, {
             "pos_rank_t2i": rank_t2i,
             "pos_rank_i2t": rank_i2t,
             "pos_rank": 0.5 * (rank_t2i + rank_i2t),
             "n_image_docs": float(n_image_docs),
             "n_text_docs": float(n_text_docs),
+            "pos_score": 0.5 * (m_t2i["pos_score"] + m_i2t["pos_score"]),
+            "neg_score": 0.5 * (m_t2i["neg_score"] + m_i2t["neg_score"]),
+            "score_gap": 0.5 * (m_t2i["score_gap"] + m_i2t["score_gap"]),
+            "gap_hinge": float(gap_l.detach()),
+            "contrastive_ce": float(ce.detach()),
         }
 
     image_docs = list(image_tokens) + list(bank_image)
     text_docs = list(text_tokens) + list(bank_text)
     scores_t2i = build_late_interaction_matrix(
-        text_tokens, image_docs, soft_maxsim_temperature=soft_tau
+        text_tokens,
+        image_docs,
+        soft_maxsim_temperature=soft_tau,
+        query_topk=q_topk,
     ) / temperature
     scores_i2t = build_late_interaction_matrix(
-        image_tokens, text_docs, soft_maxsim_temperature=soft_tau
+        image_tokens,
+        text_docs,
+        soft_maxsim_temperature=soft_tau,
+        query_topk=q_topk,
     ) / temperature
     scores_t2i = apply_hard_bank_mining(scores_t2i, batch, hard_bank_k)
     scores_i2t = apply_hard_bank_mining(scores_i2t, batch, hard_bank_k)
@@ -1035,17 +1432,25 @@ def contrastive_late_interaction_loss(
     loss_i2t = masked_cross_entropy(
         scores_i2t, labels, non_negative_mask=mask_i2t
     )
-    loss = 0.5 * (loss_t2i + loss_i2t)
+    ce = 0.5 * (loss_t2i + loss_i2t)
+    loss, gap_l = _combine_ce_and_gap(scores_t2i, scores_i2t, ce)
     if not return_metrics:
         return loss
     rank_t2i = mean_positive_rank(scores_t2i.detach(), labels)
     rank_i2t = mean_positive_rank(scores_i2t.detach(), labels)
+    m_t2i = contrastive_score_margin_metrics(scores_t2i.detach(), labels)
+    m_i2t = contrastive_score_margin_metrics(scores_i2t.detach(), labels)
     return loss, {
         "pos_rank_t2i": rank_t2i,
         "pos_rank_i2t": rank_i2t,
         "pos_rank": 0.5 * (rank_t2i + rank_i2t),
         "n_image_docs": float(n_image_docs),
         "n_text_docs": float(n_text_docs),
+        "pos_score": 0.5 * (m_t2i["pos_score"] + m_i2t["pos_score"]),
+        "neg_score": 0.5 * (m_t2i["neg_score"] + m_i2t["neg_score"]),
+        "score_gap": 0.5 * (m_t2i["score_gap"] + m_i2t["score_gap"]),
+        "gap_hinge": float(gap_l.detach()),
+        "contrastive_ce": float(ce.detach()),
     }
 
 
@@ -1059,6 +1464,10 @@ def text_text_contrastive_loss(
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
     hard_bank_k: int = 0,
+    query_topk: int = 0,
+    score_center: bool = DEFAULT_SCORE_CENTER,
+    gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
+    gap_margin: float = DEFAULT_GAP_MARGIN,
 ) -> torch.Tensor:
     """Query→caption InfoNCE: match own caption; not other captions / distractors / bank.
 
@@ -1075,10 +1484,24 @@ def text_text_contrastive_loss(
             "text-text contrastive loss needs batch_size >= 2 for negatives."
         )
     batch = len(query_tokens)
+    if score_center:
+        center = mean_unit_token_center(
+            query_tokens, caption_tokens, distractor_tokens or []
+        )
+        if center is not None:
+            query_tokens = apply_score_center(query_tokens, center)
+            caption_tokens = apply_score_center(caption_tokens, center)
+            if distractor_tokens:
+                distractor_tokens = apply_score_center(distractor_tokens, center)
+            if bank_docs:
+                bank_docs = apply_score_center(bank_docs, center)
     n_live = batch + len(distractor_tokens)
     all_docs = list(caption_tokens) + list(distractor_tokens) + list(bank_docs)
     scores = build_late_interaction_matrix(
-        query_tokens, all_docs, soft_maxsim_temperature=soft_maxsim_temperature
+        query_tokens,
+        all_docs,
+        soft_maxsim_temperature=soft_maxsim_temperature,
+        query_topk=int(query_topk or 0),
     ) / temperature
     scores = apply_hard_bank_mining(scores, n_live, hard_bank_k)
     labels = torch.arange(scores.size(0), device=scores.device)
@@ -1086,7 +1509,12 @@ def text_text_contrastive_loss(
     mask = _expand_non_negative_mask(
         non_negative_mask, scores.size(1), batch, n_live=n_live
     )
-    return masked_cross_entropy(scores, labels, non_negative_mask=mask)
+    ce = masked_cross_entropy(scores, labels, non_negative_mask=mask)
+    if float(gap_weight) <= 0.0:
+        return ce
+    return ce + float(gap_weight) * gap_hinge_loss(
+        scores, labels, margin=gap_margin
+    )
 
 
 def text_text_matryoshka_loss(
@@ -1101,6 +1529,10 @@ def text_text_matryoshka_loss(
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
     hard_bank_k: int = 0,
+    query_topk: int = 0,
+    score_center: bool = DEFAULT_SCORE_CENTER,
+    gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
+    gap_margin: float = DEFAULT_GAP_MARGIN,
     embed_dim: int = EMBED_DIM,
 ) -> torch.Tensor:
     """Mean of prefix-only query→caption CE (full dim handled by the main term)."""
@@ -1130,6 +1562,10 @@ def text_text_matryoshka_loss(
             soft_maxsim_temperature=soft_maxsim_temperature,
             non_negative_mask=non_negative_mask,
             hard_bank_k=hard_bank_k,
+            query_topk=query_topk,
+            score_center=score_center,
+            gap_weight=gap_weight,
+            gap_margin=gap_margin,
         )
     return loss / total_weight
 
@@ -1146,6 +1582,10 @@ def matryoshka_loss(
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
     hard_bank_k: int = 0,
+    query_topk: int = 0,
+    score_center: bool = DEFAULT_SCORE_CENTER,
+    gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
+    gap_margin: float = DEFAULT_GAP_MARGIN,
     embed_dim: int = EMBED_DIM,
 ) -> torch.Tensor:
     """Mean of prefix-only bidirectional CE (full dim handled by the main term)."""
@@ -1174,6 +1614,10 @@ def matryoshka_loss(
             soft_maxsim_temperature=soft_maxsim_temperature,
             non_negative_mask=non_negative_mask,
             hard_bank_k=hard_bank_k,
+            query_topk=query_topk,
+            score_center=score_center,
+            gap_weight=gap_weight,
+            gap_margin=gap_margin,
         )
     return loss / total_weight
 
@@ -1244,6 +1688,12 @@ class Stage1AlignmentModel(nn.Module):
         multi_positive_jaccard: float = DEFAULT_MULTI_POSITIVE_JACCARD,
         vision_patch_keep_ratio: float = DEFAULT_VISION_PATCH_KEEP_RATIO,
         vision_patch_drop_prob: float = DEFAULT_VISION_PATCH_DROP_PROB,
+        vision_merge_tokens: int = DEFAULT_VISION_MERGE_TOKENS,
+        vision_merge_assign_temperature: float = DEFAULT_VISION_MERGE_ASSIGN_TEMPERATURE,
+        score_center: bool = DEFAULT_SCORE_CENTER,
+        query_maxsim_topk: int = DEFAULT_QUERY_MAXSIM_TOPK,
+        gap_loss_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
+        gap_margin: float = DEFAULT_GAP_MARGIN,
         image_shift_max: int = DEFAULT_IMAGE_SHIFT_MAX,
         image_hflip_prob: float = DEFAULT_IMAGE_HFLIP_PROB,
         image_max_rotate_deg: float = DEFAULT_IMAGE_MAX_ROTATE_DEG,
@@ -1253,6 +1703,7 @@ class Stage1AlignmentModel(nn.Module):
         image_aug_enabled: bool = True,
         heatmap_sparsity_weight: float = DEFAULT_HEATMAP_SPARSITY_WEIGHT,
         heatmap_sparsity_temperature: float = DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
+        heatmap_sparsity_square: bool = DEFAULT_HEATMAP_SPARSITY_SQUARE,
         bank_score_policy: str = "accum_window",
         embedding_geo_weight: float = DEFAULT_EMBEDDING_GEO_WEIGHT,
         geo_center_weight: float = DEFAULT_GEO_CENTER_WEIGHT,
@@ -1263,9 +1714,16 @@ class Stage1AlignmentModel(nn.Module):
         geo_mag_floor_weight: float = DEFAULT_GEO_MAG_FLOOR_WEIGHT,
         geo_max_abs_ratio: float = DEFAULT_GEO_MAX_ABS_RATIO,
         geo_max_abs_weight: float = DEFAULT_GEO_MAX_ABS_WEIGHT,
+        geo_uniformity_weight: float = DEFAULT_GEO_UNIFORMITY_WEIGHT,
+        geo_uniformity_t: float = DEFAULT_GEO_UNIFORMITY_T,
+        geo_uniformity_max_samples: int = DEFAULT_GEO_UNIFORMITY_MAX_SAMPLES,
+        geo_token_weight: float = DEFAULT_GEO_TOKEN_WEIGHT,
+        geo_pool_weight: float = DEFAULT_GEO_POOL_WEIGHT,
         geo_prefix_dim: int = DEFAULT_GEO_PREFIX_DIM,
         geo_prefix_weight: float = DEFAULT_GEO_PREFIX_WEIGHT,
         geo_ema_momentum: float = DEFAULT_GEO_EMA_MOMENTUM,
+        geo_after_unfreeze: bool = DEFAULT_GEO_AFTER_UNFREEZE,
+        geo_square: bool = DEFAULT_GEO_SQUARE,
     ):
         super().__init__()
         self.vision_device = vision_device
@@ -1275,11 +1733,21 @@ class Stage1AlignmentModel(nn.Module):
 
         self.vision_model = vision_model
         self.text_model = text_model
+        # bias=False: L2-normalized embeddings; a free bias mainly adds a shared
+        # directional mode (cone) that fights contrastive + geometry losses.
         self.vision_projection = nn.Linear(
-            vision_hidden, embed_dim, device=vision_device, dtype=compute_dtype
+            vision_hidden,
+            embed_dim,
+            bias=False,
+            device=vision_device,
+            dtype=compute_dtype,
         )
         self.text_projection = nn.Linear(
-            text_hidden, embed_dim, device=text_device, dtype=compute_dtype
+            text_hidden,
+            embed_dim,
+            bias=False,
+            device=text_device,
+            dtype=compute_dtype,
         )
         self.embed_dim = int(embed_dim)
         # Prefix-only dims (full dim trained by main contrastive terms).
@@ -1303,6 +1771,12 @@ class Stage1AlignmentModel(nn.Module):
         self.multi_positive_jaccard = float(multi_positive_jaccard)
         self.vision_patch_keep_ratio = float(vision_patch_keep_ratio)
         self.vision_patch_drop_prob = float(vision_patch_drop_prob)
+        self.vision_merge_tokens = int(vision_merge_tokens)
+        self.vision_merge_assign_temperature = float(vision_merge_assign_temperature)
+        self.score_center = bool(score_center)
+        self.query_maxsim_topk = int(query_maxsim_topk)
+        self.gap_loss_weight = float(gap_loss_weight)
+        self.gap_margin = float(gap_margin)
         self.image_shift_max = int(image_shift_max)
         self.image_hflip_prob = float(image_hflip_prob)
         self.image_max_rotate_deg = float(image_max_rotate_deg)
@@ -1317,6 +1791,7 @@ class Stage1AlignmentModel(nn.Module):
         self.image_aug_enabled = bool(image_aug_enabled)
         self.heatmap_sparsity_weight = float(heatmap_sparsity_weight)
         self.heatmap_sparsity_temperature = float(heatmap_sparsity_temperature)
+        self.heatmap_sparsity_square = bool(heatmap_sparsity_square)
         # "accum_window" = policy B: score snapshot from window start, enqueue every mb.
         # "live" = score against bank after each prior micro-batch enqueue.
         if bank_score_policy not in ("accum_window", "live"):
@@ -1337,10 +1812,19 @@ class Stage1AlignmentModel(nn.Module):
         self.geo_mag_floor_weight = float(geo_mag_floor_weight)
         self.geo_max_abs_ratio = float(geo_max_abs_ratio)
         self.geo_max_abs_weight = float(geo_max_abs_weight)
+        self.geo_uniformity_weight = float(geo_uniformity_weight)
+        self.geo_uniformity_t = float(geo_uniformity_t)
+        self.geo_uniformity_max_samples = int(geo_uniformity_max_samples)
+        self.geo_token_weight = float(geo_token_weight)
+        self.geo_pool_weight = float(geo_pool_weight)
         self.geo_prefix_dim = int(geo_prefix_dim)
         self.geo_prefix_weight = float(geo_prefix_weight)
         self.geo_ema_momentum = float(geo_ema_momentum)
-        # Running mean of normalized token embeds (fp32, loss device).
+        # Defer geo until backbone unfreeze: linear proj cannot break a backbone cone.
+        self.geo_after_unfreeze = bool(geo_after_unfreeze)
+        self.geo_active = not self.geo_after_unfreeze
+        self.geo_square = bool(geo_square)
+        # Running mean of normalized embeds (fp32); raw mean of unit vectors, ‖μ‖≤1.
         self.register_buffer(
             "_geo_ema_mean",
             torch.zeros(embed_dim, dtype=torch.float32, device=vision_device),
@@ -1353,10 +1837,15 @@ class Stage1AlignmentModel(nn.Module):
         )
         self._init_projection_heads()
 
+    def set_geo_active(self, active: bool) -> None:
+        """Enable/disable geometry loss (used to defer geo until backbone unfreeze)."""
+        self.geo_active = bool(active)
+
     def _init_projection_heads(self):
         for proj in (self.vision_projection, self.text_projection):
             nn.init.xavier_uniform_(proj.weight)
-            if proj.bias is not None:
+            # bias=False by design; keep guard if someone re-enables bias later.
+            if getattr(proj, "bias", None) is not None:
                 nn.init.zeros_(proj.bias)
 
     def _soft_tau(self) -> float | None:
@@ -1396,20 +1885,34 @@ class Stage1AlignmentModel(nn.Module):
     def _to_loss(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.to(device=self.loss_device, dtype=self.compute_dtype)
 
+    def _module_dtype(self, module: nn.Module) -> torch.dtype:
+        """First floating parameter dtype of ``module``, else ``compute_dtype``."""
+        for p in module.parameters():
+            if p.is_floating_point():
+                return p.dtype
+        return self.compute_dtype
+
     def _select_vision_patches(
         self, vision_raw_i: torch.Tensor
     ) -> torch.Tensor:
-        """L2 background keep, then train-only random patch dropout."""
+        """L2 keep → train drop → similarity-merge to few centroids for MaxSim."""
         kept = keep_top_patches_by_l2(
             vision_raw_i, keep_ratio=self.vision_patch_keep_ratio
         )
-        return random_drop_patches(
+        kept = random_drop_patches(
             kept,
             drop_prob=self.vision_patch_drop_prob,
             training=self.training,
         )
+        if self.vision_merge_tokens > 0 and kept.shape[0] > self.vision_merge_tokens:
+            kept = merge_tokens_by_similarity(
+                kept,
+                k=self.vision_merge_tokens,
+                assign_temperature=self.vision_merge_assign_temperature,
+            )
+        return kept
 
-    def _geo_kwargs(self) -> dict[str, float]:
+    def _geo_kwargs(self) -> dict[str, float | int]:
         return {
             "center_weight": self.geo_center_weight,
             "var_weight": self.geo_var_weight,
@@ -1419,74 +1922,36 @@ class Stage1AlignmentModel(nn.Module):
             "mag_floor_weight": self.geo_mag_floor_weight,
             "max_abs_ratio": self.geo_max_abs_ratio,
             "max_abs_weight": self.geo_max_abs_weight,
+            "uniformity_weight": self.geo_uniformity_weight,
+            "uniformity_t": self.geo_uniformity_t,
+            "uniformity_max_samples": self.geo_uniformity_max_samples,
         }
 
-    def _compute_embedding_geometry(
+    def _empty_geo_metrics(self) -> dict[str, float]:
+        return {
+            "geo_center": 0.0,
+            "geo_var": 0.0,
+            "geo_vec_mean": 0.0,
+            "geo_uniformity": 0.0,
+            "geo_mag_floor": 0.0,
+            "geo_max_abs": 0.0,
+            "geo_mu_norm": 0.0,
+            "geo_min_std": 0.0,
+            "geo_mean_abs_mu": 0.0,
+            "geo_loss": 0.0,
+            "geo_raw": 0.0,
+            "geo_token_mu_norm": 0.0,
+            "geo_pool_mu_norm": 0.0,
+        }
+
+    def _geometry_on_matrix(
         self,
+        norm_mat: torch.Tensor,
         *,
-        norm_token_lists: list[list[torch.Tensor]],
-        raw_token_lists: list[list[torch.Tensor]],
+        raw_mat: torch.Tensor | None,
+        ema: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Geometry loss on live tokens (+ optional Matryoshka prefix)."""
-        zero = self.vision_projection.weight.new_zeros(())
-        if self.embedding_geo_weight <= 0.0:
-            return zero, {
-                "geo_center": 0.0,
-                "geo_var": 0.0,
-                "geo_vec_mean": 0.0,
-                "geo_mag_floor": 0.0,
-                "geo_max_abs": 0.0,
-                "geo_mu_norm": 0.0,
-                "geo_min_std": 0.0,
-                "geo_mean_abs_mu": 0.0,
-                "geo_loss": 0.0,
-            }
-
-        # Token-level matrix (large N even with micro-batch 2) + sample mean-pools.
-        token_norm = stack_token_embeddings(norm_token_lists)
-        token_raw = stack_token_embeddings(raw_token_lists)
-        pooled_parts = [
-            mean_pool_token_list(lst) for lst in norm_token_lists if lst
-        ]
-        pooled_parts = [p for p in pooled_parts if p is not None]
-        if token_norm is None and not pooled_parts:
-            return zero, {
-                "geo_center": 0.0,
-                "geo_var": 0.0,
-                "geo_vec_mean": 0.0,
-                "geo_mag_floor": 0.0,
-                "geo_max_abs": 0.0,
-                "geo_mu_norm": 0.0,
-                "geo_min_std": 0.0,
-                "geo_mean_abs_mu": 0.0,
-                "geo_loss": 0.0,
-            }
-
-        pieces: list[torch.Tensor] = []
-        if token_norm is not None:
-            pieces.append(token_norm)
-        if pooled_parts:
-            pieces.append(torch.cat(pooled_parts, dim=0))
-        norm_mat = torch.cat(pieces, dim=0)
-
-        raw_mat = None
-        if token_raw is not None and token_norm is not None:
-            # Align raw rows to token_norm only (not pooled rows).
-            if token_raw.shape[0] == token_norm.shape[0]:
-                # Pad raw with zeros for pooled rows so mag_floor only hits tokens.
-                pad_n = norm_mat.shape[0] - token_raw.shape[0]
-                if pad_n > 0:
-                    pad = token_raw.new_zeros((pad_n, token_raw.shape[-1]))
-                    # Use norms above floor so padded rows don't contribute.
-                    pad = pad + float(self.geo_mag_floor) + 1.0
-                    raw_mat = torch.cat([token_raw, pad], dim=0)
-                else:
-                    raw_mat = token_raw
-
-        ema = None
-        if self._geo_ema_initialized.item():
-            ema = self._geo_ema_mean.to(device=norm_mat.device)
-
+        """Full-dim + optional Matryoshka-prefix geometry on one unit-vector matrix."""
         geo_full, metrics = embedding_geometry_loss(
             norm_mat,
             raw=raw_mat,
@@ -1494,7 +1959,6 @@ class Stage1AlignmentModel(nn.Module):
             **self._geo_kwargs(),
         )
         geo = geo_full
-
         prefix_dim = self.geo_prefix_dim
         if (
             self.geo_prefix_weight > 0.0
@@ -1502,14 +1966,15 @@ class Stage1AlignmentModel(nn.Module):
             and prefix_dim < norm_mat.shape[-1]
         ):
             prefix = matryoshka_normalize(norm_mat, dim=prefix_dim)
-            # Raw prefix uses same slice when available.
             raw_prefix = None
-            if raw_mat is not None:
+            if raw_mat is not None and raw_mat.shape[-1] >= prefix_dim:
+                # Slice pre-norm coords; do not treat as already unit in prefix space.
                 raw_prefix = raw_mat[..., :prefix_dim]
             ema_prefix = None
-            if ema is not None:
-                # Re-normalize EMA prefix as a soft center prior for the prefix space.
-                ema_prefix = F.normalize(ema[:prefix_dim].float(), dim=-1)
+            if ema is not None and ema.numel() >= prefix_dim:
+                # Raw mean slice — NOT unit-normalized (unit EMA permanently
+                # floors center at ~0.25 even for isotropic batches).
+                ema_prefix = ema[:prefix_dim].float()
             geo_pref, pref_metrics = embedding_geometry_loss(
                 prefix,
                 raw=raw_prefix,
@@ -1522,10 +1987,139 @@ class Stage1AlignmentModel(nn.Module):
                 "geo_prefix_center": pref_metrics["geo_center"],
                 "geo_prefix_mu_norm": pref_metrics["geo_mu_norm"],
             }
+        return geo, metrics
 
-        # EMA update from live batch mean (no grad).
+    def _compute_embedding_geometry(
+        self,
+        *,
+        norm_token_lists: list[list[torch.Tensor]],
+        raw_token_lists: list[list[torch.Tensor]],
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Geometry loss on tokens and L2-renormed sequence means (equal share).
+
+        Token rows and sequence-mean rows used to be concatenated, so hundreds of
+        patches drowned ~B pooled vectors and unnormalized pools violated the
+        unit-sphere assumption. We now:
+          1. L2-renormalize mean-pooled sequences.
+          2. Score token-level and pool-level geo separately.
+          3. Average with ``geo_token_weight`` / ``geo_pool_weight`` (default 0.5/0.5).
+        """
+        zero = self.vision_projection.weight.new_zeros(())
+        empty = self._empty_geo_metrics()
+        if self.embedding_geo_weight <= 0.0 or not self.geo_active:
+            return zero, empty
+
+        token_norm = stack_token_embeddings(norm_token_lists)
+        token_raw = stack_token_embeddings(raw_token_lists)
+
+        pooled_parts: list[torch.Tensor] = []
+        for lst in norm_token_lists:
+            if not lst:
+                continue
+            p = mean_pool_token_list(lst)
+            if p is None or p.numel() == 0:
+                continue
+            # Critical: mean of unit tokens is NOT unit — renorm for sphere geo.
+            pooled_parts.append(F.normalize(p.float(), dim=-1).to(dtype=p.dtype))
+        pooled = torch.cat(pooled_parts, dim=0) if pooled_parts else None
+
+        if token_norm is None and pooled is None:
+            return zero, empty
+
+        ema = None
+        if self._geo_ema_initialized.item():
+            device = (
+                token_norm.device if token_norm is not None else pooled.device  # type: ignore[union-attr]
+            )
+            ema = self._geo_ema_mean.to(device=device)
+
+        branch_losses: list[torch.Tensor] = []
+        branch_weights: list[float] = []
+        token_metrics: dict[str, float] | None = None
+        pool_metrics: dict[str, float] | None = None
+
+        if token_norm is not None and token_norm.shape[0] > 0 and self.geo_token_weight > 0.0:
+            raw_mat = None
+            if token_raw is not None and token_raw.shape[0] == token_norm.shape[0]:
+                raw_mat = token_raw
+            g_tok, token_metrics = self._geometry_on_matrix(
+                token_norm, raw_mat=raw_mat, ema=ema
+            )
+            branch_losses.append(g_tok)
+            branch_weights.append(float(self.geo_token_weight))
+
+        if (
+            pooled is not None
+            and pooled.shape[0] >= 2
+            and self.geo_pool_weight > 0.0
+        ):
+            g_pool, pool_metrics = self._geometry_on_matrix(
+                pooled, raw_mat=None, ema=ema
+            )
+            branch_losses.append(g_pool)
+            branch_weights.append(float(self.geo_pool_weight))
+        elif pooled is not None and pooled.shape[0] == 1 and pool_metrics is None:
+            # Single sequence: still report pool μ for logging, no var/unif.
+            with torch.no_grad():
+                pool_metrics = {
+                    "geo_mu_norm": float(pooled.float().mean(dim=0).norm()),
+                    "geo_min_std": 0.0,
+                    "geo_center": 0.0,
+                    "geo_var": 0.0,
+                    "geo_uniformity": 0.0,
+                    "geo_mean_abs_mu": float(pooled.float().mean(dim=0).abs().mean()),
+                }
+
+        if not branch_losses:
+            return zero, empty
+
+        w_sum = sum(branch_weights)
+        geo_raw = sum(w * L for w, L in zip(branch_weights, branch_losses)) / max(
+            w_sum, 1e-8
+        )
+        # Non-negative badness (all terms ≥ 0). Optional square: small badness is
+        # soft (retrieval can lead); large coning is quadratically expensive.
+        if self.geo_square:
+            geo = geo_raw * geo_raw
+        else:
+            geo = geo_raw
+
+        # Prefer sample-level (pool) metrics for the headline μ / minσ logs.
+        primary = pool_metrics if pool_metrics is not None else token_metrics
+        assert primary is not None
+        metrics: dict[str, float] = {
+            **empty,
+            **primary,
+            "geo_raw": float(geo_raw.detach()),
+            "geo_loss": float(geo.detach()),
+        }
+        if token_metrics is not None:
+            metrics["geo_token_mu_norm"] = float(token_metrics.get("geo_mu_norm", 0.0))
+            metrics["geo_token_min_std"] = float(token_metrics.get("geo_min_std", 0.0))
+            metrics["geo_token_uniformity"] = float(
+                token_metrics.get("geo_uniformity", 0.0)
+            )
+        if pool_metrics is not None:
+            metrics["geo_pool_mu_norm"] = float(pool_metrics.get("geo_mu_norm", 0.0))
+            metrics["geo_pool_min_std"] = float(pool_metrics.get("geo_min_std", 0.0))
+            metrics["geo_pool_uniformity"] = float(
+                pool_metrics.get("geo_uniformity", 0.0)
+            )
+            # Headline = pool (retrieval-relevant sequence means).
+            metrics["geo_mu_norm"] = metrics["geo_pool_mu_norm"]
+            metrics["geo_min_std"] = float(pool_metrics.get("geo_min_std", 0.0))
+            metrics["geo_uniformity"] = float(pool_metrics.get("geo_uniformity", 0.0))
+            metrics["geo_center"] = float(pool_metrics.get("geo_center", 0.0))
+            metrics["geo_var"] = float(pool_metrics.get("geo_var", 0.0))
+
+        # EMA: equal blend of token mean and pool mean when both exist (no row-count dilution).
         with torch.no_grad():
-            batch_mu = norm_mat.detach().float().mean(dim=0)
+            mean_parts: list[torch.Tensor] = []
+            if token_norm is not None:
+                mean_parts.append(token_norm.detach().float().mean(dim=0))
+            if pooled is not None:
+                mean_parts.append(pooled.detach().float().mean(dim=0))
+            batch_mu = torch.stack(mean_parts, dim=0).mean(dim=0)
             if batch_mu.device != self._geo_ema_mean.device:
                 batch_mu = batch_mu.to(self._geo_ema_mean.device)
             if not self._geo_ema_initialized.item():
@@ -1536,7 +2130,6 @@ class Stage1AlignmentModel(nn.Module):
                     self._geo_ema_mean, batch_mu, momentum=self.geo_ema_momentum
                 )
 
-        metrics["geo_loss"] = float(geo.detach())
         return geo, metrics
 
     def _maybe_augment_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -1555,7 +2148,10 @@ class Stage1AlignmentModel(nn.Module):
         )
 
     def encode_images(self, pixel_values: torch.Tensor) -> list[torch.Tensor]:
-        pixel_values = pixel_values.to(self.vision_device, non_blocking=True)
+        vdtype = self._module_dtype(self.vision_model)
+        pixel_values = pixel_values.to(
+            device=self.vision_device, dtype=vdtype, non_blocking=True
+        )
         pixel_values = self._maybe_augment_images(pixel_values)
         vision_hidden = self.vision_model(
             pixel_values=pixel_values
@@ -1621,12 +2217,17 @@ class Stage1AlignmentModel(nn.Module):
         captions: list[str] | None = None,
         return_loss: bool = True,
     ) -> dict[str, Any]:
-        pixel_values = pixel_values.to(self.vision_device, non_blocking=True)
+        vdtype = self._module_dtype(self.vision_model)
+        pixel_values = pixel_values.to(
+            device=self.vision_device, dtype=vdtype, non_blocking=True
+        )
         input_ids = input_ids.to(self.text_device, non_blocking=True)
         attention_mask = attention_mask.to(self.text_device, non_blocking=True)
 
         # Train-only: flip / rotate / mild scale-stretch + pad fill + pixel shift.
         pixel_values = self._maybe_augment_images(pixel_values)
+        # Augmentations can promote to float32; cast back to vision weight dtype.
+        pixel_values = pixel_values.to(dtype=vdtype)
 
         vision_hidden = self.vision_model(
             pixel_values=pixel_values
@@ -1703,6 +2304,10 @@ class Stage1AlignmentModel(nn.Module):
         # Bank vectors are detached (hard top-k mining selects which bank cols
         # enter the softmax).
         # ------------------------------------------------------------------
+        q_topk = self.query_maxsim_topk
+        score_center = self.score_center
+        gap_w = self.gap_loss_weight
+        gap_m = self.gap_margin
         contrastive, contrastive_metrics = contrastive_late_interaction_loss(
             loss_text_tokens,
             loss_image_tokens,
@@ -1712,6 +2317,10 @@ class Stage1AlignmentModel(nn.Module):
             soft_maxsim_temperature=soft_tau,
             non_negative_mask=non_neg,
             hard_bank_k=hard_k,
+            query_topk=q_topk,
+            score_center=score_center,
+            gap_weight=gap_w,
+            gap_margin=gap_m,
             return_metrics=True,
         )
         matryoshka = matryoshka_loss(
@@ -1724,6 +2333,10 @@ class Stage1AlignmentModel(nn.Module):
             soft_maxsim_temperature=soft_tau,
             non_negative_mask=non_neg,
             hard_bank_k=hard_k,
+            query_topk=q_topk,
+            score_center=score_center,
+            gap_weight=gap_w,
+            gap_margin=gap_m,
             embed_dim=self.embed_dim,
         )
         has_prefixes = bool(self.matryoshka_dims)
@@ -1776,6 +2389,10 @@ class Stage1AlignmentModel(nn.Module):
                     soft_maxsim_temperature=soft_tau,
                     non_negative_mask=non_neg,
                     hard_bank_k=hard_k,
+                    query_topk=q_topk,
+                    score_center=score_center,
+                    gap_weight=gap_w,
+                    gap_margin=gap_m,
                     return_metrics=False,
                 )
                 query_image_matryoshka = matryoshka_loss(
@@ -1788,6 +2405,10 @@ class Stage1AlignmentModel(nn.Module):
                     soft_maxsim_temperature=soft_tau,
                     non_negative_mask=non_neg,
                     hard_bank_k=hard_k,
+                    query_topk=q_topk,
+                    score_center=score_center,
+                    gap_weight=gap_w,
+                    gap_margin=gap_m,
                     embed_dim=self.embed_dim,
                 )
 
@@ -1802,6 +2423,10 @@ class Stage1AlignmentModel(nn.Module):
                     soft_maxsim_temperature=soft_tau,
                     non_negative_mask=non_neg,
                     hard_bank_k=hard_k,
+                    query_topk=q_topk,
+                    score_center=score_center,
+                    gap_weight=gap_w,
+                    gap_margin=gap_m,
                 )
                 text_text_matryoshka = text_text_matryoshka_loss(
                     loss_query_raw,
@@ -1813,6 +2438,10 @@ class Stage1AlignmentModel(nn.Module):
                     soft_maxsim_temperature=soft_tau,
                     non_negative_mask=non_neg,
                     hard_bank_k=hard_k,
+                    query_topk=q_topk,
+                    score_center=score_center,
+                    gap_weight=gap_w,
+                    gap_margin=gap_m,
                     embed_dim=self.embed_dim,
                 )
 
@@ -1867,7 +2496,9 @@ class Stage1AlignmentModel(nn.Module):
 
         # Heatmap sparsity: punish uniform patch MaxSim on positive pairs so
         # gradients favor a few “selected blocks” (cleaner demo heatmaps).
+        # Raw value is normalized entropy ∈ [0,1]; optional square like geo.
         sparsity = zero
+        sparsity_raw = zero
         if self.heatmap_sparsity_weight > 0.0:
             sp_terms: list[torch.Tensor] = [
                 heatmap_sparsity_loss(
@@ -1885,7 +2516,12 @@ class Stage1AlignmentModel(nn.Module):
                         temperature=self.heatmap_sparsity_temperature,
                     )
                 )
-            sparsity = torch.stack(sp_terms).mean()
+            sparsity_raw = torch.stack(sp_terms).mean()
+            sparsity = (
+                sparsity_raw * sparsity_raw
+                if self.heatmap_sparsity_square
+                else sparsity_raw
+            )
             loss = loss + self.heatmap_sparsity_weight * sparsity
 
         # Enqueue *after* scoring so the current batch is never its own negative.
@@ -1904,7 +2540,9 @@ class Stage1AlignmentModel(nn.Module):
             "text_text_loss": text_text.detach(),
             "text_text_matryoshka_loss": text_text_matryoshka.detach(),
             "query_caption_loss": query_caption_task.detach(),
-            "heatmap_sparsity_loss": sparsity.detach(),
+            # Log raw entropy [0,1] for readability; loss uses squared when enabled.
+            "heatmap_sparsity_loss": sparsity_raw.detach(),
+            "heatmap_sparsity_squared": sparsity.detach(),
             "geo_loss": geo_loss.detach()
             if torch.is_tensor(geo_loss)
             else contrastive.new_zeros(()),
@@ -1913,12 +2551,19 @@ class Stage1AlignmentModel(nn.Module):
             "geo_mean_abs_mu": geo_metrics.get("geo_mean_abs_mu", 0.0),
             "geo_center": geo_metrics.get("geo_center", 0.0),
             "geo_var": geo_metrics.get("geo_var", 0.0),
+            "geo_uniformity": geo_metrics.get("geo_uniformity", 0.0),
+            "geo_pool_mu_norm": geo_metrics.get("geo_pool_mu_norm", 0.0),
+            "geo_token_mu_norm": geo_metrics.get("geo_token_mu_norm", 0.0),
             "memory_bank_size": len(bank),
             "pos_rank": contrastive_metrics["pos_rank"],
             "pos_rank_t2i": contrastive_metrics["pos_rank_t2i"],
             "pos_rank_i2t": contrastive_metrics["pos_rank_i2t"],
             "n_image_docs": contrastive_metrics["n_image_docs"],
             "n_text_docs": contrastive_metrics["n_text_docs"],
+            "pos_score": contrastive_metrics.get("pos_score", float("nan")),
+            "neg_score": contrastive_metrics.get("neg_score", float("nan")),
+            "score_gap": contrastive_metrics.get("score_gap", float("nan")),
+            "gap_hinge": contrastive_metrics.get("gap_hinge", 0.0),
         }
 
 
@@ -1960,10 +2605,12 @@ def load_text_model_for_training(
 
     quantized = checkpoint_is_quantized(model_dir)
     init_dir = QWEN_DIR if quantized else model_dir
+    dtype_name = str(compute_dtype).replace("torch.", "")
     print(
         f"Loading text model from {model_dir} on {text_device} "
-        f"(8-bit weights via Unsloth"
-        f"{', seed shell from ' + init_dir if quantized else ''}) ..."
+        f"(full {dtype_name} via Unsloth full_finetuning"
+        f"{'; dequant 8-bit ckpt, shell ' + init_dir if quantized else ''}"
+        f"; AdamW8bit) ..."
     )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
     if tokenizer.pad_token is None:
@@ -1972,11 +2619,12 @@ def load_text_model_for_training(
     model = load_qwen_backbone(
         model_dir,
         text_device,
-        load_in_8bit=True,
+        load_in_8bit=False,
         seed_dir=QWEN_DIR if quantized else None,
         tokenizer_id=tokenizer_id,
         max_seq_length=max_seq_length,
         for_training=True,
+        compute_dtype=compute_dtype,
     )
     return model, tokenizer, model.config.hidden_size
 
@@ -1988,17 +2636,20 @@ def load_vision_model_for_training(
 ):
     quantized = checkpoint_is_quantized(model_dir)
     init_dir = SIGLIP_DIR if quantized else model_dir
+    dtype_name = str(compute_dtype).replace("torch.", "")
     print(
         f"Loading vision model from {model_dir} on {vision_device} "
-        f"(8-bit weights"
-        f"{', seed shell from ' + init_dir if quantized else ''}) ..."
+        f"(full {dtype_name}"
+        f"{'; dequant 8-bit ckpt, shell ' + init_dir if quantized else ''}"
+        f"; AdamW8bit) ..."
     )
     model = load_siglip_backbone(
         model_dir,
         vision_device,
-        load_in_8bit=True,
+        load_in_8bit=False,
         seed_dir=SIGLIP_DIR if quantized else None,
         for_training=True,
+        compute_dtype=compute_dtype,
     )
     return model, model.config.hidden_size
 
@@ -2172,6 +2823,18 @@ def _torch_load(path: Path | str, map_location="cpu", *, weights_only: bool | No
     return torch.load(path, **kwargs)
 
 
+def _filter_projection_state_dict(
+    module: nn.Module, state: dict[str, Any]
+) -> dict[str, Any]:
+    """Drop keys the module does not own (e.g. old checkpoints with ``bias``)."""
+    allowed = set(module.state_dict().keys())
+    filtered = {k: v for k, v in state.items() if k in allowed}
+    dropped = sorted(set(state.keys()) - allowed)
+    if dropped:
+        print(f"  projection load: ignored keys {dropped}")
+    return filtered
+
+
 def load_projection_heads(
     alignment_model: Stage1AlignmentModel,
     checkpoint_root: Path,
@@ -2179,8 +2842,14 @@ def load_projection_heads(
     state = _torch_load(
         checkpoint_root / PROJECTION_FILE, map_location="cpu", weights_only=True
     )
-    alignment_model.vision_projection.load_state_dict(state["vision_projection"])
-    alignment_model.text_projection.load_state_dict(state["text_projection"])
+    v_sd = _filter_projection_state_dict(
+        alignment_model.vision_projection, state["vision_projection"]
+    )
+    t_sd = _filter_projection_state_dict(
+        alignment_model.text_projection, state["text_projection"]
+    )
+    alignment_model.vision_projection.load_state_dict(v_sd, strict=True)
+    alignment_model.text_projection.load_state_dict(t_sd, strict=True)
     alignment_model.vision_projection.to(
         device=alignment_model.vision_device,
         dtype=alignment_model.compute_dtype,
@@ -2586,6 +3255,106 @@ def verify_trained_checkpoint(
     )
 
 
+def is_projection_param_name(name: str) -> bool:
+    """True for Matryoshka projection heads (always trained)."""
+    return "vision_projection" in name or "text_projection" in name
+
+
+def _param_can_require_grad(param: torch.Tensor) -> bool:
+    """True if PyTorch allows ``requires_grad`` on this tensor.
+
+    bitsandbytes 8-bit ``Int8Params`` store weights as integer dtypes; those
+    cannot have ``requires_grad=True`` (only float/complex). Freezing still
+    sets ``requires_grad=False`` on them; unfreezing must skip them. Trainable
+    float scales / LoRA / projection heads are unaffected.
+    """
+    return bool(param.is_floating_point() or param.is_complex())
+
+
+def set_backbone_trainable(
+    model: Stage1AlignmentModel,
+    trainable: bool,
+) -> dict[str, int]:
+    """Freeze/unfreeze vision + text towers; projections always stay trainable.
+
+    When frozen, backbone modules are set to ``eval()`` (stable features, no
+    dropout) while projection heads remain in train mode.
+
+    Only floating/complex parameters are toggled for ``requires_grad`` (bnb
+    int8 storage tensors are left alone — see ``_param_can_require_grad``).
+    """
+    n_backbone = 0
+    n_proj = 0
+    n_skipped_nonfloat = 0
+    want = bool(trainable)
+    for name, param in model.named_parameters():
+        if is_projection_param_name(name):
+            if _param_can_require_grad(param):
+                param.requires_grad = True
+            n_proj += param.numel()
+            continue
+
+        n_backbone += param.numel()
+        if not _param_can_require_grad(param):
+            # int8 (or other non-float) storage: cannot enable grads; ensure off
+            if param.requires_grad:
+                param.requires_grad = False
+            n_skipped_nonfloat += 1
+            continue
+        param.requires_grad = want
+
+    # Keep batch-norm / dropout off on frozen towers for stable semantics.
+    if hasattr(model, "vision_model") and model.vision_model is not None:
+        model.vision_model.train(mode=want)
+    if hasattr(model, "text_model") and model.text_model is not None:
+        model.text_model.train(mode=want)
+    if hasattr(model, "vision_projection"):
+        model.vision_projection.train(True)
+    if hasattr(model, "text_projection"):
+        model.text_projection.train(True)
+
+    return {
+        "backbone_params": n_backbone,
+        "projection_params": n_proj,
+        "backbone_trainable": int(want),
+        "skipped_nonfloat": n_skipped_nonfloat,
+    }
+
+
+def count_trainable_parameters(model: Stage1AlignmentModel) -> tuple[int, int]:
+    """Return ``(trainable_numel, total_numel)``."""
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return trainable, total
+
+
+def resolve_backbone_freeze_steps(
+    args: Any,
+    total_steps: int,
+    *,
+    start_step: int = 0,
+) -> int:
+    """Global step (exclusive) until which backbones stay frozen.
+
+    Priority: ``--freeze-backbone-steps`` if >= 0, else
+    ``floor(total_steps * --freeze-backbone-ratio)``. Returns 0 when disabled.
+    """
+    if getattr(args, "no_freeze_backbone", False):
+        return 0
+    steps = getattr(args, "freeze_backbone_steps", None)
+    if steps is not None and int(steps) >= 0:
+        freeze_until = int(steps)
+    else:
+        ratio = float(getattr(args, "freeze_backbone_ratio", 0.0) or 0.0)
+        if ratio <= 0.0:
+            return 0
+        freeze_until = int(total_steps * ratio)
+    # Already past freeze window on resume → no freeze.
+    if start_step >= freeze_until:
+        return 0
+    return max(0, freeze_until)
+
+
 def build_optimizer(
     model: Stage1AlignmentModel,
     learning_rate: float,
@@ -2595,17 +3364,29 @@ def build_optimizer(
 ):
     import bitsandbytes as bnb
 
+    # Include all parameters (even if currently frozen) so unfreezing mid-run
+    # does not require rebuilding the optimizer. Frozen params simply get no
+    # grads until ``set_backbone_trainable(True)``.
     vision_params, text_params, projection_params = [], [], []
     for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "vision_projection" in name or "text_projection" in name:
+        if is_projection_param_name(name):
             projection_params.append(param)
         elif "vision_model" in name:
             vision_params.append(param)
         else:
             text_params.append(param)
 
+    if not projection_params:
+        raise RuntimeError(
+            "No projection parameters found for the optimizer "
+            "(expected vision_projection / text_projection)."
+        )
+    if not vision_params:
+        raise RuntimeError("No vision_model parameters found for the optimizer.")
+    if not text_params:
+        raise RuntimeError("No text_model parameters found for the optimizer.")
+
+    # Fixed group order for run_training LR updates: 0=vision, 1=text, 2=proj.
     return bnb.optim.AdamW8bit(
         [
             {"params": vision_params, "lr": vision_learning_rate},
@@ -2665,6 +3446,43 @@ def run_training(
         int(len(dataloader) * args.num_epochs // max(args.gradient_accumulation_steps, 1)),
     )
     warmup_steps = int(total_steps * args.warmup_ratio)
+    freeze_until = resolve_backbone_freeze_steps(
+        args, total_steps, start_step=start_step
+    )
+    backbone_frozen = freeze_until > start_step
+    # Geo is inert under frozen backbones (linear proj cannot un-cone); defer by default.
+    geo_after_unfreeze = bool(getattr(args, "geo_after_unfreeze", DEFAULT_GEO_AFTER_UNFREEZE))
+    if hasattr(model, "set_geo_active"):
+        if geo_after_unfreeze and backbone_frozen:
+            model.set_geo_active(False)
+            print(
+                "Embedding geometry: deferred until backbone unfreeze "
+                f"(step {freeze_until})."
+            )
+        else:
+            model.set_geo_active(True)
+            if geo_after_unfreeze and not backbone_frozen:
+                print("Embedding geometry: active (backbone already unfrozen).")
+            elif not geo_after_unfreeze:
+                print("Embedding geometry: active from step 0 (--geo-during-freeze).")
+    if backbone_frozen:
+        stats = set_backbone_trainable(model, False)
+        tr, tot = count_trainable_parameters(model)
+        print(
+            f"Projection-only phase: freeze vision/text backbones until "
+            f"global step {freeze_until} "
+            f"(trainable {tr:,} / {tot:,} params; "
+            f"proj≈{stats['projection_params']:,})."
+        )
+    else:
+        set_backbone_trainable(model, True)
+        if getattr(args, "no_freeze_backbone", False) or freeze_until == 0:
+            print("Backbone freeze: disabled (full tower training from start).")
+        else:
+            print(
+                f"Backbone freeze: skipped (resume step {start_step} "
+                f">= freeze_until {freeze_until})."
+            )
 
     def lr_at(step: int) -> float:
         if step < warmup_steps:
@@ -2685,7 +3503,9 @@ def run_training(
     log_geo_mu = 0.0
     log_geo_min_std = 0.0
     log_pos_rank = 0.0
+    log_score_gap = 0.0
     log_batches = 0
+    bank_clear_steps = int(getattr(args, "bank_clear_steps", DEFAULT_BANK_CLEAR_STEPS) or 0)
 
     if max_steps is not None and start_step >= max_steps:
         print(f"Already at step {start_step} (max_steps={max_steps}); nothing to train.")
@@ -2698,6 +3518,10 @@ def run_training(
             # Policy B: snapshot bank for scoring at the start of each accum window.
             if micro_step % accum == 0 and hasattr(model, "begin_accum_window"):
                 model.begin_accum_window()
+
+            # model.train() would re-enable backbone dropout; re-assert freeze.
+            if backbone_frozen:
+                set_backbone_trainable(model, False)
 
             outputs = model(**batch, return_loss=True)
             loss_val = outputs["loss"].detach().float().item()
@@ -2724,6 +3548,9 @@ def run_training(
             log_geo_mu += float(outputs.get("geo_mu_norm", 0.0))
             log_geo_min_std += float(outputs.get("geo_min_std", 0.0))
             log_pos_rank += float(outputs.get("pos_rank", 0.0))
+            gap = outputs.get("score_gap", float("nan"))
+            if gap == gap:  # not NaN
+                log_score_gap += float(gap)
             log_batches += 1
             micro_step += 1
 
@@ -2734,8 +3561,13 @@ def run_training(
             vision_lr = args.vision_learning_rate or text_lr
             schedule_scale = text_lr / max(args.learning_rate, 1e-12)
             proj_lr = args.projection_learning_rate * schedule_scale
-            optimizer.param_groups[0]["lr"] = vision_lr
-            optimizer.param_groups[1]["lr"] = text_lr
+            # During proj-only phase, zero backbone LRs (belt-and-suspenders).
+            if backbone_frozen:
+                optimizer.param_groups[0]["lr"] = 0.0
+                optimizer.param_groups[1]["lr"] = 0.0
+            else:
+                optimizer.param_groups[0]["lr"] = vision_lr
+                optimizer.param_groups[1]["lr"] = text_lr
             optimizer.param_groups[2]["lr"] = proj_lr
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -2746,9 +3578,52 @@ def run_training(
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
+            if backbone_frozen and global_step >= freeze_until:
+                stats = set_backbone_trainable(model, True)
+                backbone_frozen = False
+                if geo_after_unfreeze and hasattr(model, "set_geo_active"):
+                    model.set_geo_active(True)
+                tr, tot = count_trainable_parameters(model)
+                skip = stats.get("skipped_nonfloat", 0)
+                skip_msg = (
+                    f" skipped_nonfloat={skip} (bnb int8 storage)"
+                    if skip
+                    else ""
+                )
+                geo_msg = (
+                    " Embedding geometry enabled."
+                    if geo_after_unfreeze
+                    else ""
+                )
+                print(
+                    f"Unfroze vision/text backbones at step {global_step} "
+                    f"(trainable {tr:,} / {tot:,} params{skip_msg}). "
+                    f"Continuing with full tower fine-tuning.{geo_msg}"
+                )
+
+            # Drop stale bank negatives so a collapse episode cannot lock CE at chance.
+            if (
+                bank_clear_steps > 0
+                and global_step > 0
+                and global_step % bank_clear_steps == 0
+                and hasattr(model, "memory_bank")
+            ):
+                bank = model.memory_bank
+                if bank is not None and len(bank) > 0:
+                    n_cleared = len(bank)
+                    bank.clear()
+                    if hasattr(model, "_score_bank_snapshot"):
+                        model._score_bank_snapshot = None
+                    print(
+                        f"Cleared memory bank at step {global_step} "
+                        f"({n_cleared} entries; refresh every {bank_clear_steps} steps)."
+                    )
+
             if global_step == 1 or global_step % args.logging_steps == 0:
+                phase = "proj-only" if backbone_frozen else "full"
                 msg = (
                     f"step {global_step:5d} | "
+                    f"[{phase}] | "
                     f"loss {log_loss / log_batches:.4f} | "
                     f"cap↔img {log_contrastive / log_batches:.4f} | "
                     f"mrl {log_matryoshka / log_batches:.4f}"
@@ -2782,6 +3657,8 @@ def run_training(
                     msg += f" | bank {bank_len}"
                 n_docs = int(outputs.get("n_image_docs", args.batch_size))
                 msg += f" | pos_rank {log_pos_rank / log_batches:.1f}/{n_docs}"
+                if log_batches > 0:
+                    msg += f" | gap {log_score_gap / log_batches:.3f}"
                 msg += f" | grad_norm {float(grad_norm):.4f} | lr {text_lr:.2e}"
                 print(msg)
                 log_loss = log_contrastive = log_matryoshka = 0.0
@@ -2789,7 +3666,7 @@ def run_training(
                 log_text_text = log_text_text_matryoshka = 0.0
                 log_heatmap_sparsity = 0.0
                 log_geo = log_geo_mu = log_geo_min_std = 0.0
-                log_pos_rank = 0.0
+                log_pos_rank = log_score_gap = 0.0
                 log_batches = 0
 
             if global_step % args.save_steps == 0:

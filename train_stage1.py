@@ -4,7 +4,8 @@ Stage 1: Seeding & Cross-Modal Alignment (training_plan.md §3)
 
 Trains the SigLIP vision embedder and Qwen3-MoE text embedder jointly in a
 shared 1024-dim Matryoshka space using ColBERT-style contrastive loss and
-Matryoshka loss. Both towers are loaded in 8-bit via Unsloth/bitsandbytes.
+Matryoshka loss. Towers load in full bf16/fp16 (Unsloth full_finetuning) so
+every parameter is optimizable; AdamW8bit keeps optimizer state small.
 
 Training data is always real image–caption pairs (HuggingFace datasets or
 local JSONL). Checkpoints are written under models/trained/stage1/.
@@ -77,19 +78,33 @@ from trisearch_models import (
     verify_trained_checkpoint,
 )
 from trisearch_models.training import (
+    DEFAULT_BANK_CLEAR_STEPS,
+    DEFAULT_BATCH_SIZE,
     DEFAULT_EMBEDDING_GEO_WEIGHT,
+    DEFAULT_FREEZE_BACKBONE_RATIO,
+    DEFAULT_GEO_AFTER_UNFREEZE,
     DEFAULT_GEO_CENTER_WEIGHT,
+    DEFAULT_GEO_SQUARE,
     DEFAULT_GEO_EMA_MOMENTUM,
     DEFAULT_GEO_MAG_FLOOR,
     DEFAULT_GEO_MAG_FLOOR_WEIGHT,
     DEFAULT_GEO_MAX_ABS_RATIO,
     DEFAULT_GEO_MAX_ABS_WEIGHT,
+    DEFAULT_GEO_POOL_WEIGHT,
     DEFAULT_GEO_PREFIX_DIM,
     DEFAULT_GEO_PREFIX_WEIGHT,
+    DEFAULT_GEO_TOKEN_WEIGHT,
+    DEFAULT_GEO_UNIFORMITY_MAX_SAMPLES,
+    DEFAULT_GEO_UNIFORMITY_T,
+    DEFAULT_GEO_UNIFORMITY_WEIGHT,
     DEFAULT_GEO_VAR_RATIO,
     DEFAULT_GEO_VAR_WEIGHT,
     DEFAULT_GEO_VEC_MEAN_WEIGHT,
+    DEFAULT_GAP_LOSS_WEIGHT,
+    DEFAULT_GAP_MARGIN,
+    DEFAULT_GRAD_ACCUM_STEPS,
     DEFAULT_HARD_BANK_NEGATIVES,
+    DEFAULT_HEATMAP_SPARSITY_SQUARE,
     DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
     DEFAULT_HEATMAP_SPARSITY_WEIGHT,
     DEFAULT_IMAGE_FILL_MODE,
@@ -98,8 +113,19 @@ from trisearch_models.training import (
     DEFAULT_IMAGE_SCALE_MAX,
     DEFAULT_IMAGE_SCALE_MIN,
     DEFAULT_IMAGE_SHIFT_MAX,
+    DEFAULT_LEARNING_RATE,
+    DEFAULT_LOGGING_STEPS,
+    DEFAULT_MATRYOSHKA_WEIGHT,
+    DEFAULT_MAX_STEPS,
     DEFAULT_MULTI_POSITIVE_JACCARD,
+    DEFAULT_PROJECTION_LEARNING_RATE,
+    DEFAULT_SAVE_STEPS,
+    DEFAULT_QUERY_MAXSIM_TOPK,
+    DEFAULT_SCORE_CENTER,
     DEFAULT_SOFT_MAXSIM_TEMPERATURE,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_VISION_MERGE_ASSIGN_TEMPERATURE,
+    DEFAULT_VISION_MERGE_TOKENS,
     DEFAULT_VISION_PATCH_DROP_PROB,
     DEFAULT_VISION_PATCH_KEEP_RATIO,
 )
@@ -179,7 +205,12 @@ def parse_args() -> argparse.Namespace:
         help="Prefix dims for Matryoshka CE (full embed dim is trained by the "
              "main contrastive terms and is stripped if listed).",
     )
-    parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMPERATURE,
+        help=f"InfoNCE temperature (default {DEFAULT_TEMPERATURE}).",
+    )
     parser.add_argument(
         "--contrastive-weight",
         type=float,
@@ -190,9 +221,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--matryoshka-weight",
         type=float,
-        default=1.0,
+        default=DEFAULT_MATRYOSHKA_WEIGHT,
         help="Within each retrieval task, relative weight of mean prefix CE "
-             "vs full-dim CE (default 1.0 → equal share). 0 disables prefixes.",
+             f"vs full-dim CE (default {DEFAULT_MATRYOSHKA_WEIGHT}). "
+             "0 disables prefixes.",
     )
     parser.add_argument(
         "--text-text-weight",
@@ -220,6 +252,14 @@ def parse_args() -> argparse.Namespace:
         help="Top-k hardest memory-bank docs kept per query as InfoNCE "
              f"negatives (default {DEFAULT_HARD_BANK_NEGATIVES}). "
              "0 uses the full bank.",
+    )
+    parser.add_argument(
+        "--bank-clear-steps",
+        type=int,
+        default=DEFAULT_BANK_CLEAR_STEPS,
+        help="Clear the memory bank every N global steps so a collapse "
+             f"episode cannot poison all negatives (default {DEFAULT_BANK_CLEAR_STEPS}). "
+             "0 disables.",
     )
     parser.add_argument("--no-text-text-training", action="store_true",
                         help="Disable query→caption and query↔image text-query training.")
@@ -280,6 +320,58 @@ def parse_args() -> argparse.Namespace:
              "0 disables. Eval/demo keep all selected patches.",
     )
     parser.add_argument(
+        "--vision-merge-tokens",
+        type=int,
+        default=DEFAULT_VISION_MERGE_TOKENS,
+        help="Merge vision patches into this many similarity centroids "
+             f"before MaxSim (default {DEFAULT_VISION_MERGE_TOKENS}). "
+             "0 disables. Reduces background MaxSim collisions.",
+    )
+    parser.add_argument(
+        "--vision-merge-assign-temperature",
+        type=float,
+        default=DEFAULT_VISION_MERGE_ASSIGN_TEMPERATURE,
+        help="Softmax temperature for soft patch→centroid assignment "
+             f"(default {DEFAULT_VISION_MERGE_ASSIGN_TEMPERATURE}).",
+    )
+    parser.set_defaults(score_center=DEFAULT_SCORE_CENTER)
+    parser.add_argument(
+        "--score-center",
+        action="store_true",
+        dest="score_center",
+        help="Subtract detached live-batch mean of unit tokens before InfoNCE "
+             "(default on). Removes domain cone that makes MaxSim match all images.",
+    )
+    parser.add_argument(
+        "--no-score-center",
+        action="store_false",
+        dest="score_center",
+        help="Disable batch score centering.",
+    )
+    parser.add_argument(
+        "--query-maxsim-topk",
+        type=int,
+        default=DEFAULT_QUERY_MAXSIM_TOPK,
+        help="Mean only the top-k query-token MaxSims "
+             f"(default {DEFAULT_QUERY_MAXSIM_TOPK}; 0 = mean all tokens). "
+             "Drops stopword-like tokens that match every document.",
+    )
+    parser.add_argument(
+        "--gap-loss-weight",
+        type=float,
+        default=DEFAULT_GAP_LOSS_WEIGHT,
+        help="Weight for score-gap hinge ReLU(margin - gap) on InfoNCE logits "
+             f"(default {DEFAULT_GAP_LOSS_WEIGHT}). 0 disables. Directly trains "
+             "the logged gap (pos - mean finite negs).",
+    )
+    parser.add_argument(
+        "--gap-margin",
+        type=float,
+        default=DEFAULT_GAP_MARGIN,
+        help="Target minimum score_gap in logit space "
+             f"(default {DEFAULT_GAP_MARGIN}; 0 = push gap ≥ 0).",
+    )
+    parser.add_argument(
         "--image-shift-max",
         type=int,
         default=DEFAULT_IMAGE_SHIFT_MAX,
@@ -332,7 +424,7 @@ def parse_args() -> argparse.Namespace:
         help="Weight for positive-pair heatmap sparsity loss (normalized "
              f"entropy of patch MaxSim; default {DEFAULT_HEATMAP_SPARSITY_WEIGHT}). "
              "Punishes noisy/uniform heatmaps so the model selects few blocks. "
-             "0 disables.",
+             "0 disables. Squared by default (see --heatmap-sparsity-square).",
     )
     parser.add_argument(
         "--heatmap-sparsity-temperature",
@@ -340,6 +432,20 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
         help="Softmax temperature for heatmap sparsity "
              f"(default {DEFAULT_HEATMAP_SPARSITY_TEMPERATURE}).",
+    )
+    parser.set_defaults(heatmap_sparsity_square=DEFAULT_HEATMAP_SPARSITY_SQUARE)
+    parser.add_argument(
+        "--heatmap-sparsity-square",
+        action="store_true",
+        dest="heatmap_sparsity_square",
+        help="Square heatmap entropy badness before weighting (default on): "
+             "soft when already sparse, hard shove on diffuse MaxSim maps.",
+    )
+    parser.add_argument(
+        "--no-heatmap-sparsity-square",
+        action="store_false",
+        dest="heatmap_sparsity_square",
+        help="Use raw normalized entropy without squaring.",
     )
     parser.add_argument(
         "--embedding-geo-weight",
@@ -422,6 +528,70 @@ def parse_args() -> argparse.Namespace:
         help="EMA momentum for running embedding mean used in center blending "
              f"(default {DEFAULT_GEO_EMA_MOMENTUM}).",
     )
+    parser.add_argument(
+        "--geo-uniformity-weight",
+        type=float,
+        default=DEFAULT_GEO_UNIFORMITY_WEIGHT,
+        help="Wang–Isola uniformity term weight inside geo "
+             f"(default {DEFAULT_GEO_UNIFORMITY_WEIGHT}; 0 disables).",
+    )
+    parser.add_argument(
+        "--geo-uniformity-t",
+        type=float,
+        default=DEFAULT_GEO_UNIFORMITY_T,
+        help=f"Uniformity temperature t in exp(-t||xi-xj||²) "
+             f"(default {DEFAULT_GEO_UNIFORMITY_T}).",
+    )
+    parser.add_argument(
+        "--geo-uniformity-max-samples",
+        type=int,
+        default=DEFAULT_GEO_UNIFORMITY_MAX_SAMPLES,
+        help="Max rows subsampled for pairwise uniformity "
+             f"(default {DEFAULT_GEO_UNIFORMITY_MAX_SAMPLES}).",
+    )
+    parser.add_argument(
+        "--geo-token-weight",
+        type=float,
+        default=DEFAULT_GEO_TOKEN_WEIGHT,
+        help="Relative weight of token-level geo branch "
+             f"(default {DEFAULT_GEO_TOKEN_WEIGHT}).",
+    )
+    parser.add_argument(
+        "--geo-pool-weight",
+        type=float,
+        default=DEFAULT_GEO_POOL_WEIGHT,
+        help="Relative weight of L2-renormed sequence-mean geo branch "
+             f"(default {DEFAULT_GEO_POOL_WEIGHT}).",
+    )
+    parser.set_defaults(geo_after_unfreeze=DEFAULT_GEO_AFTER_UNFREEZE)
+    parser.add_argument(
+        "--geo-after-unfreeze",
+        action="store_true",
+        dest="geo_after_unfreeze",
+        help="Defer embedding geometry until backbone unfreeze. "
+             "Linear proj cannot break a backbone cone during freeze.",
+    )
+    parser.add_argument(
+        "--geo-during-freeze",
+        action="store_false",
+        dest="geo_after_unfreeze",
+        help="Apply geometry loss also during projection-only freeze phase "
+             f"(default when geo_after_unfreeze={DEFAULT_GEO_AFTER_UNFREEZE}).",
+    )
+    parser.set_defaults(geo_square=DEFAULT_GEO_SQUARE)
+    parser.add_argument(
+        "--geo-square",
+        action="store_true",
+        dest="geo_square",
+        help="Square non-negative geo badness (default on): soft when nearly "
+             "isotropic, quadratic shove on severe coning. Geo never negative.",
+    )
+    parser.add_argument(
+        "--no-geo-square",
+        action="store_false",
+        dest="geo_square",
+        help="Use raw non-negative geo badness without squaring.",
+    )
     parser.add_argument("--openrouter-config", default=str(DEFAULT_OPENROUTER_CONFIG),
                         help="YAML file with openrouter.api_key and openrouter.model.")
     parser.add_argument("--query-cache", default=str(DEFAULT_QUERY_CACHE_PATH),
@@ -439,18 +609,76 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--vision-gpu", type=int, default=0)
     parser.add_argument("--text-gpu", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Micro-batch size (default {DEFAULT_BATCH_SIZE}; must be >= 2).",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=DEFAULT_GRAD_ACCUM_STEPS,
+        help=f"Grad accumulation (default {DEFAULT_GRAD_ACCUM_STEPS}; "
+             f"effective batch = batch-size × this).",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--learning-rate", type=float, default=2e-5)
-    parser.add_argument("--projection-learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=DEFAULT_LEARNING_RATE,
+        help=f"Text/backbone peak LR (default {DEFAULT_LEARNING_RATE}).",
+    )
+    parser.add_argument(
+        "--projection-learning-rate",
+        type=float,
+        default=DEFAULT_PROJECTION_LEARNING_RATE,
+        help=f"Projection-head peak LR (default {DEFAULT_PROJECTION_LEARNING_RATE}).",
+    )
     parser.add_argument("--vision-learning-rate", type=float, default=None)
     parser.add_argument("--num-epochs", type=float, default=1.0)
-    parser.add_argument("--max-steps", type=int, default=1000)
-    parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=DEFAULT_MAX_STEPS,
+        help=f"Total global-step budget (default {DEFAULT_MAX_STEPS}).",
+    )
+    parser.add_argument("--warmup-ratio", type=float, default=0.03,
+                        help="LR warmup as a fraction of total steps (cosine after).")
+    parser.add_argument(
+        "--freeze-backbone-ratio",
+        type=float,
+        default=DEFAULT_FREEZE_BACKBONE_RATIO,
+        help="Fraction of total steps to train *only* projection heads "
+             f"(vision/text towers frozen, eval mode). Default {DEFAULT_FREEZE_BACKBONE_RATIO}. "
+             "Overridden by --freeze-backbone-steps. Use 0 or "
+             "--no-freeze-backbone to disable.",
+    )
+    parser.add_argument(
+        "--freeze-backbone-steps",
+        type=int,
+        default=None,
+        help="Absolute global-step count for projection-only phase "
+             "(overrides --freeze-backbone-ratio). 0 disables.",
+    )
+    parser.add_argument(
+        "--no-freeze-backbone",
+        action="store_true",
+        help="Train full vision/text towers from step 0 (no proj-only phase).",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--logging-steps", type=int, default=10)
-    parser.add_argument("--save-steps", type=int, default=250)
+    parser.add_argument(
+        "--logging-steps",
+        type=int,
+        default=DEFAULT_LOGGING_STEPS,
+        help=f"Log every N global steps (default {DEFAULT_LOGGING_STEPS}).",
+    )
+    parser.add_argument(
+        "--save-steps",
+        type=int,
+        default=DEFAULT_SAVE_STEPS,
+        help=f"Checkpoint every N global steps (default {DEFAULT_SAVE_STEPS}).",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--bf16", action="store_true", default=True)
@@ -588,6 +816,12 @@ def main():
         multi_positive_jaccard=args.multi_positive_jaccard,
         vision_patch_keep_ratio=args.vision_patch_keep_ratio,
         vision_patch_drop_prob=args.vision_patch_drop_prob,
+        vision_merge_tokens=args.vision_merge_tokens,
+        vision_merge_assign_temperature=args.vision_merge_assign_temperature,
+        score_center=args.score_center,
+        query_maxsim_topk=args.query_maxsim_topk,
+        gap_loss_weight=args.gap_loss_weight,
+        gap_margin=args.gap_margin,
         image_shift_max=args.image_shift_max,
         image_hflip_prob=args.image_hflip_prob,
         image_max_rotate_deg=args.image_max_rotate_deg,
@@ -597,6 +831,7 @@ def main():
         image_aug_enabled=not args.no_image_aug,
         heatmap_sparsity_weight=args.heatmap_sparsity_weight,
         heatmap_sparsity_temperature=args.heatmap_sparsity_temperature,
+        heatmap_sparsity_square=args.heatmap_sparsity_square,
         bank_score_policy=args.bank_score_policy,
         embedding_geo_weight=args.embedding_geo_weight,
         geo_center_weight=args.geo_center_weight,
@@ -607,9 +842,16 @@ def main():
         geo_mag_floor_weight=args.geo_mag_floor_weight,
         geo_max_abs_ratio=args.geo_max_abs_ratio,
         geo_max_abs_weight=args.geo_max_abs_weight,
+        geo_uniformity_weight=args.geo_uniformity_weight,
+        geo_uniformity_t=args.geo_uniformity_t,
+        geo_uniformity_max_samples=args.geo_uniformity_max_samples,
+        geo_token_weight=args.geo_token_weight,
+        geo_pool_weight=args.geo_pool_weight,
         geo_prefix_dim=args.geo_prefix_dim,
         geo_prefix_weight=args.geo_prefix_weight,
         geo_ema_momentum=args.geo_ema_momentum,
+        geo_after_unfreeze=args.geo_after_unfreeze,
+        geo_square=args.geo_square,
     )
     alignment_model.vision_projection.to(device=vision_device, dtype=compute_dtype)
     alignment_model.text_projection.to(device=text_device, dtype=compute_dtype)
@@ -651,7 +893,7 @@ def main():
     print(
         f"  memory bank    : {args.memory_bank_size} "
         f"(hard top-{args.hard_bank_negatives} bank negs/query; "
-        f"in-batch always kept)"
+        f"in-batch always kept; clear every {args.bank_clear_steps or 'never'})"
     )
     print(f"  bank policy    : {args.bank_score_policy}")
     print(
@@ -663,6 +905,22 @@ def main():
     print(
         f"  patch dropout  : {args.vision_patch_drop_prob} "
         f"(train-only random drop after L2 keep)"
+    )
+    print(
+        f"  vision merge   : k={args.vision_merge_tokens} "
+        f"(sim centroids; τ_assign={args.vision_merge_assign_temperature})"
+    )
+    print(
+        f"  score center   : {args.score_center} "
+        f"(subtract live-batch mean before InfoNCE)"
+    )
+    print(
+        f"  query MaxSim   : topk={args.query_maxsim_topk} "
+        f"(0=mean all query tokens)"
+    )
+    print(
+        f"  gap hinge      : weight={args.gap_loss_weight} "
+        f"margin={args.gap_margin} (ReLU(m - score_gap))"
     )
     if args.no_image_aug:
         print("  image aug      : disabled (--no-image-aug)")
@@ -676,14 +934,19 @@ def main():
         )
     print(
         f"  heatmap sparse : weight={args.heatmap_sparsity_weight} "
-        f"(τ={args.heatmap_sparsity_temperature}; "
+        f"({'squared' if args.heatmap_sparsity_square else 'linear'}, "
+        f"τ={args.heatmap_sparsity_temperature}; "
         f"entropy of patch MaxSim → select blocks)"
     )
     print(
         f"  emb geometry   : weight={args.embedding_geo_weight} "
         f"(center={args.geo_center_weight}, var={args.geo_var_weight}, "
-        f"vec_mean={args.geo_vec_mean_weight}, mag_floor={args.geo_mag_floor}, "
-        f"prefix={args.geo_prefix_dim}@{args.geo_prefix_weight})"
+        f"unif={args.geo_uniformity_weight}, "
+        f"token/pool={args.geo_token_weight}/{args.geo_pool_weight}, "
+        f"mag_floor={args.geo_mag_floor}, "
+        f"prefix={args.geo_prefix_dim}@{args.geo_prefix_weight}, "
+        f"{'after-unfreeze' if args.geo_after_unfreeze else 'from-step-0'}, "
+        f"{'squared' if args.geo_square else 'linear-badness'})"
     )
     print(f"  max tokens     : {args.max_input_tokens}")
     print(
@@ -706,8 +969,24 @@ def main():
     print(f"  compute dtype  : {compute_dtype}")
     print(f"  vision GPU     : {vision_device}")
     print(f"  text GPU       : {text_device}")
-    print(f"  weight precision: 8-bit (bnb)")
-    print(f"  optimizer      : AdamW8bit")
+    print(f"  weight precision: full {compute_dtype} (all params trainable)")
+    print(f"  optimizer      : AdamW8bit (8-bit moments)")
+    if args.no_freeze_backbone or (
+        args.freeze_backbone_steps is not None and args.freeze_backbone_steps <= 0
+    ) or (
+        args.freeze_backbone_steps is None and args.freeze_backbone_ratio <= 0
+    ):
+        print("  backbone freeze: off (full towers from step 0)")
+    elif args.freeze_backbone_steps is not None:
+        print(
+            f"  backbone freeze: proj-only until step {args.freeze_backbone_steps} "
+            f"(then unfreeze)"
+        )
+    else:
+        print(
+            f"  backbone freeze: proj-only for first "
+            f"{args.freeze_backbone_ratio:.0%} of steps (then unfreeze)"
+        )
     print(f"  trained dir    : {args.trained_dir}")
     print(f"  resume step    : {start_step}\n")
 
