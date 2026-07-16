@@ -38,9 +38,15 @@ from diffusers.models.transformers import SD3Transformer2DModel
 
 warnings.filterwarnings("ignore")
 
-# Baseline checkpoints (public, non-gated) used as references.
+# Baseline checkpoints (public, non-gated) used as *architecture* references
+# for the size-search tables (meta param counts). Weight *seeding* defaults
+# live in model_seeding.DEFAULT_QWEN_SEED_ID / create_*.py defaults.
 SIGLIP_BASELINE_ID = "google/siglip-so400m-patch14-384"
-QWEN_BASELINE_ID = "Qwen/Qwen3-30B-A3B"
+# Dense Qwen3 ~1.7B: used for shared dims when building MoE candidates, and as
+# a small official reference. (No official Qwen3 MoE exists in the ~1–2B band.)
+QWEN_BASELINE_ID = "Qwen/Qwen3-1.7B"
+# Default *weight seed* for create_qwen3_moe_model (dense→MoE arch-aware).
+QWEN_SEED_ID = "Qwen/Qwen3-1.7B"
 MMDIT_BASELINE_ID = "v2ray/stable-diffusion-3-medium-diffusers"
 
 
