@@ -71,15 +71,17 @@ for the full multi-stage plan.
 - If GPUs are unavailable, say so explicitly and run what you can (imports,
   dataset parsing, CPU-only paths).
 
-### 4. 8-bit training and loading
+### 4. Training precision and loading
 
-- Vision and text towers are trained and loaded in **8-bit** (bitsandbytes).
-- Text tower goes through **Unsloth** (`FastLanguageModel`, AdamW8bit).
-- Trained checkpoints are saved as `model.safetensors` + `config.json` per
-  tower, plus `projection_heads.pt` at the stage root.
-- **Do not** load trained 8-bit weights with `from_pretrained(trained_dir)`
-  directly — that drops `.SCB` / `.weight_format` scales. Always use the
-  seed-shell pattern in `trisearch_models`.
+- Stage-1 **trains** vision and text towers in **full bf16/fp16** (all
+  parameters have `requires_grad`) via Unsloth `full_finetuning=True` for
+  text; SigLIP loads without weight quantization.
+- Optimizer is **AdamW8bit** (8-bit moments only — not weight quant).
+- **Inference** may still load older **8-bit** checkpoints (bnb) with the
+  seed-shell + `load_state_dict` pattern. New training saves are float
+  safetensors (no `.SCB`).
+- Resuming a **legacy 8-bit** train checkpoint dequantizes int8+SCB into the
+  float shell (same architecture required).
 
 ### 5. Architecture and module layout
 
@@ -87,14 +89,18 @@ Keep shared code in modules, not duplicated in scripts:
 
 | Module | Responsibility |
 |--------|----------------|
-| `trisearch_models/` | Model constants, inference embedders, 8-bit loading, training losses, `Stage1AlignmentModel`, checkpoint I/O, optimizer helpers |
+| `trisearch_models/` | Model constants, inference embedders, 8-bit loading, training losses, `Stage1AlignmentModel`, Stage-2 MMDiT recon, checkpoint I/O, optimizer helpers |
 | `trisearch_dataset.py` | HF/JSONL loading, mixing, `ImageCaptionDataset`, sampling for eval/index |
 | `trisearch_data_format.py` | Curated TriSearch dataset schema, 1024px resize, HF export/load |
+| `trisearch_demo_index.py` | Shared demo embedding cache/index (stage-1 search + stage-2 recon) |
 | `generate_datasets.py` | Build curated Stage-1 dataset (COCO + SkyScript/RSICD, queries) |
 | `view_dataset.py` | Gradio browser for curated dataset |
 | `train_stage1.py` | Stage-1 CLI only — argparse + `main()` |
+| `train_stage2.py` | Stage-2 CLI — freeze vision, train MMDiT recon from patch embeddings |
 | `run_*.py` | Thin smoke/runner scripts |
 | `demo_image_search.py` | Gradio retrieval UI over a real HF dataset sample |
+| `demo_stage2_recon.py` | Gradio caption search + original \| generated recon (shuffled cond) |
+| `demo_stage2_text2img.py` | Gradio text query → Qwen embeds → Stage-2 multi-image generation |
 
 Scripts should import from these modules. If you add logic used in more than
 one place, move it to the appropriate module first.
@@ -150,18 +156,15 @@ Hardware: tested on 2× RTX 3060 12GB.
 ## Common commands
 
 ```bash
-# Stage 1 training on published Hub curated set (default)
-python3 train_stage1.py --max-steps 10000 --batch-size 4
+# Stage 1 training (defaults: B=4×accum8, geo=0.4, heat_sparse=0, bank clear 250)
+python3 train_stage1.py --fresh --max-steps 5000
 
 # Smoke train (small Hub sample)
 python3 train_stage1.py --max-steps 4 --max-satellite-samples 8 --max-general-samples 8 \
   --skip-query-generation --batch-size 2
 
-# Resume from models/trained/stage1/ (default)
-python3 train_stage1.py --max-steps 20000
-
-# Fresh run from seeds
-python3 train_stage1.py --fresh --max-steps 10000
+# Resume from models/trained/stage1/ (default when not --fresh)
+python3 train_stage1.py --max-steps 5000
 
 # Image search demo (TriSearch curated only; lazy map — batch_size caps image RAM)
 python3 demo_image_search.py --phase 1 --count 1000 --batch-size 4 --rebuild-index
@@ -176,8 +179,26 @@ python3 view_dataset.py --prefer-local --dataset-dir models/data/trisearch-v1
 python3 run_siglip.py --phase 1
 python3 run_qwen3.py --phase 1
 
-# Dataset pipeline unit tests
+# Stage 2: dual-GPU embed precompute (disk cache) + pipeline-parallel MMDiT train
+# Host RSS soft-target ~6GB; default adamw8bit puts moments in VRAM.
+# IMPORTANT: do not train on a smoke cache (--max-samples 8). That memorizes ~8 images.
+# Precompute full (or large) cache first; train refuses caches with <16 samples unless --allow-tiny-cache.
+python3 train_stage2.py --precompute-only --embed-cache-dir models/data/stage2_embed_cache
+python3 train_stage2.py --max-steps 10000 --batch-size 1 --skip-precompute \
+  --embed-cache-dir models/data/stage2_embed_cache
+python3 train_stage2.py --max-steps 2 --max-samples 8 --batch-size 1 --fresh --skip-verify \
+  --allow-tiny-cache  # deliberate overfit smoke only
+
+# Stage-2 recon demo (shared embedding cache with demo_image_search)
+python3 demo_stage2_recon.py --count 100 --generator-dir models/trained/stage2
+
+# Stage-2 text→image (Qwen token embeds → MMDiT; multi-seed gallery)
+python3 demo_stage2_text2img.py --generator-dir models/trained/stage2
+python3 demo_stage2_text2img.py --smoke  # one tiny gen + api check, then exit
+
+# Dataset / stage-2 unit tests
 python3 -m unittest tests.test_dataset_pipeline -v
+python3 -m unittest tests.test_stage2 -v
 ```
 
 ## Checklist before submitting work
@@ -185,7 +206,7 @@ python3 -m unittest tests.test_dataset_pipeline -v
 - [ ] No `trust_remote_code` and no dataset loading scripts
 - [ ] No synthetic/fake/demo training data introduced
 - [ ] Shared logic in `trisearch_models` or `trisearch_dataset`, not copy-pasted
-- [ ] 8-bit load path uses seed shell + `load_state_dict` for trained weights
+- [ ] Training uses full-precision towers + AdamW8bit; inference 8-bit uses seed shell
 - [ ] Training or inference actually run and output captured
 - [ ] Gradio UIs smoke-tested (`get_api_info` + launch/HTTP if applicable)
 - [ ] `view_dataset.py` exercised on a real dataset dir when one exists
@@ -196,6 +217,7 @@ python3 -m unittest tests.test_dataset_pipeline -v
 
 - Do not commit `unsloth_compiled_cache/`, large checkpoints, or demo indexes
   unless explicitly asked.
-- Do not dequantize 8-bit weights to fp32 for “convenience”.
+- Do not re-introduce weight-only 8-bit training (int8 `requires_grad` is not
+  supported; towers will not update).
 - Do not add markdown docs the user did not ask for (this file is the
   exception — it was requested).
