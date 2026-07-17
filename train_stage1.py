@@ -42,7 +42,12 @@ from trisearch_dataset import (
     DEFAULT_GENERAL_CAPTION_COLUMN,
     DEFAULT_GENERAL_DATASET,
     DEFAULT_GENERAL_SPLIT,
+    DEFAULT_MAX_TEXTS_PER_IMAGE,
     DEFAULT_OPENROUTER_CONFIG,
+    DEFAULT_PARAPHRASE_CONFIG,
+    DEFAULT_PARAPHRASE_DATASET,
+    DEFAULT_PARAPHRASE_QUEUE_SIZE,
+    DEFAULT_PARAPHRASE_REFILL_SIZE,
     DEFAULT_QUERY_CACHE_PATH,
     DEFAULT_TRISEARCH_HF_DATASET,
     OPENROUTER_QUERY_BATCH_SIZE,
@@ -51,6 +56,7 @@ from trisearch_dataset import (
     DEFAULT_SATELLITE_SPLIT,
     ImageCaptionDataset,
     Stage1Collator,
+    StreamingTextPairQueue,
     enrich_rows_with_text_queries,
     load_stage1_training_rows,
 )
@@ -329,6 +335,60 @@ def parse_args() -> argparse.Namespace:
              "Applied to captions for cap↔img and q→cap; to related_query "
              "strings for q↔img. Pairs at/above threshold are excluded from "
              "the negative set. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--max-texts-per-image",
+        type=int,
+        default=DEFAULT_MAX_TEXTS_PER_IMAGE,
+        help="Max positive texts per image for cap↔img (primary caption + extra "
+             f"captions + related query; default {DEFAULT_MAX_TEXTS_PER_IMAGE}).",
+    )
+    parser.add_argument(
+        "--paraphrase-dataset",
+        type=str,
+        default=DEFAULT_PARAPHRASE_DATASET,
+        help="HF dataset for text–text paraphrase/NLI training "
+             f"(default {DEFAULT_PARAPHRASE_DATASET}). Streamed; never fully "
+             "materialized in RAM.",
+    )
+    parser.add_argument(
+        "--paraphrase-config",
+        type=str,
+        default=DEFAULT_PARAPHRASE_CONFIG,
+        help="Dataset config/subset (triplet|pair|pair-class; "
+             f"default {DEFAULT_PARAPHRASE_CONFIG}).",
+    )
+    parser.add_argument(
+        "--paraphrase-queue-size",
+        type=int,
+        default=DEFAULT_PARAPHRASE_QUEUE_SIZE,
+        help="In-memory paraphrase pair queue cap "
+             f"(default {DEFAULT_PARAPHRASE_QUEUE_SIZE}).",
+    )
+    parser.add_argument(
+        "--paraphrase-refill-size",
+        type=int,
+        default=DEFAULT_PARAPHRASE_REFILL_SIZE,
+        help="How many pairs to pull from the stream when the queue is low "
+             f"(default {DEFAULT_PARAPHRASE_REFILL_SIZE}).",
+    )
+    parser.add_argument(
+        "--paraphrase-batch-size",
+        type=int,
+        default=0,
+        help="AllNLI micro-batch size per step (0 = same as --batch-size).",
+    )
+    parser.add_argument(
+        "--paraphrase-weight",
+        type=float,
+        default=1.0,
+        help="Weight on paraphrase/NLI text–text loss (default 1.0). "
+             "Set 0 or use --no-paraphrase to disable.",
+    )
+    parser.add_argument(
+        "--no-paraphrase",
+        action="store_true",
+        help="Disable streamed AllNLI paraphrase text–text loss.",
     )
     parser.add_argument(
         "--vision-patch-keep-ratio",
@@ -878,7 +938,23 @@ def main():
         image_root=image_root,
         max_text_length=args.max_input_tokens,
         with_text_queries=with_text_queries,
+        max_texts_per_image=args.max_texts_per_image,
     )
+
+    paraphrase_queue = None
+    if not args.no_paraphrase and args.paraphrase_weight > 0.0:
+        paraphrase_queue = StreamingTextPairQueue(
+            dataset_name=args.paraphrase_dataset,
+            config=args.paraphrase_config,
+            queue_size=args.paraphrase_queue_size,
+            refill_size=args.paraphrase_refill_size,
+            seed=args.seed,
+        )
+        n_prefill = paraphrase_queue.refill()
+        print(
+            f"Paraphrase queue: {args.paraphrase_dataset}/{args.paraphrase_config} "
+            f"(prefilled {n_prefill}, cap={args.paraphrase_queue_size})"
+        )
 
     query_task_w = 1.0 if with_text_queries else 0.0
     alignment_model = Stage1AlignmentModel(
@@ -1110,7 +1186,18 @@ def main():
             f"{args.freeze_backbone_ratio:.0%} of steps (then unfreeze)"
         )
     print(f"  trained dir    : {args.trained_dir}")
-    print(f"  resume step    : {start_step}\n")
+    print(f"  resume step    : {start_step}")
+    print(f"  max texts/img  : {args.max_texts_per_image}")
+    if paraphrase_queue is not None:
+        print(
+            f"  paraphrase     : w={args.paraphrase_weight} "
+            f"batch={args.paraphrase_batch_size or args.batch_size} "
+            f"queue={args.paraphrase_queue_size} "
+            f"({args.paraphrase_dataset}/{args.paraphrase_config})"
+        )
+    else:
+        print("  paraphrase     : off")
+    print()
 
     trained_path = Path(args.trained_dir)
     final_step = run_training(
@@ -1121,6 +1208,7 @@ def main():
         start_step=start_step,
         tokenizer=tokenizer,
         image_processor=image_processor,
+        paraphrase_queue=paraphrase_queue,
     )
     save_stage1_checkpoint(
         trained_path,

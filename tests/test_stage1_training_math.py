@@ -1326,3 +1326,98 @@ class TestLatestTrainedCheckpointAcrossStages(unittest.TestCase):
                     with mock.patch.object(tr, "LEGACY_CHECKPOINT_DIR", str(base / "legacy")):
                         got = tr.resolve_inference_checkpoint(latest_across_stages=True)
             self.assertEqual(got, ckpt)
+
+
+class TestMultiPosAndParaphraseQueue(unittest.TestCase):
+    def test_multi_positive_cross_entropy_prefers_pos(self):
+        from trisearch_models.training import multi_positive_cross_entropy
+
+        scores = torch.tensor([[5.0, 4.0, 0.0], [0.0, 0.1, 5.0]])
+        pos = torch.tensor([[True, True, False], [False, False, True]])
+        loss = multi_positive_cross_entropy(scores, pos)
+        self.assertGreater(float(loss), 0.0)
+        self.assertLess(float(loss), 0.5)
+
+    def test_multipos_contrastive_two_captions_one_image(self):
+        from trisearch_models.training import contrastive_late_interaction_loss
+
+        g = torch.Generator().manual_seed(7)
+        def tok(seed):
+            gg = torch.Generator().manual_seed(seed)
+            return F.normalize(torch.randn(4, 16, generator=gg), dim=-1)
+
+        imgs = [tok(1), tok(2)]
+        texts = [tok(10), tok(11), tok(20)]
+        ids = torch.tensor([0, 0, 1])
+        loss, metrics = contrastive_late_interaction_loss(
+            texts,
+            imgs,
+            temperature=0.07,
+            text_image_ids=ids,
+            score_center=False,
+            gap_weight=0.0,
+            return_metrics=True,
+            soft_maxsim_temperature=None,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(metrics["n_text_docs"], 3.0)
+        self.assertEqual(metrics["n_image_docs"], 2.0)
+
+    def test_streaming_queue_pop_and_refill(self):
+        from trisearch_dataset import StreamingTextPairQueue
+
+        rows = [
+            {"anchor": f"a{i}", "positive": f"p{i}", "negative": f"n{i}"}
+            for i in range(40)
+        ]
+        q = StreamingTextPairQueue(
+            queue_size=15,
+            refill_size=8,
+            row_iterator=iter(rows),
+            seed=1,
+        )
+        self.assertEqual(q.refill(), 8)
+        self.assertEqual(len(q), 8)
+        b1 = q.pop_batch(5)
+        self.assertEqual(len(b1), 5)
+        self.assertEqual(len(q), 3)
+        # Needs refill for larger batch
+        b2 = q.pop_batch(6)
+        self.assertEqual(len(b2), 6)
+        self.assertLessEqual(len(q), 15)
+
+    def test_build_positive_texts_includes_extras_and_query(self):
+        from trisearch_dataset import build_positive_texts_for_image
+
+        texts = build_positive_texts_for_image(
+            {"captions": ["Primary view", "Secondary view", "Primary view"]},
+            caption="Primary view",
+            related_query="search for scene",
+            max_texts=4,
+        )
+        self.assertEqual(texts[0], "primary view")
+        self.assertIn("secondary view", texts)
+        self.assertIn("search for scene", texts)
+        self.assertEqual(len(texts), len(set(texts)))
+
+    def test_paraphrase_contrastive_with_hard_negs(self):
+        from trisearch_models.training import paraphrase_contrastive_loss
+
+        g = torch.Generator().manual_seed(3)
+        def tok():
+            return F.normalize(torch.randn(3, 12, generator=g), dim=-1)
+
+        anchors = [tok() for _ in range(4)]
+        positives = [tok() for _ in range(4)]
+        negatives = [tok() for _ in range(4)]
+        loss = paraphrase_contrastive_loss(
+            anchors,
+            positives,
+            negative_tokens=negatives,
+            temperature=0.07,
+            score_center=False,
+            gap_weight=0.0,
+            soft_maxsim_temperature=None,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(float(loss), 0.0)

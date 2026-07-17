@@ -1574,6 +1574,220 @@ def _tokenize_text(tokenizer, text: str, max_text_length: int) -> dict[str, Any]
     )
 
 
+# ---------------------------------------------------------------------------
+# Streamed AllNLI / paraphrase pairs (≤ queue_size in RAM)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PARAPHRASE_DATASET = "sentence-transformers/all-nli"
+DEFAULT_PARAPHRASE_CONFIG = "triplet"
+DEFAULT_PARAPHRASE_SPLIT = "train"
+DEFAULT_PARAPHRASE_QUEUE_SIZE = 1000
+DEFAULT_PARAPHRASE_REFILL_SIZE = 1000
+DEFAULT_PARAPHRASE_SHUFFLE_BUFFER = 10_000
+DEFAULT_MAX_TEXTS_PER_IMAGE = 4
+
+
+@dataclass(frozen=True)
+class TextPairSample:
+    """One paraphrase/NLI training triple (negative optional)."""
+
+    anchor: str
+    positive: str
+    negative: str | None = None
+
+
+def parse_text_pair_row(row: dict[str, Any], *, config: str = "triplet") -> TextPairSample | None:
+    """Map a HF AllNLI (or similar) row to :class:`TextPairSample`.
+
+    Supports ``triplet`` (anchor/positive/negative), ``pair`` (anchor/positive),
+    and ``pair-class`` (premise/hypothesis/label; only entailment kept).
+    """
+    cfg = (config or "triplet").lower()
+    if cfg == "pair-class":
+        a = normalize_training_text(row.get("premise", ""))
+        b = normalize_training_text(row.get("hypothesis", ""))
+        label = row.get("label")
+        # pair-class: 0=entailment, 1=neutral, 2=contradiction (ST convention)
+        if label is not None and int(label) != 0:
+            return None
+        if not a or not b or a == b:
+            return None
+        return TextPairSample(anchor=a, positive=b, negative=None)
+    if cfg == "pair":
+        a = normalize_training_text(row.get("anchor", row.get("sentence1", "")))
+        b = normalize_training_text(row.get("positive", row.get("sentence2", "")))
+        if not a or not b or a == b:
+            return None
+        return TextPairSample(anchor=a, positive=b, negative=None)
+    # triplet (default)
+    a = normalize_training_text(row.get("anchor", row.get("premise", "")))
+    b = normalize_training_text(row.get("positive", row.get("hypothesis", "")))
+    c = normalize_training_text(row.get("negative", "") or "")
+    if not a or not b or a == b:
+        return None
+    neg = c if c and c != a and c != b else None
+    return TextPairSample(anchor=a, positive=b, negative=neg)
+
+
+def build_positive_texts_for_image(
+    row: dict[str, Any],
+    *,
+    caption: str,
+    related_query: str = "",
+    caption_column: str = "caption",
+    max_texts: int = DEFAULT_MAX_TEXTS_PER_IMAGE,
+) -> list[str]:
+    """Deduped texts that should be positives for this image (captions + query)."""
+    max_n = max(1, int(max_texts))
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(text: str) -> None:
+        t = normalize_training_text(text)
+        if not t or t in seen:
+            return
+        seen.add(t)
+        out.append(t)
+
+    _add(caption)
+    extras = row.get("captions")
+    if isinstance(extras, (list, tuple)):
+        for item in extras:
+            if len(out) >= max_n:
+                break
+            _add(item)
+    # Also try caption_column siblings if captions list missing
+    if len(out) < max_n and not isinstance(extras, (list, tuple)):
+        for key in ("caption_0", "caption_1", "caption_2", "text"):
+            if key == caption_column:
+                continue
+            if key in row and len(out) < max_n:
+                _add(str(row.get(key, "")))
+    if related_query and len(out) < max_n:
+        _add(related_query)
+    return out[:max_n]
+
+
+class StreamingTextPairQueue:
+    """In-memory queue of ≤ ``queue_size`` paraphrase pairs; refill from HF stream.
+
+    Does **not** materialize the full dataset. When training pops pairs, they are
+    **removed** from the queue. When fewer than needed remain, a new chunk of
+    ``refill_size`` pairs is pulled from a shuffled streaming iterator.
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset_name: str = DEFAULT_PARAPHRASE_DATASET,
+        config: str = DEFAULT_PARAPHRASE_CONFIG,
+        split: str = DEFAULT_PARAPHRASE_SPLIT,
+        queue_size: int = DEFAULT_PARAPHRASE_QUEUE_SIZE,
+        refill_size: int = DEFAULT_PARAPHRASE_REFILL_SIZE,
+        shuffle_buffer: int = DEFAULT_PARAPHRASE_SHUFFLE_BUFFER,
+        seed: int = 42,
+        row_iterator: Iterator[dict[str, Any]] | None = None,
+    ):
+        self.dataset_name = dataset_name
+        self.config = config
+        self.split = split
+        self.queue_size = max(1, int(queue_size))
+        self.refill_size = max(1, int(refill_size))
+        self.shuffle_buffer = max(100, int(shuffle_buffer))
+        self.seed = int(seed)
+        self._queue: list[TextPairSample] = []
+        self._iter: Iterator[dict[str, Any]] | None = row_iterator
+        self._owns_stream = row_iterator is None
+        self._refill_count = 0
+        self._rng = random.Random(self.seed)
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    @property
+    def refill_count(self) -> int:
+        return self._refill_count
+
+    def _open_stream(self) -> Iterator[dict[str, Any]]:
+        from datasets import load_dataset
+
+        # No trust_remote_code — parquet-native AllNLI only.
+        ds = load_dataset(
+            self.dataset_name,
+            self.config,
+            split=self.split,
+            streaming=True,
+        )
+        seed = self.seed + self._refill_count * 9973
+        try:
+            ds = ds.shuffle(seed=seed, buffer_size=self.shuffle_buffer)
+        except Exception:
+            # Some stream backends lack shuffle; still iterable.
+            pass
+        return iter(ds)
+
+    def _ensure_iter(self) -> Iterator[dict[str, Any]]:
+        if self._iter is None:
+            self._iter = self._open_stream()
+        return self._iter
+
+    def _next_row(self) -> dict[str, Any] | None:
+        it = self._ensure_iter()
+        try:
+            return dict(next(it))
+        except StopIteration:
+            if not self._owns_stream:
+                return None
+            # Restart stream with a new shuffle seed.
+            self._iter = self._open_stream()
+            try:
+                return dict(next(self._iter))
+            except StopIteration:
+                return None
+
+    def refill(self) -> int:
+        """Pull up to ``refill_size`` valid pairs into the queue (cap at queue_size)."""
+        added = 0
+        attempts = 0
+        max_attempts = self.refill_size * 20
+        while (
+            len(self._queue) < self.queue_size
+            and added < self.refill_size
+            and attempts < max_attempts
+        ):
+            attempts += 1
+            row = self._next_row()
+            if row is None:
+                break
+            sample = parse_text_pair_row(row, config=self.config)
+            if sample is None:
+                continue
+            self._queue.append(sample)
+            added += 1
+        self._refill_count += 1
+        return added
+
+    def pop_batch(self, n: int) -> list[TextPairSample]:
+        """Remove and return ``n`` random pairs from the queue (refilling as needed)."""
+        n = max(1, int(n))
+        if len(self._queue) < n:
+            self.refill()
+        if len(self._queue) < n:
+            # Second chance after stream restart
+            self.refill()
+        if len(self._queue) < n:
+            raise RuntimeError(
+                f"StreamingTextPairQueue could only collect {len(self._queue)} "
+                f"pairs (need {n}) from {self.dataset_name}/{self.config}. "
+                "Check network / dataset availability."
+            )
+        idxs = self._rng.sample(range(len(self._queue)), n)
+        batch = [self._queue[i] for i in idxs]
+        for i in sorted(idxs, reverse=True):
+            del self._queue[i]
+        return batch
+
+
 class ImageCaptionDataset(Dataset):
     """PyTorch dataset over **lazy** or small row sources.
 
@@ -1595,6 +1809,7 @@ class ImageCaptionDataset(Dataset):
         related_query_column: str = QUERY_CACHE_RELATED_KEY,
         unrelated_query_column: str = QUERY_CACHE_UNRELATED_KEY,
         use_extra_captions_as_related: bool = True,
+        max_texts_per_image: int = DEFAULT_MAX_TEXTS_PER_IMAGE,
     ):
         self.rows = rows
         self.image_processor = image_processor
@@ -1607,6 +1822,7 @@ class ImageCaptionDataset(Dataset):
         self.related_query_column = related_query_column
         self.unrelated_query_column = unrelated_query_column
         self.use_extra_captions_as_related = use_extra_captions_as_related
+        self.max_texts_per_image = max(1, int(max_texts_per_image))
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -1648,6 +1864,7 @@ class ImageCaptionDataset(Dataset):
             # Raw caption string for multi-positive (false-negative) masking.
             "caption": caption,
         }
+        related = ""
         if self.with_text_queries:
             related = self._resolve_related_query(row, caption)
             unrelated = normalize_training_text(
@@ -1671,6 +1888,23 @@ class ImageCaptionDataset(Dataset):
             sample["unrelated_attention_mask"] = unrelated_text["attention_mask"][0]
             # Raw query string for multi-positive (false-negative) masking on query tasks.
             sample["related_query"] = related
+
+        positive_texts = build_positive_texts_for_image(
+            row,
+            caption=caption,
+            related_query=related,
+            caption_column=self.caption_column,
+            max_texts=self.max_texts_per_image,
+        )
+        pos_ids = []
+        pos_masks = []
+        for ptext in positive_texts:
+            ptok = _tokenize_text(self.tokenizer, ptext, self.max_text_length)
+            pos_ids.append(ptok["input_ids"][0])
+            pos_masks.append(ptok["attention_mask"][0])
+        sample["positive_input_ids"] = pos_ids
+        sample["positive_attention_mask"] = pos_masks
+        sample["positive_texts"] = positive_texts
         return sample
 
 
@@ -1689,6 +1923,28 @@ class Stage1Collator:
         }
         if all("caption" in f for f in features):
             batch["captions"] = [f["caption"] for f in features]
+        # Flatten multi-text positives: T texts for B images, text_image_ids maps T→B.
+        if all("positive_input_ids" in f for f in features):
+            flat_ids: list[Any] = []
+            flat_masks: list[Any] = []
+            text_image_ids: list[int] = []
+            flat_texts: list[str] = []
+            for img_i, f in enumerate(features):
+                ids_list = f["positive_input_ids"]
+                mask_list = f["positive_attention_mask"]
+                texts = f.get("positive_texts") or [f.get("caption", "")] * len(ids_list)
+                for j, (ids, mask) in enumerate(zip(ids_list, mask_list)):
+                    flat_ids.append(ids)
+                    flat_masks.append(mask)
+                    text_image_ids.append(img_i)
+                    if j < len(texts):
+                        flat_texts.append(texts[j])
+                    else:
+                        flat_texts.append("")
+            batch["all_input_ids"] = torch.stack(flat_ids)
+            batch["all_attention_mask"] = torch.stack(flat_masks)
+            batch["text_image_ids"] = torch.tensor(text_image_ids, dtype=torch.long)
+            batch["all_positive_texts"] = flat_texts
         if self.with_text_queries:
             batch["query_input_ids"] = torch.stack(
                 [f["query_input_ids"] for f in features]

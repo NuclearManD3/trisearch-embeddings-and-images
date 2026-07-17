@@ -486,6 +486,59 @@ def masked_cross_entropy(
     return F.cross_entropy(masked, labels)
 
 
+def multi_positive_cross_entropy(
+    scores: torch.Tensor,
+    positive_mask: torch.Tensor,
+    *,
+    non_negative_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Multi-positive InfoNCE: ``log Z - logsumexp(pos)`` per row.
+
+    ``scores``: ``(B, N)`` logits. ``positive_mask``: ``(B, N)`` bool with at
+    least one True per row. Optional ``non_negative_mask`` softens other
+    near-duplicates (sets them to -inf except true positives).
+    """
+    if positive_mask.shape != scores.shape:
+        raise ValueError(
+            f"positive_mask shape {tuple(positive_mask.shape)} != "
+            f"scores shape {tuple(scores.shape)}"
+        )
+    if not bool(positive_mask.any()):
+        raise ValueError("positive_mask has no True entries")
+    logits = scores
+    if non_negative_mask is not None:
+        if non_negative_mask.shape != scores.shape:
+            raise ValueError(
+                f"non_negative_mask shape {tuple(non_negative_mask.shape)} != "
+                f"scores shape {tuple(scores.shape)}"
+            )
+        # Keep positives finite; soft-exclude other non-negatives from the denom.
+        exclude = non_negative_mask & ~positive_mask
+        logits = scores.masked_fill(exclude, float("-inf"))
+    log_z = torch.logsumexp(logits, dim=1)
+    pos_logits = logits.masked_fill(~positive_mask, float("-inf"))
+    log_pos = torch.logsumexp(pos_logits, dim=1)
+    return (log_z - log_pos).mean()
+
+
+def text_image_positive_mask(
+    text_image_ids: torch.Tensor,
+    n_images: int,
+    n_texts: int,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """``(n_images, n_texts)`` bool: True when text ``t`` is a positive for image ``i``."""
+    if text_image_ids.numel() != n_texts:
+        raise ValueError(
+            f"text_image_ids length {text_image_ids.numel()} != n_texts {n_texts}"
+        )
+    dev = device or text_image_ids.device
+    ids = text_image_ids.to(device=dev, dtype=torch.long)
+    img = torch.arange(n_images, device=dev).unsqueeze(1)  # (B, 1)
+    return ids.unsqueeze(0) == img  # (B, T)
+
+
 def keep_top_patches_by_l2(
     tokens: torch.Tensor,
     keep_ratio: float = DEFAULT_VISION_PATCH_KEEP_RATIO,
@@ -1159,6 +1212,7 @@ def contrastive_late_interaction_loss(
     gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
     gap_margin: float = DEFAULT_GAP_MARGIN,
     return_metrics: bool = False,
+    text_image_ids: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
     """Bidirectional late-interaction InfoNCE with optional memory-bank negatives.
 
@@ -1166,9 +1220,13 @@ def contrastive_late_interaction_loss(
     (t2i on ``S``, i2t on ``S.T``). With a bank, each side scores the live batch
     positives first, then bank docs as extra negatives (labels stay in ``0..B-1``).
 
+    When ``text_image_ids`` is provided (length T = len(text_tokens)), multiple
+    texts may map to the same image: t→i uses single-label CE; i→t uses
+    multi-positive InfoNCE over all texts of that image.
+
     Scores use mean-MaxSim (see ``differentiable_late_interaction_score``),
-    optionally soft MaxSim. ``non_negative_mask`` is an optional ``(B, B)`` bool
-    mask of in-batch pairs that must not act as negatives (false-neg softening).
+    optionally soft MaxSim. ``non_negative_mask`` is an optional ``(B_img, B_img)``
+    bool mask of image-level near-duplicates (expanded to text rows via ids).
 
     ``hard_bank_k`` keeps only the top-k hardest bank docs per query (see
     ``apply_hard_bank_mining``); live in-batch columns are always kept.
@@ -1186,20 +1244,36 @@ def contrastive_late_interaction_loss(
     When ``return_metrics`` is True, also returns mean positive ranks (1 = best)
     averaged over t2i and i2t — useful as a bank-size-invariant health signal.
     """
-    batch = len(text_tokens)
-    if batch != len(image_tokens):
-        raise ValueError(
-            f"text/image batch size mismatch: {batch} vs {len(image_tokens)}"
-        )
+    n_text = len(text_tokens)
+    n_image = len(image_tokens)
+    if n_text < 1 or n_image < 1:
+        raise ValueError("Contrastive loss needs non-empty text and image lists.")
+
+    # Square 1:1 path when ids omitted or diagonal.
+    use_multipos = False
+    if text_image_ids is not None:
+        ids = text_image_ids.to(device=text_tokens[0].device, dtype=torch.long).view(-1)
+        if ids.numel() != n_text:
+            raise ValueError(
+                f"text_image_ids length {ids.numel()} != n_text {n_text}"
+            )
+        if n_text != n_image or not bool(torch.equal(ids, torch.arange(n_image, device=ids.device))):
+            use_multipos = True
+    else:
+        ids = torch.arange(n_image, device=text_tokens[0].device)
+        if n_text != n_image:
+            raise ValueError(
+                f"text/image batch size mismatch: {n_text} vs {n_image} "
+                "(pass text_image_ids for multi-text positives)"
+            )
+
     bank_text = bank_text_tokens or []
     bank_image = bank_image_tokens or []
-    if batch < 2 and not bank_text and not bank_image:
+    if n_image < 2 and not bank_text and not bank_image:
         raise ValueError(
-            f"Contrastive loss needs batch_size >= 2 (got {batch}), "
+            f"Contrastive loss needs batch_size >= 2 (got {n_image} images), "
             "or a non-empty memory bank for negatives."
         )
-    if batch < 1:
-        raise ValueError("Contrastive loss needs a non-empty batch.")
 
     text_tokens, image_tokens, bank_text, bank_image = _maybe_score_center_pair(
         text_tokens,
@@ -1209,40 +1283,75 @@ def contrastive_late_interaction_loss(
         score_center=score_center,
     )
 
-    labels = torch.arange(batch, device=text_tokens[0].device)
-    n_image_docs = batch + len(bank_image)
-    n_text_docs = batch + len(bank_text)
     soft_tau = soft_maxsim_temperature
     q_topk = int(query_topk or 0)
+    n_image_docs = n_image + len(bank_image)
+    n_text_docs = n_text + len(bank_text)
+    # t→i labels: each text maps to its image index
+    labels_t2i = ids
+    # For gap/rank on multipos i2t, use first text index per image as representative.
+    primary_text_idx = torch.full((n_image,), -1, device=ids.device, dtype=torch.long)
+    for t_i, img_i in enumerate(ids.tolist()):
+        if 0 <= img_i < n_image and primary_text_idx[img_i] < 0:
+            primary_text_idx[img_i] = t_i
+    if bool((primary_text_idx < 0).any()):
+        missing = (primary_text_idx < 0).nonzero(as_tuple=False).view(-1).tolist()
+        raise ValueError(f"No text positives for image indices {missing}")
 
     def _combine_ce_and_gap(
         scores_a: torch.Tensor,
         scores_b: torch.Tensor,
         ce: torch.Tensor,
+        labels_a: torch.Tensor,
+        labels_b: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         gap_w = float(gap_weight)
         if gap_w <= 0.0:
             return ce, ce.new_zeros(())
         g = 0.5 * (
-            gap_hinge_loss(scores_a, labels, margin=gap_margin)
-            + gap_hinge_loss(scores_b, labels, margin=gap_margin)
+            gap_hinge_loss(scores_a, labels_a, margin=gap_margin)
+            + gap_hinge_loss(scores_b, labels_b, margin=gap_margin)
         )
         return ce + gap_w * g, g
 
-    if not bank_text and not bank_image:
+    # --- Expand image-level non-neg mask to text rows ---
+    def _mask_t2i(n_docs: int) -> torch.Tensor | None:
+        if non_negative_mask is None:
+            return None
+        # non_negative_mask is (n_image, n_image); expand rows by text→image
+        base = _expand_non_negative_mask(non_negative_mask, n_docs, n_image)
+        if base is None:
+            return None
+        return base[ids]  # (n_text, n_docs)
+
+    def _mask_i2t_live(n_live_text: int, n_docs: int) -> torch.Tensor | None:
+        """Soft FN mask on i2t: mark other images' near-dup primary texts."""
+        if non_negative_mask is None:
+            return None
+        # Build (n_image, n_live_text) from image-image mask via text ids
+        # entry (i, t) soft if non_neg[i, ids[t]] and i != ids[t]
+        img_of_t = ids[:n_live_text]
+        soft = non_negative_mask[:, img_of_t]  # (B, T_live)
+        # Structural multipos are handled by multipos CE, not this mask.
+        if n_docs > n_live_text:
+            pad = soft.new_zeros((n_image, n_docs - n_live_text))
+            soft = torch.cat([soft, pad], dim=1)
+        return soft
+
+    if not use_multipos and not bank_text and not bank_image:
         scores = build_late_interaction_matrix(
             text_tokens,
             image_tokens,
             soft_maxsim_temperature=soft_tau,
             query_topk=q_topk,
         ) / temperature
-        mask = _expand_non_negative_mask(non_negative_mask, batch, batch)
+        labels = torch.arange(n_image, device=scores.device)
+        mask = _expand_non_negative_mask(non_negative_mask, n_image, n_image)
         loss_t2i = masked_cross_entropy(scores, labels, non_negative_mask=mask)
-        # i2t uses the transpose; mask also transposed.
         mask_t = mask.T if mask is not None else None
         loss_i2t = masked_cross_entropy(scores.T, labels, non_negative_mask=mask_t)
         ce = 0.5 * (loss_t2i + loss_i2t)
-        loss, gap_l = _combine_ce_and_gap(scores, scores.T, ce)
+        loss, gap_l = _combine_ce_and_gap(scores, scores.T, ce, labels, labels)
         if not return_metrics:
             return loss
         rank_t2i = mean_positive_rank(scores.detach(), labels)
@@ -1276,27 +1385,84 @@ def contrastive_late_interaction_loss(
         soft_maxsim_temperature=soft_tau,
         query_topk=q_topk,
     ) / temperature
+
     scores_t2i = apply_hard_bank_mining(
         scores_t2i,
-        batch,
+        n_image if not use_multipos else n_image,
         hard_bank_k,
-        labels=labels,
+        labels=labels_t2i if use_multipos else torch.arange(n_image, device=ids.device),
         bank_fn_margin=bank_fn_margin,
         bank_random_k=bank_random_k,
     )
+    # For i2t bank mining with multipos: label = first positive text col
+    labels_i2t_primary = primary_text_idx
     scores_i2t = apply_hard_bank_mining(
         scores_i2t,
-        batch,
+        n_text,
         hard_bank_k,
-        labels=labels,
+        labels=labels_i2t_primary if use_multipos else torch.arange(n_image, device=ids.device),
         bank_fn_margin=bank_fn_margin,
         bank_random_k=bank_random_k,
     )
-    mask_t2i = _expand_non_negative_mask(non_negative_mask, n_image_docs, batch)
+
+    if use_multipos:
+        # t→i: single label per text
+        mask_t2i = _mask_t2i(n_image_docs)
+        loss_t2i = masked_cross_entropy(
+            scores_t2i, labels_t2i, non_negative_mask=mask_t2i
+        )
+        # i→t: multi-positive over live text columns (+ bank never structural pos)
+        pos_mask = text_image_positive_mask(
+            ids, n_image, n_text, device=scores_i2t.device
+        )
+        if n_text_docs > n_text:
+            pos_mask = torch.cat(
+                [
+                    pos_mask,
+                    pos_mask.new_zeros((n_image, n_text_docs - n_text)),
+                ],
+                dim=1,
+            )
+        mask_i2t = _mask_i2t_live(n_text, n_text_docs)
+        loss_i2t = multi_positive_cross_entropy(
+            scores_i2t, pos_mask, non_negative_mask=mask_i2t
+        )
+        ce = 0.5 * (loss_t2i + loss_i2t)
+        loss, gap_l = _combine_ce_and_gap(
+            scores_t2i,
+            scores_i2t,
+            ce,
+            labels_t2i,
+            labels_i2t_primary,
+        )
+        if not return_metrics:
+            return loss
+        rank_t2i = mean_positive_rank(scores_t2i.detach(), labels_t2i)
+        rank_i2t = mean_positive_rank(scores_i2t.detach(), labels_i2t_primary)
+        m_t2i = contrastive_score_margin_metrics(scores_t2i.detach(), labels_t2i)
+        m_i2t = contrastive_score_margin_metrics(
+            scores_i2t.detach(), labels_i2t_primary
+        )
+        return loss, {
+            "pos_rank_t2i": rank_t2i,
+            "pos_rank_i2t": rank_i2t,
+            "pos_rank": 0.5 * (rank_t2i + rank_i2t),
+            "n_image_docs": float(n_image_docs),
+            "n_text_docs": float(n_text_docs),
+            "pos_score": 0.5 * (m_t2i["pos_score"] + m_i2t["pos_score"]),
+            "neg_score": 0.5 * (m_t2i["neg_score"] + m_i2t["neg_score"]),
+            "score_gap": 0.5 * (m_t2i["score_gap"] + m_i2t["score_gap"]),
+            "gap_hinge": float(gap_l.detach()),
+            "contrastive_ce": float(ce.detach()),
+        }
+
+    # Square + bank (original path)
+    labels = torch.arange(n_image, device=scores_t2i.device)
+    mask_t2i = _expand_non_negative_mask(non_negative_mask, n_image_docs, n_image)
     mask_i2t = _expand_non_negative_mask(
         non_negative_mask.T if non_negative_mask is not None else None,
         n_text_docs,
-        batch,
+        n_image,
     )
     loss_t2i = masked_cross_entropy(
         scores_t2i, labels, non_negative_mask=mask_t2i
@@ -1305,7 +1471,7 @@ def contrastive_late_interaction_loss(
         scores_i2t, labels, non_negative_mask=mask_i2t
     )
     ce = 0.5 * (loss_t2i + loss_i2t)
-    loss, gap_l = _combine_ce_and_gap(scores_t2i, scores_i2t, ce)
+    loss, gap_l = _combine_ce_and_gap(scores_t2i, scores_i2t, ce, labels, labels)
     if not return_metrics:
         return loss
     rank_t2i = mean_positive_rank(scores_t2i.detach(), labels)
@@ -1324,6 +1490,73 @@ def contrastive_late_interaction_loss(
         "gap_hinge": float(gap_l.detach()),
         "contrastive_ce": float(ce.detach()),
     }
+
+
+def paraphrase_contrastive_loss(
+    anchor_tokens: list[torch.Tensor],
+    positive_tokens: list[torch.Tensor],
+    *,
+    negative_tokens: list[torch.Tensor] | None = None,
+    temperature: float = 0.07,
+    bank_doc_tokens: list[torch.Tensor] | None = None,
+    soft_maxsim_temperature: float | None = None,
+    hard_bank_k: int = 0,
+    bank_fn_margin: float | None = DEFAULT_BANK_FN_MARGIN,
+    bank_random_k: int = DEFAULT_BANK_RANDOM_K,
+    query_topk: int = 0,
+    score_center: bool = DEFAULT_SCORE_CENTER,
+    gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
+    gap_margin: float = DEFAULT_GAP_MARGIN,
+) -> torch.Tensor:
+    """Anchor→positive late-interaction InfoNCE (AllNLI / paraphrase).
+
+    Docs = ``[positives | hard_negatives | bank]``. Labels point at the matching
+    positive (diagonal in the positive block). Explicit NLI contradiction
+    negatives (when provided) sit after the positive block as live hard negs.
+    """
+    batch = len(anchor_tokens)
+    if batch != len(positive_tokens):
+        raise ValueError(
+            f"anchor/positive batch mismatch: {batch} vs {len(positive_tokens)}"
+        )
+    if batch < 1:
+        raise ValueError("paraphrase_contrastive_loss needs a non-empty batch")
+    negs = negative_tokens or []
+    bank = bank_doc_tokens or []
+    if batch < 2 and not negs and not bank:
+        raise ValueError(
+            "paraphrase_contrastive_loss needs batch>=2 or negatives/bank"
+        )
+
+    if score_center:
+        center = mean_unit_token_center(anchor_tokens, positive_tokens, negs)
+        if center is not None:
+            anchor_tokens = apply_score_center(anchor_tokens, center)
+            positive_tokens = apply_score_center(positive_tokens, center)
+            negs = apply_score_center(negs, center) if negs else negs
+            bank = apply_score_center(bank, center) if bank else bank
+
+    docs = list(positive_tokens) + list(negs) + list(bank)
+    scores = build_late_interaction_matrix(
+        anchor_tokens,
+        docs,
+        soft_maxsim_temperature=soft_maxsim_temperature,
+        query_topk=int(query_topk or 0),
+    ) / temperature
+    labels = torch.arange(batch, device=scores.device)
+    scores = apply_hard_bank_mining(
+        scores,
+        batch + len(negs),  # live = positives + explicit negs
+        hard_bank_k,
+        labels=labels,
+        bank_fn_margin=bank_fn_margin,
+        bank_random_k=bank_random_k,
+    )
+    ce = F.cross_entropy(scores, labels)
+    if float(gap_weight) > 0.0:
+        g = gap_hinge_loss(scores, labels, margin=gap_margin)
+        return ce + float(gap_weight) * g
+    return ce
 
 
 def text_text_contrastive_loss(
@@ -1474,6 +1707,7 @@ def matryoshka_loss(
     gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
     gap_margin: float = DEFAULT_GAP_MARGIN,
     embed_dim: int = EMBED_DIM,
+    text_image_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Mean of prefix-only bidirectional CE (full dim handled by the main term)."""
     prefix_dims = matryoshka_prefix_dims(dims, embed_dim=embed_dim)
@@ -1507,6 +1741,7 @@ def matryoshka_loss(
             score_center=score_center,
             gap_weight=gap_weight,
             gap_margin=gap_margin,
+            text_image_ids=text_image_ids,
         )
     return loss / total_weight
 
@@ -2142,6 +2377,73 @@ class Stage1AlignmentModel(nn.Module):
             tokens.append(matryoshka_normalize(text_raw[i, mask]))
         return tokens, raw_masked
 
+    def encode_text_tokens(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Project text ids → (normalized tokens list, raw masked list)."""
+        input_ids = input_ids.to(self.text_device, non_blocking=True)
+        attention_mask = attention_mask.to(self.text_device, non_blocking=True)
+        text_hidden = self._text_backbone()(
+            input_ids=input_ids, attention_mask=attention_mask
+        ).last_hidden_state.to(dtype=self.compute_dtype)
+        text_raw = self.text_projection(
+            text_hidden.to(self.text_projection.weight.dtype)
+        )
+        tokens: list[torch.Tensor] = []
+        raw_masked: list[torch.Tensor] = []
+        for i in range(text_raw.size(0)):
+            mask = attention_mask[i].bool()
+            raw_masked.append(text_raw[i, mask])
+            tokens.append(matryoshka_normalize(text_raw[i, mask]))
+        return tokens, raw_masked
+
+    def compute_paraphrase_loss(
+        self,
+        anchor_input_ids: torch.Tensor,
+        anchor_attention_mask: torch.Tensor,
+        positive_input_ids: torch.Tensor,
+        positive_attention_mask: torch.Tensor,
+        *,
+        negative_input_ids: torch.Tensor | None = None,
+        negative_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """AllNLI / paraphrase MaxSim InfoNCE (text tower only)."""
+        anchor_tok, _ = self.encode_text_tokens(
+            anchor_input_ids, anchor_attention_mask
+        )
+        pos_tok, _ = self.encode_text_tokens(
+            positive_input_ids, positive_attention_mask
+        )
+        neg_tok: list[torch.Tensor] = []
+        if negative_input_ids is not None and negative_attention_mask is not None:
+            neg_tok, _ = self.encode_text_tokens(
+                negative_input_ids, negative_attention_mask
+            )
+        bank = self.memory_bank
+        score_text_raw, _ = self._bank_raw_for_scoring()
+        bank_text = (
+            [matryoshka_normalize(self._to_loss(t)) for t in score_text_raw]
+            if score_text_raw
+            else []
+        )
+        return paraphrase_contrastive_loss(
+            [self._to_loss(t) for t in anchor_tok],
+            [self._to_loss(t) for t in pos_tok],
+            negative_tokens=[self._to_loss(t) for t in neg_tok] if neg_tok else None,
+            temperature=self.temperature,
+            bank_doc_tokens=bank_text,
+            soft_maxsim_temperature=self._soft_tau(),
+            hard_bank_k=self.hard_bank_negatives,
+            bank_fn_margin=self.bank_fn_margin,
+            bank_random_k=self.bank_random_k,
+            query_topk=self.query_maxsim_topk,
+            score_center=self.score_center,
+            gap_weight=self.gap_loss_weight,
+            gap_margin=self.gap_margin,
+        )
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -2153,6 +2455,10 @@ class Stage1AlignmentModel(nn.Module):
         unrelated_attention_mask: torch.Tensor | None = None,
         captions: list[str] | None = None,
         related_queries: list[str] | None = None,
+        all_input_ids: torch.Tensor | None = None,
+        all_attention_mask: torch.Tensor | None = None,
+        text_image_ids: torch.Tensor | None = None,
+        all_positive_texts: list[str] | None = None,
         return_loss: bool = True,
     ) -> dict[str, Any]:
         vdtype = self._module_dtype(self.vision_model)
@@ -2170,15 +2476,47 @@ class Stage1AlignmentModel(nn.Module):
         vision_hidden = self.vision_model(
             pixel_values=pixel_values
         ).last_hidden_state.to(dtype=self.compute_dtype)
-        text_hidden = self._text_backbone()(
-            input_ids=input_ids, attention_mask=attention_mask
-        ).last_hidden_state.to(dtype=self.compute_dtype)
         vision_raw = self.vision_projection(
             vision_hidden.to(self.vision_projection.weight.dtype)
         )
-        text_raw = self.text_projection(
-            text_hidden.to(self.text_projection.weight.dtype)
+
+        # Multi-text positives: encode all captions/queries for images when present.
+        use_all_texts = (
+            all_input_ids is not None
+            and all_attention_mask is not None
+            and text_image_ids is not None
+            and all_input_ids.shape[0] >= input_ids.shape[0]
         )
+        if use_all_texts:
+            assert all_input_ids is not None and all_attention_mask is not None
+            text_tokens, text_raw_masked = self.encode_text_tokens(
+                all_input_ids, all_attention_mask
+            )
+            ids_map = text_image_ids.to(device=self.text_device, dtype=torch.long).view(-1)
+        else:
+            text_tokens, text_raw_masked = self.encode_text_tokens(
+                input_ids, attention_mask
+            )
+            ids_map = torch.arange(
+                input_ids.shape[0], device=self.text_device, dtype=torch.long
+            )
+
+        # Primary caption tokens (1 per image) for bank + query→caption docs.
+        n_images = vision_raw.size(0)
+        primary_idx = torch.full(
+            (n_images,), -1, device=ids_map.device, dtype=torch.long
+        )
+        for t_i, img_i in enumerate(ids_map.tolist()):
+            if 0 <= img_i < n_images and primary_idx[img_i] < 0:
+                primary_idx[img_i] = t_i
+        if bool((primary_idx < 0).any()):
+            # Fall back: encode primary input_ids if multipos map incomplete.
+            prim_tok, prim_raw = self.encode_text_tokens(input_ids, attention_mask)
+            primary_text_tokens = prim_tok
+            primary_text_raw = prim_raw
+        else:
+            primary_text_tokens = [text_tokens[int(i)] for i in primary_idx.tolist()]
+            primary_text_raw = [text_raw_masked[int(i)] for i in primary_idx.tolist()]
 
         # Vision: drop background patches (pre-norm L2) before normalize / bank.
         image_raw_kept: list[torch.Tensor] = []
@@ -2188,22 +2526,18 @@ class Stage1AlignmentModel(nn.Module):
             image_raw_kept.append(kept)
             image_tokens.append(matryoshka_normalize(kept))
 
-        text_tokens: list[torch.Tensor] = []
-        text_raw_masked: list[torch.Tensor] = []
-        for i in range(text_raw.size(0)):
-            mask = attention_mask[i].bool()
-            text_raw_masked.append(text_raw[i, mask])
-            text_tokens.append(matryoshka_normalize(text_raw[i, mask]))
-
         if not return_loss:
-            return {"text_embeddings": text_tokens, "image_embeddings": image_tokens}
+            return {
+                "text_embeddings": primary_text_tokens,
+                "image_embeddings": image_tokens,
+            }
 
         loss_text_tokens = [self._to_loss(t) for t in text_tokens]
         loss_image_tokens = [self._to_loss(t) for t in image_tokens]
-        # Per-sample raw projected tokens (unnormalized) for Matryoshka + bank.
-        # Image raw uses the same L2-kept patch subset as MaxSim scoring.
         loss_text_raw = [self._to_loss(t) for t in text_raw_masked]
         loss_image_raw = [self._to_loss(t) for t in image_raw_kept]
+        loss_primary_text_tokens = [self._to_loss(t) for t in primary_text_tokens]
+        loss_primary_text_raw = [self._to_loss(t) for t in primary_text_raw]
 
         bank = self.memory_bank
         score_text_raw, score_image_raw = self._bank_raw_for_scoring()
@@ -2231,22 +2565,22 @@ class Stage1AlignmentModel(nn.Module):
         # search queries are dissimilar (different intents, similar captions).
         non_neg_cap = build_multi_positive_mask(
             captions,
-            batch_size=len(loss_text_tokens),
+            batch_size=n_images,
             jaccard_threshold=self.multi_positive_jaccard,
-            device=loss_text_tokens[0].device,
+            device=loss_image_tokens[0].device,
         )
         non_neg_query = build_multi_positive_mask(
             related_queries,
-            batch_size=len(loss_text_tokens),
+            batch_size=n_images,
             jaccard_threshold=self.multi_positive_jaccard,
-            device=loss_text_tokens[0].device,
+            device=loss_image_tokens[0].device,
         )
         # Fallback: if queries missing, do not reuse caption mask for q↔img.
         # (None → standard single-positive InfoNCE on that task.)
 
         # ------------------------------------------------------------------
         # Retrieval tasks (all InfoNCE on shared live embeddings):
-        #   1) caption ↔ image  — every caption matches its image, not others
+        #   1) caption(s) ↔ image  — all positive texts match their image
         #   2) query  ↔ image   — query finds the matching image
         #   3) query  → caption — query finds the matching caption
         # Within each task, full-dim CE + prefix Matryoshka CE both backprop into
@@ -2261,6 +2595,7 @@ class Stage1AlignmentModel(nn.Module):
         score_center = self.score_center
         gap_w = self.gap_loss_weight
         gap_m = self.gap_margin
+        ids_for_loss = ids_map.to(device=loss_image_tokens[0].device)
         contrastive, contrastive_metrics = contrastive_late_interaction_loss(
             loss_text_tokens,
             loss_image_tokens,
@@ -2277,6 +2612,7 @@ class Stage1AlignmentModel(nn.Module):
             gap_weight=gap_w,
             gap_margin=gap_m,
             return_metrics=True,
+            text_image_ids=ids_for_loss,
         )
         matryoshka = matryoshka_loss(
             loss_text_raw,
@@ -2295,6 +2631,7 @@ class Stage1AlignmentModel(nn.Module):
             gap_weight=gap_w,
             gap_margin=gap_m,
             embed_dim=self.embed_dim,
+            text_image_ids=ids_for_loss,
         )
         has_prefixes = bool(self.matryoshka_dims)
         caption_image_task = combine_full_and_matryoshka(
@@ -2375,11 +2712,11 @@ class Stage1AlignmentModel(nn.Module):
                 )
 
             if want_query_caption:
-                # Query → matching caption; not other captions / distractors / bank.
+                # Query → matching primary caption; not other captions / distractors / bank.
                 # Multi-pos softens near-duplicate *captions* (doc-side FNs).
                 text_text = text_text_contrastive_loss(
                     loss_query_tokens,
-                    loss_text_tokens,
+                    loss_primary_text_tokens,
                     loss_distractor_tokens,
                     temperature=self.temperature,
                     bank_doc_tokens=bank_text_tokens,
@@ -2395,7 +2732,7 @@ class Stage1AlignmentModel(nn.Module):
                 )
                 text_text_matryoshka = text_text_matryoshka_loss(
                     loss_query_raw,
-                    loss_text_raw,
+                    loss_primary_text_raw,
                     loss_distractor_raw,
                     dims=self.matryoshka_dims,
                     temperature=self.temperature,
@@ -2438,11 +2775,11 @@ class Stage1AlignmentModel(nn.Module):
         # Geometry / anti-cone: text + image (+ query when available).
         # Queries showed strong dim-0 bias (~0.05) in retrieval probes.
         geo_norm_lists: list[list[torch.Tensor]] = [
-            loss_text_tokens,
+            loss_primary_text_tokens,
             loss_image_tokens,
         ]
         geo_raw_lists: list[list[torch.Tensor]] = [
-            loss_text_raw,
+            loss_primary_text_raw,
             loss_image_raw,
         ]
         if loss_query_tokens:
@@ -2469,7 +2806,7 @@ class Stage1AlignmentModel(nn.Module):
         if self.heatmap_sparsity_weight > 0.0:
             sp_terms: list[torch.Tensor] = [
                 heatmap_sparsity_loss(
-                    loss_text_tokens,
+                    loss_primary_text_tokens,
                     loss_image_tokens,
                     temperature=self.heatmap_sparsity_temperature,
                 )
@@ -2492,9 +2829,9 @@ class Stage1AlignmentModel(nn.Module):
             loss = loss + self.heatmap_sparsity_weight * sparsity
 
         # Enqueue *after* scoring so the current batch is never its own negative.
-        # Policy B: enqueue every micro-batch into the live FIFO.
+        # Policy B: enqueue every micro-batch into the live FIFO (primary texts).
         if bank.enabled:
-            bank.enqueue(image_raw=loss_image_raw, text_raw=loss_text_raw)
+            bank.enqueue(image_raw=loss_image_raw, text_raw=loss_primary_text_raw)
 
         return {
             "loss": loss,
@@ -3448,6 +3785,56 @@ def sanity_check_loss(model: Stage1AlignmentModel, dataloader: DataLoader):
         )
 
 
+def tokenize_text_pair_batch(
+    tokenizer: Any,
+    pairs: list[Any],
+    *,
+    max_length: int = DEFAULT_MAX_INPUT_TOKENS,
+) -> dict[str, torch.Tensor]:
+    """Tokenize a list of TextPairSample (or anchor/positive/negative tuples)."""
+    anchors = []
+    positives = []
+    negatives = []
+    has_neg = False
+    for p in pairs:
+        if hasattr(p, "anchor"):
+            a, b, c = p.anchor, p.positive, p.negative
+        else:
+            a, b = p[0], p[1]
+            c = p[2] if len(p) > 2 else None
+        anchors.append(str(a))
+        positives.append(str(b))
+        if c:
+            has_neg = True
+            negatives.append(str(c))
+        else:
+            negatives.append("")  # placeholder; dropped if none have neg
+
+    def _tok(texts: list[str]) -> dict[str, torch.Tensor]:
+        out = tokenizer(
+            texts,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+            padding=True,
+        )
+        return {"input_ids": out["input_ids"], "attention_mask": out["attention_mask"]}
+
+    a = _tok(anchors)
+    b = _tok(positives)
+    result = {
+        "anchor_input_ids": a["input_ids"],
+        "anchor_attention_mask": a["attention_mask"],
+        "positive_input_ids": b["input_ids"],
+        "positive_attention_mask": b["attention_mask"],
+    }
+    if has_neg and all(n for n in negatives):
+        c = _tok(negatives)
+        result["negative_input_ids"] = c["input_ids"]
+        result["negative_attention_mask"] = c["attention_mask"]
+    return result
+
+
 def run_training(
     model: Stage1AlignmentModel,
     dataloader: DataLoader,
@@ -3457,6 +3844,7 @@ def run_training(
     *,
     tokenizer: Any = None,
     image_processor: Any = None,
+    paraphrase_queue: Any = None,
 ) -> int:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -3527,8 +3915,17 @@ def run_training(
     log_geo_min_std = 0.0
     log_pos_rank = 0.0
     log_score_gap = 0.0
+    log_paraphrase = 0.0
     log_batches = 0
     bank_clear_steps = int(getattr(args, "bank_clear_steps", DEFAULT_BANK_CLEAR_STEPS) or 0)
+    paraphrase_weight = float(getattr(args, "paraphrase_weight", 0.0) or 0.0)
+    paraphrase_batch_size = int(
+        getattr(args, "paraphrase_batch_size", 0) or args.batch_size
+    )
+    paraphrase_max_len = int(
+        getattr(args, "max_text_length", DEFAULT_MAX_INPUT_TOKENS)
+        or DEFAULT_MAX_INPUT_TOKENS
+    )
 
     if max_steps is not None and start_step >= max_steps:
         print(f"Already at step {start_step} (max_steps={max_steps}); nothing to train.")
@@ -3547,14 +3944,40 @@ def run_training(
                 set_backbone_trainable(model, False)
 
             outputs = model(**batch, return_loss=True)
-            loss_val = outputs["loss"].detach().float().item()
+            loss = outputs["loss"]
+            para_val = 0.0
+            if (
+                paraphrase_queue is not None
+                and paraphrase_weight > 0.0
+                and tokenizer is not None
+            ):
+                pairs = paraphrase_queue.pop_batch(paraphrase_batch_size)
+                tok = tokenize_text_pair_batch(
+                    tokenizer, pairs, max_length=paraphrase_max_len
+                )
+                para_kwargs = {
+                    "anchor_input_ids": tok["anchor_input_ids"],
+                    "anchor_attention_mask": tok["anchor_attention_mask"],
+                    "positive_input_ids": tok["positive_input_ids"],
+                    "positive_attention_mask": tok["positive_attention_mask"],
+                }
+                if "negative_input_ids" in tok:
+                    para_kwargs["negative_input_ids"] = tok["negative_input_ids"]
+                    para_kwargs["negative_attention_mask"] = tok[
+                        "negative_attention_mask"
+                    ]
+                para_loss = model.compute_paraphrase_loss(**para_kwargs)
+                para_val = float(para_loss.detach().float().item())
+                loss = loss + paraphrase_weight * para_loss
+
+            loss_val = loss.detach().float().item()
             if loss_val <= 0.0 or not math.isfinite(loss_val):
                 raise RuntimeError(
                     f"Invalid loss {loss_val} at micro-step {micro_step}. "
                     f"batch={batch['input_ids'].shape[0]} — need batch_size >= 2."
                 )
 
-            (outputs["loss"] / accum).backward()
+            (loss / accum).backward()
 
             log_loss += loss_val
             log_contrastive += float(outputs["contrastive_loss"])
@@ -3571,6 +3994,7 @@ def run_training(
             log_geo_mu += float(outputs.get("geo_mu_norm", 0.0))
             log_geo_min_std += float(outputs.get("geo_min_std", 0.0))
             log_pos_rank += float(outputs.get("pos_rank", 0.0))
+            log_paraphrase += para_val
             gap = outputs.get("score_gap", float("nan"))
             if gap == gap:  # not NaN
                 log_score_gap += float(gap)
@@ -3662,6 +4086,8 @@ def run_training(
                     msg += (
                         f" | q→cap_mrl {log_text_text_matryoshka / log_batches:.4f}"
                     )
+                if paraphrase_weight > 0.0:
+                    msg += f" | para {log_paraphrase / log_batches:.4f}"
                 if (
                     log_heatmap_sparsity > 0.0
                     or getattr(args, "heatmap_sparsity_weight", 0.0) > 0.0
@@ -3690,6 +4116,7 @@ def run_training(
                 log_heatmap_sparsity = 0.0
                 log_geo = log_geo_mu = log_geo_min_std = 0.0
                 log_pos_rank = log_score_gap = 0.0
+                log_paraphrase = 0.0
                 log_batches = 0
 
             if global_step % args.save_steps == 0:
