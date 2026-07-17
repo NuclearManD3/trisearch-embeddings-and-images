@@ -184,6 +184,16 @@ def patch_affinity_grid(
     return scores.reshape(gh, gw)
 
 
+# Heatmap display: peak-relative exponential contrast (not linear percentile stretch).
+# Cosine MaxSim non-matches often sit at 0.6–0.8 while the true match is 0.85–0.95;
+# linear maps make 0.2 vs 0.8 look huge and 0.8 vs 0.9 look tiny. We care about the
+# gap to the *best patch on this image*, not absolute cosine.
+DEFAULT_HEATMAP_PEAK_TEMPERATURE = 0.06
+DEFAULT_HEATMAP_PEAK_POWER = 1.0
+# If max−min is below this, treat the map as non-discriminative → all cold.
+DEFAULT_HEATMAP_MIN_SPREAD = 1e-4
+
+
 def _jet_colormap_rgb(t: float) -> tuple[int, int, int]:
     """Classic jet-like RGB for ``t`` in ``[0, 1]`` (no matplotlib dependency)."""
     t = max(0.0, min(1.0, float(t)))
@@ -203,20 +213,91 @@ def _jet_colormap_rgb(t: float) -> tuple[int, int, int]:
     )
 
 
+def normalize_heatmap_scores(
+    scores: torch.Tensor,
+    *,
+    mode: str = "peak",
+    peak_temperature: float = DEFAULT_HEATMAP_PEAK_TEMPERATURE,
+    peak_power: float = DEFAULT_HEATMAP_PEAK_POWER,
+    min_spread: float = DEFAULT_HEATMAP_MIN_SPREAD,
+    percentile_low: float = 5.0,
+    percentile_high: float = 95.0,
+) -> torch.Tensor:
+    """Map raw patch affinities to ``[0, 1]`` heat for colormap display.
+
+    **``mode="peak"`` (default)** — peak-relative exponential contrast:
+
+    .. math::
+
+        h_i = \\exp\\bigl((s_i - s_{\\max}) / \\tau\\bigr)^{\\gamma}
+
+    where ``τ = peak_temperature`` and ``γ = peak_power``. The hottest patch is
+    always 1; a patch ``δ`` below the max has heat ``e^{-δ/τ}`` (then raised to
+    ``γ``). Absolute level does not matter: a non-match at 0.85 stays cold if the
+    peak is 0.95 and ``τ`` is small, while 0.93 vs 0.95 still separates.
+
+    If ``max(s) − min(s) < min_spread``, returns all zeros (no discriminative
+    peak → stay cold rather than painting the whole image red).
+
+    **``mode="percentile"``** — legacy linear stretch between score percentiles
+    (old demo behaviour).
+    """
+    grid = torch.as_tensor(scores, dtype=torch.float32).detach().cpu()
+    if grid.numel() == 0:
+        return grid
+    mode_l = (mode or "peak").lower()
+    flat = grid.reshape(-1)
+    s_min = float(flat.min())
+    s_max = float(flat.max())
+    spread = s_max - s_min
+
+    if mode_l == "peak":
+        if spread < float(min_spread):
+            return torch.zeros_like(grid)
+        tau = max(float(peak_temperature), 1e-8)
+        # exp((s - s_max)/τ) ∈ (0, 1], max → 1; far below max → ~0.
+        heat = torch.exp((grid - s_max) / tau)
+        power = float(peak_power)
+        if power != 1.0:
+            if power <= 0.0:
+                raise ValueError(f"peak_power must be > 0, got {peak_power}")
+            heat = heat.pow(power)
+        return heat.clamp(0.0, 1.0)
+
+    if mode_l in ("percentile", "linear", "legacy"):
+        lo = float(torch.quantile(flat, float(percentile_low) / 100.0))
+        hi = float(torch.quantile(flat, float(percentile_high) / 100.0))
+        if hi <= lo:
+            lo, hi = s_min, s_max
+            if hi <= lo:
+                hi = lo + 1e-6
+        return ((grid - lo) / (hi - lo)).clamp(0.0, 1.0)
+
+    raise ValueError(
+        f"heatmap mode must be 'peak' or 'percentile', got {mode!r}"
+    )
+
+
 def overlay_patch_heatmap(
     image,
     patch_scores,
     *,
     grid_hw: tuple[int, int] | None = None,
     alpha: float = 0.5,
+    mode: str = "peak",
+    peak_temperature: float = DEFAULT_HEATMAP_PEAK_TEMPERATURE,
+    peak_power: float = DEFAULT_HEATMAP_PEAK_POWER,
+    min_spread: float = DEFAULT_HEATMAP_MIN_SPREAD,
     percentile_low: float = 5.0,
     percentile_high: float = 95.0,
 ):
     """Overlay a patch-affinity heatmap on a PIL image (center-crop square space).
 
     ``patch_scores`` is a flat ``(n_p,)`` or ``(H, W)`` tensor of affinities.
-    Scores are robustly normalized with percentiles then mapped with a jet
-    colormap and alpha-blended onto ``image``.
+    By default scores use **peak-relative exponential contrast** (see
+    :func:`normalize_heatmap_scores`) so only patches near the image's best
+    match light up; absolute cosine floor does not paint non-matches warm.
+    Mapped with a jet colormap and alpha-blended onto ``image``.
 
     Returns a new RGB ``PIL.Image``.
     """
@@ -240,17 +321,17 @@ def overlay_patch_heatmap(
     else:
         raise ValueError(f"patch_scores must be 1-D or 2-D, got shape {tuple(scores.shape)}")
 
-    flat = grid.reshape(-1)
-    if flat.numel() == 0:
+    if grid.numel() == 0:
         return image.convert("RGB")
-    lo = float(torch.quantile(flat, percentile_low / 100.0))
-    hi = float(torch.quantile(flat, percentile_high / 100.0))
-    if hi <= lo:
-        lo = float(flat.min())
-        hi = float(flat.max())
-        if hi <= lo:
-            hi = lo + 1e-6
-    norm = ((grid - lo) / (hi - lo)).clamp(0.0, 1.0)
+    norm = normalize_heatmap_scores(
+        grid,
+        mode=mode,
+        peak_temperature=peak_temperature,
+        peak_power=peak_power,
+        min_spread=min_spread,
+        percentile_low=percentile_low,
+        percentile_high=percentile_high,
+    )
 
     gh, gw = int(norm.shape[0]), int(norm.shape[1])
     heat = PILImage.new("RGB", (gw, gh))

@@ -103,16 +103,26 @@ from trisearch_models.training import (
     DEFAULT_GAP_LOSS_WEIGHT,
     DEFAULT_GAP_MARGIN,
     DEFAULT_GRAD_ACCUM_STEPS,
+    DEFAULT_BANK_FN_MARGIN,
+    DEFAULT_BANK_RANDOM_K,
     DEFAULT_HARD_BANK_NEGATIVES,
     DEFAULT_HEATMAP_SPARSITY_SQUARE,
     DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
     DEFAULT_HEATMAP_SPARSITY_WEIGHT,
+    DEFAULT_GRAYSCALE_PROB,
     DEFAULT_IMAGE_FILL_MODE,
     DEFAULT_IMAGE_HFLIP_PROB,
     DEFAULT_IMAGE_MAX_ROTATE_DEG,
     DEFAULT_IMAGE_SCALE_MAX,
     DEFAULT_IMAGE_SCALE_MIN,
     DEFAULT_IMAGE_SHIFT_MAX,
+    DEFAULT_PHOTO_BRIGHTNESS,
+    DEFAULT_PHOTO_CONTRAST,
+    DEFAULT_PHOTO_HUE,
+    DEFAULT_PHOTO_SATURATION,
+    DEFAULT_SPATIAL_BRIGHTNESS,
+    DEFAULT_SPATIAL_COLOR,
+    DEFAULT_SPATIAL_NOISE_GRID,
     DEFAULT_LEARNING_RATE,
     DEFAULT_LOGGING_STEPS,
     DEFAULT_MATRYOSHKA_WEIGHT,
@@ -251,7 +261,23 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_HARD_BANK_NEGATIVES,
         help="Top-k hardest memory-bank docs kept per query as InfoNCE "
              f"negatives (default {DEFAULT_HARD_BANK_NEGATIVES}). "
-             "0 uses the full bank.",
+             "0 uses the full bank (after FN filter).",
+    )
+    parser.add_argument(
+        "--bank-fn-margin",
+        type=float,
+        default=DEFAULT_BANK_FN_MARGIN,
+        help="Exclude bank cols with score >= pos - margin (logit space after "
+             f"/temp) as false negatives (default {DEFAULT_BANK_FN_MARGIN}). "
+             "Use a negative value (e.g. -1) to disable the FN filter.",
+    )
+    parser.add_argument(
+        "--bank-random-k",
+        type=int,
+        default=DEFAULT_BANK_RANDOM_K,
+        help="Extra random bank negatives kept after hard-k for diversity "
+             f"(default {DEFAULT_BANK_RANDOM_K}). Only applies when "
+             "--hard-bank-negatives > 0. 0 = hard-only.",
     )
     parser.add_argument(
         "--bank-clear-steps",
@@ -298,10 +324,11 @@ def parse_args() -> argparse.Namespace:
         "--multi-positive-jaccard",
         type=float,
         default=DEFAULT_MULTI_POSITIVE_JACCARD,
-        help="Caption token-Jaccard threshold for multi-positive non-negative "
-             f"masking in InfoNCE (default {DEFAULT_MULTI_POSITIVE_JACCARD}). "
-             "Pairs at/above threshold are excluded from the negative set. "
-             "Set 0 to disable.",
+        help="Token-Jaccard threshold for multi-positive non-negative masking "
+             f"in InfoNCE (default {DEFAULT_MULTI_POSITIVE_JACCARD}). "
+             "Applied to captions for cap↔img and q→cap; to related_query "
+             "strings for q↔img. Pairs at/above threshold are excluded from "
+             "the negative set. Set 0 to disable.",
     )
     parser.add_argument(
         "--vision-patch-keep-ratio",
@@ -381,7 +408,64 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-image-aug",
         action="store_true",
-        help="Disable all train-time geometric image augs (flip/rotate/scale/shift).",
+        help="Disable all train-time image augs (geometry + photometric + shift).",
+    )
+    parser.add_argument(
+        "--no-photometric-aug",
+        action="store_true",
+        help="Keep geometric+shift augs but disable color/brightness photometric stack.",
+    )
+    parser.add_argument(
+        "--photo-brightness",
+        type=float,
+        default=DEFAULT_PHOTO_BRIGHTNESS,
+        help=f"Global brightness jitter range (default {DEFAULT_PHOTO_BRIGHTNESS}).",
+    )
+    parser.add_argument(
+        "--photo-contrast",
+        type=float,
+        default=DEFAULT_PHOTO_CONTRAST,
+        help=f"Global contrast jitter range (default {DEFAULT_PHOTO_CONTRAST}).",
+    )
+    parser.add_argument(
+        "--photo-saturation",
+        type=float,
+        default=DEFAULT_PHOTO_SATURATION,
+        help=f"Global saturation jitter range (default {DEFAULT_PHOTO_SATURATION}).",
+    )
+    parser.add_argument(
+        "--photo-hue",
+        type=float,
+        default=DEFAULT_PHOTO_HUE,
+        help=f"Global hue jitter range (default {DEFAULT_PHOTO_HUE}).",
+    )
+    parser.add_argument(
+        "--spatial-brightness",
+        type=float,
+        default=DEFAULT_SPATIAL_BRIGHTNESS,
+        help="Strength of smooth spatial brightness field "
+             f"(default {DEFAULT_SPATIAL_BRIGHTNESS}).",
+    )
+    parser.add_argument(
+        "--spatial-color",
+        type=float,
+        default=DEFAULT_SPATIAL_COLOR,
+        help="Strength of smooth spatial RGB field "
+             f"(default {DEFAULT_SPATIAL_COLOR}).",
+    )
+    parser.add_argument(
+        "--spatial-noise-grid",
+        type=int,
+        default=DEFAULT_SPATIAL_NOISE_GRID,
+        help="Low-res noise grid size before upsample "
+             f"(default {DEFAULT_SPATIAL_NOISE_GRID}).",
+    )
+    parser.add_argument(
+        "--grayscale-prob",
+        type=float,
+        default=DEFAULT_GRAYSCALE_PROB,
+        help="Prob. of converting image to grayscale "
+             f"(default {DEFAULT_GRAYSCALE_PROB}).",
     )
     parser.add_argument(
         "--image-hflip-prob",
@@ -777,6 +861,13 @@ def main():
     image_processor = AutoImageProcessor.from_pretrained(args.vision_processor_id)
     target_size = vision_model.config.image_size
     image_processor.size = {"height": target_size, "width": target_size}
+    # Photometric augs denorm/renorm with processor stats when present.
+    image_mean = getattr(image_processor, "image_mean", None)
+    image_std = getattr(image_processor, "image_std", None)
+    if image_mean is not None:
+        image_mean = tuple(float(x) for x in image_mean)
+    if image_std is not None:
+        image_std = tuple(float(x) for x in image_std)
 
     train_dataset = ImageCaptionDataset(
         rows=mixed_rows,
@@ -809,6 +900,11 @@ def main():
             args.query_image_weight * query_task_w if with_text_queries else 0.0
         ),
         hard_bank_negatives=args.hard_bank_negatives,
+        # Negative margin → disable FN filter (None).
+        bank_fn_margin=(
+            None if args.bank_fn_margin < 0 else args.bank_fn_margin
+        ),
+        bank_random_k=args.bank_random_k,
         compute_dtype=compute_dtype,
         memory_bank_size=args.memory_bank_size,
         soft_maxsim=args.soft_maxsim,
@@ -829,6 +925,17 @@ def main():
         image_scale_max=args.image_scale_max,
         image_fill_mode=args.image_fill_mode,
         image_aug_enabled=not args.no_image_aug,
+        photometric_enabled=not args.no_photometric_aug,
+        photo_brightness=args.photo_brightness,
+        photo_contrast=args.photo_contrast,
+        photo_saturation=args.photo_saturation,
+        photo_hue=args.photo_hue,
+        spatial_brightness=args.spatial_brightness,
+        spatial_color=args.spatial_color,
+        spatial_noise_grid=args.spatial_noise_grid,
+        grayscale_prob=args.grayscale_prob,
+        image_mean=image_mean,
+        image_std=image_std,
         heatmap_sparsity_weight=args.heatmap_sparsity_weight,
         heatmap_sparsity_temperature=args.heatmap_sparsity_temperature,
         heatmap_sparsity_square=args.heatmap_sparsity_square,
@@ -892,15 +999,20 @@ def main():
     print(f"  effective batch: {args.batch_size * args.gradient_accumulation_steps}")
     print(
         f"  memory bank    : {args.memory_bank_size} "
-        f"(hard top-{args.hard_bank_negatives} bank negs/query; "
+        f"(hard top-{args.hard_bank_negatives} + random {args.bank_random_k}; "
         f"in-batch always kept; clear every {args.bank_clear_steps or 'never'})"
     )
+    fn_m = "off" if args.bank_fn_margin < 0 else args.bank_fn_margin
+    print(f"  bank FN margin : {fn_m} (exclude bank ≥ pos − margin)")
     print(f"  bank policy    : {args.bank_score_policy}")
     print(
         f"  soft MaxSim    : {args.soft_maxsim}"
         + (f" (τ_s={args.soft_maxsim_temperature})" if args.soft_maxsim else "")
     )
-    print(f"  multi-pos Jac  : {args.multi_positive_jaccard}")
+    print(
+        f"  multi-pos Jac  : {args.multi_positive_jaccard} "
+        f"(captions for cap↔img/q→cap; related_query for q↔img)"
+    )
     print(f"  vision keep    : {args.vision_patch_keep_ratio} (L2 background drop)")
     print(
         f"  patch dropout  : {args.vision_patch_drop_prob} "
@@ -932,6 +1044,16 @@ def main():
             f"(anisotropic), fill={args.image_fill_mode}, "
             f"shift ±{args.image_shift_max} px (train-only)"
         )
+        if args.no_photometric_aug:
+            print("  photometric    : disabled (--no-photometric-aug)")
+        else:
+            print(
+                f"  photometric    : bright±{args.photo_brightness}, "
+                f"contrast±{args.photo_contrast}, sat±{args.photo_saturation}, "
+                f"hue±{args.photo_hue}; spatial b={args.spatial_brightness} "
+                f"c={args.spatial_color} grid={args.spatial_noise_grid}; "
+                f"gray p={args.grayscale_prob}"
+            )
     print(
         f"  heatmap sparse : weight={args.heatmap_sparsity_weight} "
         f"({'squared' if args.heatmap_sparsity_square else 'linear'}, "

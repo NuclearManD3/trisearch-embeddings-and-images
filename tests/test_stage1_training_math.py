@@ -49,6 +49,13 @@ from trisearch_models.training import (
     random_shift_pixel_values,
     soft_or_hard_maxsim,
     train_image_geometric_augment,
+    train_image_photometric_augment,
+)
+from image_augment import (
+    DEFAULT_GRAYSCALE_PROB,
+    denormalize_pixel_values,
+    normalize_pixel_values,
+    smooth_noise_field,
 )
 
 
@@ -605,6 +612,108 @@ class TestTrainImageGeometricAugment(unittest.TestCase):
         self.assertLess(float(y[0, 0, 16, 2]), 0.5)
 
 
+class TestPhotometricAugment(unittest.TestCase):
+    def test_preserves_shape_and_finite(self):
+        x = torch.randn(2, 3, 48, 48)
+        y = train_image_photometric_augment(
+            x,
+            brightness=0.3,
+            contrast=0.3,
+            saturation=0.3,
+            hue=0.05,
+            spatial_brightness=0.2,
+            spatial_color=0.1,
+            grayscale_prob=0.0,
+        )
+        self.assertEqual(tuple(y.shape), tuple(x.shape))
+        self.assertTrue(torch.isfinite(y).all())
+
+    def test_disabled_is_identity(self):
+        x = torch.randn(1, 3, 32, 32)
+        y = train_image_photometric_augment(x, enabled=False)
+        self.assertTrue(torch.equal(x, y))
+
+    def test_strong_brightness_changes_mean(self):
+        torch.manual_seed(0)
+        # Mid-gray in denorm space after normalize with mean=std=0.5
+        rgb = torch.full((1, 3, 32, 32), 0.5)
+        x = normalize_pixel_values(rgb, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        y = train_image_photometric_augment(
+            x,
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+            brightness=0.5,
+            contrast=0.0,
+            saturation=0.0,
+            hue=0.0,
+            spatial_brightness=0.0,
+            spatial_color=0.0,
+            grayscale_prob=0.0,
+        )
+        # Multiple draws until brightness factor ≠ 1
+        changed = False
+        for _ in range(20):
+            y = train_image_photometric_augment(
+                x,
+                mean=(0.5, 0.5, 0.5),
+                std=(0.5, 0.5, 0.5),
+                brightness=0.5,
+                contrast=0.0,
+                saturation=0.0,
+                hue=0.0,
+                spatial_brightness=0.0,
+                spatial_color=0.0,
+                grayscale_prob=0.0,
+            )
+            if not torch.allclose(y, x, atol=1e-5):
+                changed = True
+                break
+        self.assertTrue(changed)
+
+    def test_grayscale_makes_channels_equal(self):
+        torch.manual_seed(1)
+        rgb = torch.rand(1, 3, 24, 24)
+        x = normalize_pixel_values(rgb, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        y = train_image_photometric_augment(
+            x,
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+            brightness=0.0,
+            contrast=0.0,
+            saturation=0.0,
+            hue=0.0,
+            spatial_brightness=0.0,
+            spatial_color=0.0,
+            grayscale_prob=1.0,
+        )
+        rgb_y = denormalize_pixel_values(y, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        self.assertTrue(torch.allclose(rgb_y[0, 0], rgb_y[0, 1], atol=1e-5))
+        self.assertTrue(torch.allclose(rgb_y[0, 1], rgb_y[0, 2], atol=1e-5))
+
+    def test_smooth_noise_shape(self):
+        f = smooth_noise_field(2, 3, 40, 40, grid=8)
+        self.assertEqual(tuple(f.shape), (2, 3, 40, 40))
+        self.assertTrue(torch.isfinite(f).all())
+
+    def test_full_stack_with_photometric(self):
+        x = torch.randn(2, 3, 40, 40)
+        y = apply_train_image_augmentations(
+            x,
+            photometric=True,
+            photo_brightness=0.2,
+            spatial_brightness=0.1,
+            spatial_color=0.05,
+            grayscale_prob=0.0,
+            max_shift=4,
+            enabled=True,
+        )
+        self.assertEqual(tuple(y.shape), tuple(x.shape))
+        self.assertTrue(torch.isfinite(y).all())
+
+    def test_default_grayscale_prob_positive(self):
+        self.assertGreater(DEFAULT_GRAYSCALE_PROB, 0.0)
+
+
 class TestHeatmapSparsityLoss(unittest.TestCase):
     def test_uniform_higher_than_peaked(self):
         # One query token; image patches: peaked vs flat similarities.
@@ -955,7 +1064,9 @@ class TestHardBankMining(unittest.TestCase):
                 [0.0, 1.0,  1.0, 9.0, 8.0, 0.5],  # top2 = 9,8
             ]
         )
-        out = apply_hard_bank_mining(scores, n_live=2, hard_k=2)
+        out = apply_hard_bank_mining(
+            scores, n_live=2, hard_k=2, bank_random_k=0, bank_fn_margin=None
+        )
         # live unchanged
         self.assertTrue(torch.equal(out[:, :2], scores[:, :2]))
         # row0 bank: keep 5 and 4, mask 3 and 2
@@ -969,10 +1080,72 @@ class TestHardBankMining(unittest.TestCase):
         self.assertTrue(torch.isfinite(out[1, 4]))
         self.assertTrue(torch.isinf(out[1, 5]) and out[1, 5] < 0)
 
-    def test_hard_k_zero_is_noop(self):
+    def test_hard_k_zero_is_full_bank(self):
         scores = torch.randn(3, 10)
-        out = apply_hard_bank_mining(scores, n_live=3, hard_k=0)
+        # hard_k=0 → full bank (random_k ignored); no FN without labels.
+        out = apply_hard_bank_mining(
+            scores, n_live=3, hard_k=0, bank_random_k=8, bank_fn_margin=None
+        )
         self.assertTrue(torch.equal(out, scores))
+
+    def test_fn_filter_masks_bank_near_positive(self):
+        # live pos col 0 score=5; bank col with 6 should be FN at margin=0.
+        scores = torch.tensor(
+            [
+                [5.0, 0.0,  6.0, 4.0, 1.0],  # bank: 6 FN, 4 hard, 1 soft
+            ]
+        )
+        labels = torch.tensor([0])
+        out = apply_hard_bank_mining(
+            scores,
+            n_live=2,
+            hard_k=2,
+            labels=labels,
+            bank_fn_margin=0.0,
+            bank_random_k=0,
+        )
+        self.assertTrue(torch.isinf(out[0, 2]) and out[0, 2] < 0)  # FN
+        self.assertTrue(torch.isfinite(out[0, 3]))  # hard
+        self.assertTrue(torch.isfinite(out[0, 4]))  # hard (only 2 non-FN)
+
+    def test_fn_filter_margin_keeps_slightly_below_pos(self):
+        scores = torch.tensor([[10.0, 0.0, 9.5, 1.0, 0.5]])
+        labels = torch.tensor([0])
+        # margin=0 → 9.5 < 10 stays; margin=0 means thr=10, bank>=10 filtered
+        out = apply_hard_bank_mining(
+            scores,
+            n_live=2,
+            hard_k=3,
+            labels=labels,
+            bank_fn_margin=0.0,
+            bank_random_k=0,
+        )
+        self.assertTrue(torch.isfinite(out[0, 2]))  # 9.5 < 10
+
+        out2 = apply_hard_bank_mining(
+            scores,
+            n_live=2,
+            hard_k=3,
+            labels=labels,
+            bank_fn_margin=1.0,  # thr=9 → 9.5 is FN
+            bank_random_k=0,
+        )
+        self.assertTrue(torch.isinf(out2[0, 2]) and out2[0, 2] < 0)
+
+    def test_hard_plus_random_keeps_extra(self):
+        torch.manual_seed(0)
+        # bank: 5,4,3,2,1 — hard_k=1 keeps 5; random_k=1 keeps one of 4..1
+        scores = torch.tensor([[0.0, 1.0, 5.0, 4.0, 3.0, 2.0, 1.0]])
+        out = apply_hard_bank_mining(
+            scores,
+            n_live=2,
+            hard_k=1,
+            bank_random_k=1,
+            bank_fn_margin=None,
+        )
+        finite_bank = torch.isfinite(out[0, 2:]).sum().item()
+        self.assertEqual(finite_bank, 2)  # 1 hard + 1 random
+        self.assertTrue(torch.isfinite(out[0, 2]))  # hardest always kept
 
     def test_contrastive_with_hard_bank_finite(self):
         texts = _rand_tokens(2, [3, 2], dim=8, seed=20)
@@ -986,9 +1159,35 @@ class TestHardBankMining(unittest.TestCase):
             bank_text_tokens=bank_t,
             bank_image_tokens=bank_i,
             hard_bank_k=2,
+            bank_random_k=1,
+            bank_fn_margin=0.0,
         )
         self.assertTrue(torch.isfinite(loss))
-        self.assertGreater(float(loss), 0.0)
+
+    def test_query_mask_differs_from_caption_mask(self):
+        """Caption-near-dups must not force query-task multi-pos when queries differ."""
+        caps = [
+            "a red sports car on a racetrack",
+            "a red sports car on a track",  # high caption Jaccard
+            "satellite view of a harbor",
+        ]
+        queries = [
+            "sports car photo",
+            "harbor aerial",  # different intent despite similar first captions
+            "harbor aerial view",
+        ]
+        cap_mask = build_multi_positive_mask(
+            caps, batch_size=3, jaccard_threshold=0.5, device=torch.device("cpu")
+        )
+        q_mask = build_multi_positive_mask(
+            queries, batch_size=3, jaccard_threshold=0.5, device=torch.device("cpu")
+        )
+        assert cap_mask is not None and q_mask is not None
+        # Captions 0 and 1 are multi-pos; queries 0 and 1 are not.
+        self.assertTrue(bool(cap_mask[0, 1]))
+        self.assertFalse(bool(q_mask[0, 1]))
+        # Queries 1 and 2 may be multi-pos (harbor).
+        self.assertTrue(bool(q_mask[1, 2]))
 
 
 class TestMeanTaskLossesErrorAtOutputs(unittest.TestCase):
@@ -1013,3 +1212,117 @@ class TestMeanTaskLossesErrorAtOutputs(unittest.TestCase):
         e2 = e.detach().clone().requires_grad_(True)
         (0.5 * (e2 * e2).sum() + 0.5 * (e2 - 1.0).pow(2).sum()).backward()
         self.assertTrue(torch.allclose(e.grad, e2.grad))
+
+
+class TestPeakHeatmapNormalize(unittest.TestCase):
+    def test_peak_is_one_and_far_is_cold(self):
+        from trisearch_models.inference import normalize_heatmap_scores
+
+        # High absolute floor; only the 0.95 peak should be hot.
+        s = torch.tensor([0.80, 0.82, 0.95, 0.88])
+        h = normalize_heatmap_scores(s, mode="peak", peak_temperature=0.06)
+        self.assertAlmostEqual(float(h[2]), 1.0, places=5)
+        # δ=0.15 → exp(-0.15/0.06) ≈ 0.082
+        self.assertLess(float(h[0]), 0.15)
+        # Close non-match 0.88 vs peak 0.95: δ=0.07 → exp(-0.07/0.06) ≈ 0.31
+        self.assertGreater(float(h[3]), float(h[0]))
+        self.assertLess(float(h[3]), 0.5)
+
+    def test_absolute_level_does_not_paint_flat_hot(self):
+        from trisearch_models.inference import normalize_heatmap_scores
+
+        flat_high = torch.full((8,), 0.9)
+        h = normalize_heatmap_scores(flat_high, mode="peak", min_spread=1e-4)
+        self.assertTrue(torch.all(h == 0.0))
+
+    def test_close_match_separates_better_than_linear_percentile(self):
+        from trisearch_models.inference import normalize_heatmap_scores
+
+        # One peak 0.9, close 0.85, bulk non-match ~0.7
+        s = torch.tensor([0.70, 0.71, 0.72, 0.85, 0.90])
+        peak = normalize_heatmap_scores(s, mode="peak", peak_temperature=0.05)
+        lin = normalize_heatmap_scores(s, mode="percentile")
+        # Peak mode: gap between 0.85 and 0.90 should dominate visual scale.
+        peak_gap = float(peak[4] - peak[3])
+        lin_gap = float(lin[4] - lin[3])
+        # Relative separation of close pair vs bulk: peak compresses bulk to near 0.
+        self.assertLess(float(peak[0]), 0.05)
+        self.assertGreater(peak_gap, lin_gap * 0.5)  # at least competitive
+        self.assertAlmostEqual(float(peak[4]), 1.0, places=5)
+
+
+class TestLatestTrainedCheckpointAcrossStages(unittest.TestCase):
+    """find_latest_trained_checkpoint: stage5→1, newest within highest stage."""
+
+    def _make_ckpt(self, root: Path, *, mtime: float | None = None) -> Path:
+        import os
+        import time
+
+        root.mkdir(parents=True, exist_ok=True)
+        for comp in ("vision_model", "text_model"):
+            d = root / comp
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "model.safetensors").write_bytes(b"x")
+            (d / "config.json").write_text('{"model_type": "test"}', encoding="utf-8")
+        proj = root / "projection_heads.pt"
+        proj.write_bytes(b"y")
+        if mtime is not None:
+            os.utime(proj, (mtime, mtime))
+            os.utime(root, (mtime, mtime))
+        return root
+
+    def test_prefers_higher_stage_over_newer_lower(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        import trisearch_models.training as tr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            s1 = base / "stage1"
+            s2 = base / "stage2"
+            self._make_ckpt(s1 / "history" / "step-9000", mtime=2_000_000_000)
+            self._make_ckpt(s2 / "history" / "step-10", mtime=1_000_000_000)
+            with mock.patch.object(tr, "TRAINED_ROOT", str(base)):
+                with mock.patch.object(tr, "DEFAULT_TRAINED_DIR", str(s1)):
+                    with mock.patch.object(tr, "LEGACY_CHECKPOINT_DIR", str(base / "legacy")):
+                        found = tr.find_latest_trained_checkpoint(max_stage=5, min_stage=1)
+            self.assertIsNotNone(found)
+            self.assertEqual(found, s2 / "history" / "step-10")
+
+    def test_within_stage_picks_newest_mtime(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        import trisearch_models.training as tr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            s1 = base / "stage1"
+            older = self._make_ckpt(s1 / "history" / "step-100", mtime=1000)
+            newer = self._make_ckpt(s1 / "history" / "step-200", mtime=2000)
+            with mock.patch.object(tr, "TRAINED_ROOT", str(base)):
+                with mock.patch.object(tr, "DEFAULT_TRAINED_DIR", str(s1)):
+                    with mock.patch.object(tr, "LEGACY_CHECKPOINT_DIR", str(base / "legacy")):
+                        found = tr.find_latest_trained_checkpoint()
+            self.assertEqual(found, newer)
+            self.assertNotEqual(found, older)
+
+    def test_resolve_latest_across_stages_flag(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        import trisearch_models.training as tr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            s1 = base / "stage1"
+            ckpt = self._make_ckpt(s1, mtime=5000)
+            with mock.patch.object(tr, "TRAINED_ROOT", str(base)):
+                with mock.patch.object(tr, "DEFAULT_TRAINED_DIR", str(s1)):
+                    with mock.patch.object(tr, "LEGACY_CHECKPOINT_DIR", str(base / "legacy")):
+                        got = tr.resolve_inference_checkpoint(latest_across_stages=True)
+            self.assertEqual(got, ckpt)

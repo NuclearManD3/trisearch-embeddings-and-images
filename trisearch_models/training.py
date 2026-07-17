@@ -20,8 +20,33 @@ from trisearch_dataset import (
     load_verification_samples,
 )
 
+from image_augment import (
+    DEFAULT_GRAYSCALE_PROB,
+    DEFAULT_IMAGE_FILL_MODE,
+    DEFAULT_IMAGE_HFLIP_PROB,
+    DEFAULT_IMAGE_MAX_ROTATE_DEG,
+    DEFAULT_IMAGE_MEAN,
+    DEFAULT_IMAGE_SCALE_MAX,
+    DEFAULT_IMAGE_SCALE_MIN,
+    DEFAULT_IMAGE_SHIFT_MAX,
+    DEFAULT_IMAGE_STD,
+    DEFAULT_PHOTO_BRIGHTNESS,
+    DEFAULT_PHOTO_CONTRAST,
+    DEFAULT_PHOTO_HUE,
+    DEFAULT_PHOTO_SATURATION,
+    DEFAULT_PHOTOMETRIC_ENABLED,
+    DEFAULT_SPATIAL_BRIGHTNESS,
+    DEFAULT_SPATIAL_COLOR,
+    DEFAULT_SPATIAL_NOISE_GRID,
+    apply_train_image_augmentations,
+    random_shift_pixel_values,
+    train_image_geometric_augment,
+    train_image_photometric_augment,
+)
+
 from .inference import (
     EMBED_DIM,
+    MAX_TRAINING_PHASE,
     QWEN_DIR,
     QWEN_TOKENIZER_ID,
     SIGLIP_DIR,
@@ -34,6 +59,7 @@ from .inference import (
 
 DEFAULT_SEED_VISION_DIR = SIGLIP_DIR
 DEFAULT_SEED_TEXT_DIR = QWEN_DIR
+TRAINED_ROOT = "models/trained"
 DEFAULT_TRAINED_DIR = "models/trained/stage1"
 LEGACY_CHECKPOINT_DIR = "checkpoints/stage1"
 VISION_COMPONENT = "vision_model"
@@ -63,15 +89,6 @@ DEFAULT_VISION_MERGE_ASSIGN_TEMPERATURE = 0.05
 DEFAULT_SCORE_CENTER = True
 # Mean only the top-k query-token MaxSims (0 = mean all). Drops stopword-like tokens.
 DEFAULT_QUERY_MAXSIM_TOPK = 8
-# Train-only: random integer translate in [-max, max] pixels (reflect pad).
-DEFAULT_IMAGE_SHIFT_MAX = 18
-# Train-only geometric aug (flip / rotate / mild scale-stretch + pad fill).
-DEFAULT_IMAGE_HFLIP_PROB = 0.5
-DEFAULT_IMAGE_MAX_ROTATE_DEG = 30.0
-DEFAULT_IMAGE_SCALE_MIN = 0.75
-DEFAULT_IMAGE_SCALE_MAX = 1.05
-# "random" | "mean" | "reflect" fill for rotate/scale gaps.
-DEFAULT_IMAGE_FILL_MODE = "random"
 # Heatmap sparsity stuck ~1.0 and added noise; off unless debugging demos.
 DEFAULT_HEATMAP_SPARSITY_WEIGHT = 0.0
 DEFAULT_HEATMAP_SPARSITY_TEMPERATURE = 0.07
@@ -80,6 +97,10 @@ DEFAULT_HEATMAP_SPARSITY_TEMPERATURE = 0.07
 DEFAULT_HEATMAP_SPARSITY_SQUARE = True
 # Top-k hardest bank docs kept per query as InfoNCE negatives (0 = use full bank).
 DEFAULT_HARD_BANK_NEGATIVES = 32
+# Exclude bank cols with score >= pos - margin (logit space) as false negatives.
+DEFAULT_BANK_FN_MARGIN = 0.0
+# Extra random bank negatives after hard-k (diversity; 0 = hard-only).
+DEFAULT_BANK_RANDOM_K = 8
 # Flush FIFO bank periodically so a collapsed stretch cannot poison all negatives.
 DEFAULT_BANK_CLEAR_STEPS = 250
 # Direct margin on score_gap = mean(pos) - mean(finite negs) after /temp + hard-k.
@@ -524,223 +545,8 @@ def random_drop_patches(
     return tokens[idx]
 
 
-def random_shift_pixel_values(
-    pixel_values: torch.Tensor,
-    max_shift: int = DEFAULT_IMAGE_SHIFT_MAX,
-) -> torch.Tensor:
-    """Per-image integer shift in ``[-max_shift, max_shift]`` with reflect pad.
-
-    ``pixel_values`` is ``(B, C, H, W)``. Each sample draws independent ``(dy, dx)``.
-    Used only during training to reduce grid-position memorization (sub-patch /
-    one-patch scale when max_shift ≈ patch size).
-    """
-    if max_shift is None or int(max_shift) <= 0:
-        return pixel_values
-    if pixel_values.ndim != 4:
-        raise ValueError(
-            f"pixel_values must be (B,C,H,W), got shape {tuple(pixel_values.shape)}"
-        )
-    max_shift = int(max_shift)
-    b, _, h, w = pixel_values.shape
-    pad = max_shift
-    # (left, right, top, bottom)
-    padded = F.pad(pixel_values, (pad, pad, pad, pad), mode="reflect")
-    out = pixel_values.new_empty(pixel_values.shape)
-    for i in range(b):
-        dy = int(torch.randint(-max_shift, max_shift + 1, (1,)).item())
-        dx = int(torch.randint(-max_shift, max_shift + 1, (1,)).item())
-        y0 = pad + dy
-        x0 = pad + dx
-        out[i] = padded[i, :, y0 : y0 + h, x0 : x0 + w]
-    return out
-
-
-def _sample_fill_color(
-    image_chw: torch.Tensor,
-    mode: str = DEFAULT_IMAGE_FILL_MODE,
-) -> list[float]:
-    """Per-channel fill for gaps (normalized tensor space).
-
-    * ``random`` — uniform in an expanded range around the image min/max
-    * ``mean`` — channel means of the image
-    * ``reflect`` — unused here (caller uses reflect pad); falls back to mean
-    """
-    c = int(image_chw.shape[0])
-    mode = (mode or "random").lower()
-    if mode == "reflect":
-        mode = "mean"
-    if mode == "mean":
-        return [float(image_chw[ch].mean()) for ch in range(c)]
-    # random: sample per channel in [lo-margin, hi+margin]
-    fills: list[float] = []
-    for ch in range(c):
-        lo = float(image_chw[ch].min())
-        hi = float(image_chw[ch].max())
-        span = max(hi - lo, 1e-3)
-        lo_e, hi_e = lo - 0.25 * span, hi + 0.25 * span
-        fills.append(float(lo_e + (hi_e - lo_e) * torch.rand(1).item()))
-    return fills
-
-
-def _fit_chw_to_size(
-    image_chw: torch.Tensor,
-    out_h: int,
-    out_w: int,
-    fill: list[float],
-) -> torch.Tensor:
-    """Center-pad (shrink) or center-crop (mild expand) a ``(C,H,W)`` tensor."""
-    c, h, w = image_chw.shape
-    # Pad if smaller.
-    pad_top = max(0, (out_h - h) // 2)
-    pad_bottom = max(0, out_h - h - pad_top)
-    pad_left = max(0, (out_w - w) // 2)
-    pad_right = max(0, out_w - w - pad_left)
-    if pad_top or pad_bottom or pad_left or pad_right:
-        # F.pad on (C,H,W) uses last dims: (left, right, top, bottom)
-        # pad value: use mean fill broadcast — pad with zeros then paint.
-        image_chw = F.pad(
-            image_chw,
-            (pad_left, pad_right, pad_top, pad_bottom),
-            mode="constant",
-            value=0.0,
-        )
-        if pad_top:
-            for ch, v in enumerate(fill):
-                image_chw[ch, :pad_top, :] = v
-        if pad_bottom:
-            for ch, v in enumerate(fill):
-                image_chw[ch, image_chw.shape[1] - pad_bottom :, :] = v
-        if pad_left:
-            for ch, v in enumerate(fill):
-                image_chw[ch, :, :pad_left] = v
-        if pad_right:
-            for ch, v in enumerate(fill):
-                image_chw[ch, :, image_chw.shape[2] - pad_right :] = v
-        h, w = image_chw.shape[1], image_chw.shape[2]
-    # Center-crop if larger (limited expand path).
-    if h > out_h or w > out_w:
-        top = max(0, (h - out_h) // 2)
-        left = max(0, (w - out_w) // 2)
-        image_chw = image_chw[:, top : top + out_h, left : left + out_w]
-    # Exact size guard (rounding).
-    if image_chw.shape[1] != out_h or image_chw.shape[2] != out_w:
-        image_chw = F.interpolate(
-            image_chw.unsqueeze(0),
-            size=(out_h, out_w),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-    return image_chw
-
-
-def train_image_geometric_augment(
-    pixel_values: torch.Tensor,
-    *,
-    hflip_prob: float = DEFAULT_IMAGE_HFLIP_PROB,
-    max_rotate_deg: float = DEFAULT_IMAGE_MAX_ROTATE_DEG,
-    scale_min: float = DEFAULT_IMAGE_SCALE_MIN,
-    scale_max: float = DEFAULT_IMAGE_SCALE_MAX,
-    fill_mode: str = DEFAULT_IMAGE_FILL_MODE,
-) -> torch.Tensor:
-    """Train-time geometric aug: H-flip, rotate, anisotropic scale, pad/crop.
-
-    ``pixel_values`` is ``(B, C, H, W)`` (typically processor-normalized).
-
-    Design (content-preserving):
-    * Horizontal flip with probability ``hflip_prob``.
-    * Rotation uniform in ``[-max_rotate_deg, max_rotate_deg]`` (same output size;
-      corners filled).
-    * Independent ``scale_x, scale_y`` in ``[scale_min, scale_max]``. Shrink pads
-      with fill; mild expand center-crops so labels stay mostly valid
-      (``scale_max`` should stay near 1.05–1.10).
-    * Fill: ``random`` / ``mean`` channel colors in tensor space (not raw RGB).
-
-    Does **not** apply integer pixel shift — compose with
-    ``random_shift_pixel_values`` separately.
-    """
-    if pixel_values.ndim != 4:
-        raise ValueError(
-            f"pixel_values must be (B,C,H,W), got shape {tuple(pixel_values.shape)}"
-        )
-    b, c, h, w = pixel_values.shape
-    smin = float(scale_min)
-    smax = float(scale_max)
-    if smin <= 0 or smax <= 0 or smin > smax:
-        raise ValueError(f"invalid scale range [{smin}, {smax}]")
-    max_rot = abs(float(max_rotate_deg))
-    hflip_p = float(hflip_prob)
-
-    # torchvision is the clean path for rotate on CHW batches.
-    try:
-        import torchvision.transforms.functional as tvf
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "train_image_geometric_augment requires torchvision"
-        ) from exc
-
-    out = pixel_values.new_empty(pixel_values.shape)
-    for i in range(b):
-        img = pixel_values[i]
-        fill = _sample_fill_color(img, mode=fill_mode)
-
-        if hflip_p > 0.0 and torch.rand(1).item() < hflip_p:
-            img = tvf.hflip(img)
-
-        if max_rot > 0.0:
-            angle = float((-max_rot) + (2.0 * max_rot) * torch.rand(1).item())
-            if abs(angle) > 1e-6:
-                # fill: sequence length C for multi-channel.
-                img = tvf.rotate(
-                    img,
-                    angle=angle,
-                    interpolation=tvf.InterpolationMode.BILINEAR,
-                    expand=False,
-                    fill=fill,
-                )
-
-        # Anisotropic scale (independent x/y).
-        sx = float(smin + (smax - smin) * torch.rand(1).item())
-        sy = float(smin + (smax - smin) * torch.rand(1).item())
-        if abs(sx - 1.0) > 1e-6 or abs(sy - 1.0) > 1e-6:
-            new_w = max(1, int(round(w * sx)))
-            new_h = max(1, int(round(h * sy)))
-            img = tvf.resize(
-                img,
-                [new_h, new_w],
-                interpolation=tvf.InterpolationMode.BILINEAR,
-                antialias=True,
-            )
-            img = _fit_chw_to_size(img, h, w, fill=fill)
-
-        out[i] = img
-    return out
-
-
-def apply_train_image_augmentations(
-    pixel_values: torch.Tensor,
-    *,
-    hflip_prob: float = DEFAULT_IMAGE_HFLIP_PROB,
-    max_rotate_deg: float = DEFAULT_IMAGE_MAX_ROTATE_DEG,
-    scale_min: float = DEFAULT_IMAGE_SCALE_MIN,
-    scale_max: float = DEFAULT_IMAGE_SCALE_MAX,
-    fill_mode: str = DEFAULT_IMAGE_FILL_MODE,
-    max_shift: int = DEFAULT_IMAGE_SHIFT_MAX,
-    enabled: bool = True,
-) -> torch.Tensor:
-    """Full train-time vision aug stack: geometric → integer shift."""
-    if not enabled:
-        return pixel_values
-    x = train_image_geometric_augment(
-        pixel_values,
-        hflip_prob=hflip_prob,
-        max_rotate_deg=max_rotate_deg,
-        scale_min=scale_min,
-        scale_max=scale_max,
-        fill_mode=fill_mode,
-    )
-    if max_shift and int(max_shift) > 0:
-        x = random_shift_pixel_values(x, max_shift=int(max_shift))
-    return x
+# Image geometric / photometric / shift: see project-root image_augment.py
+# (re-exported above for train_stage1 and tests).
 
 
 def heatmap_sparsity_loss(
@@ -1193,18 +999,27 @@ def apply_hard_bank_mining(
     scores: torch.Tensor,
     n_live: int,
     hard_k: int,
+    *,
+    labels: torch.Tensor | None = None,
+    bank_fn_margin: float | None = DEFAULT_BANK_FN_MARGIN,
+    bank_random_k: int = DEFAULT_BANK_RANDOM_K,
 ) -> torch.Tensor:
-    """Keep only the top-``hard_k`` hardest *bank* columns per row.
+    """Select bank negatives for InfoNCE; live columns always kept.
 
     ``scores`` is ``(B, n_live + n_bank)`` with live docs in ``[:, :n_live]``.
-    Live columns are always kept (in-batch negatives + the labeled positive).
-    Bank columns outside each row's top-k hardest scores are set to ``-inf`` so
-    they drop out of InfoNCE — easy bank negatives no longer dilute the softmax.
 
-    ``hard_k <= 0`` or ``hard_k >= n_bank`` leaves scores unchanged.
+    1. **FN filter** (when ``labels`` is set and ``bank_fn_margin`` is not None):
+       bank columns with ``score >= pos - margin`` are set to ``-inf`` so
+       near-duplicates of the positive are not treated as hard negatives.
+    2. **Hard-k** (when ``hard_k > 0``): keep the top-``hard_k`` hardest
+       *remaining* bank columns.
+    3. **Random-k** (only with hard mining): keep up to ``bank_random_k``
+       additional bank columns drawn uniformly from the non-hard, non-FN
+       remainder (diversity so the model is not stuck on a few hard FNs).
+
+    ``hard_k <= 0`` means use the full bank after FN filtering (``bank_random_k``
+    is ignored in that mode).
     """
-    if hard_k is None or int(hard_k) <= 0:
-        return scores
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2-D, got shape {tuple(scores.shape)}")
     batch, n_docs = scores.shape
@@ -1213,16 +1028,55 @@ def apply_hard_bank_mining(
     n_bank = n_docs - n_live
     if n_bank <= 0:
         return scores
-    k = min(int(hard_k), n_bank)
-    if k >= n_bank:
-        return scores
 
     live = scores[:, :n_live]
-    bank = scores[:, n_live:]
-    topk_idx = torch.topk(bank, k=k, dim=1).indices  # (B, k)
+    bank = scores[:, n_live:].clone()
+    neg_large = float("-inf")
+
+    # --- False-negative filter relative to live positive ---
+    if labels is not None and bank_fn_margin is not None:
+        if labels.shape[0] != batch:
+            raise ValueError(
+                f"labels batch {labels.shape[0]} != scores batch {batch}"
+            )
+        # Positive is always among live columns [0, n_live).
+        pos = scores.gather(1, labels.view(-1, 1).clamp(max=n_live - 1)).squeeze(1)
+        thr = pos.unsqueeze(1) - float(bank_fn_margin)
+        # Bank at/above threshold ≈ too similar to positive → not a negative.
+        bank = bank.masked_fill(bank >= thr, neg_large)
+
+    hard_k = 0 if hard_k is None else int(hard_k)
+    random_k = 0 if bank_random_k is None else max(int(bank_random_k), 0)
+
+    if hard_k <= 0:
+        # Full bank after FN filter (CLI: hard_k=0 → use full bank).
+        return torch.cat([live, bank], dim=1)
+
     keep = torch.zeros_like(bank, dtype=torch.bool)
-    keep.scatter_(1, topk_idx, True)
-    bank = bank.masked_fill(~keep, float("-inf"))
+    # Eligible = finite after FN filter.
+    eligible = torch.isfinite(bank)
+
+    for i in range(batch):
+        elig_idx = eligible[i].nonzero(as_tuple=False).view(-1)
+        if elig_idx.numel() == 0:
+            continue
+        vals = bank[i, elig_idx]
+        # Hard: top-k among eligible
+        k_h = min(hard_k, int(elig_idx.numel()))
+        top = torch.topk(vals, k=k_h, dim=0).indices
+        hard_sel = elig_idx[top]
+        keep[i, hard_sel] = True
+        hard_set = {int(x) for x in hard_sel.tolist()}
+        # Random among remaining eligible (diversity; optional).
+        if random_k > 0:
+            remain = [int(x) for x in elig_idx.tolist() if int(x) not in hard_set]
+            if remain:
+                k_r = min(random_k, len(remain))
+                perm = torch.randperm(len(remain), device=scores.device)[:k_r]
+                for j in perm.tolist():
+                    keep[i, remain[j]] = True
+
+    bank = bank.masked_fill(~keep, neg_large)
     return torch.cat([live, bank], dim=1)
 
 
@@ -1298,6 +1152,8 @@ def contrastive_late_interaction_loss(
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
     hard_bank_k: int = 0,
+    bank_fn_margin: float | None = DEFAULT_BANK_FN_MARGIN,
+    bank_random_k: int = DEFAULT_BANK_RANDOM_K,
     query_topk: int = 0,
     score_center: bool = DEFAULT_SCORE_CENTER,
     gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
@@ -1316,6 +1172,8 @@ def contrastive_late_interaction_loss(
 
     ``hard_bank_k`` keeps only the top-k hardest bank docs per query (see
     ``apply_hard_bank_mining``); live in-batch columns are always kept.
+    ``bank_fn_margin`` / ``bank_random_k`` control FN filtering and hard+random
+    bank mix (see ``apply_hard_bank_mining``).
 
     ``score_center`` subtracts the detached mean of live unit tokens before
     scoring (removes domain cone so background MaxSim cannot equate all pairs).
@@ -1418,8 +1276,22 @@ def contrastive_late_interaction_loss(
         soft_maxsim_temperature=soft_tau,
         query_topk=q_topk,
     ) / temperature
-    scores_t2i = apply_hard_bank_mining(scores_t2i, batch, hard_bank_k)
-    scores_i2t = apply_hard_bank_mining(scores_i2t, batch, hard_bank_k)
+    scores_t2i = apply_hard_bank_mining(
+        scores_t2i,
+        batch,
+        hard_bank_k,
+        labels=labels,
+        bank_fn_margin=bank_fn_margin,
+        bank_random_k=bank_random_k,
+    )
+    scores_i2t = apply_hard_bank_mining(
+        scores_i2t,
+        batch,
+        hard_bank_k,
+        labels=labels,
+        bank_fn_margin=bank_fn_margin,
+        bank_random_k=bank_random_k,
+    )
     mask_t2i = _expand_non_negative_mask(non_negative_mask, n_image_docs, batch)
     mask_i2t = _expand_non_negative_mask(
         non_negative_mask.T if non_negative_mask is not None else None,
@@ -1464,6 +1336,8 @@ def text_text_contrastive_loss(
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
     hard_bank_k: int = 0,
+    bank_fn_margin: float | None = DEFAULT_BANK_FN_MARGIN,
+    bank_random_k: int = DEFAULT_BANK_RANDOM_K,
     query_topk: int = 0,
     score_center: bool = DEFAULT_SCORE_CENTER,
     gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
@@ -1503,8 +1377,15 @@ def text_text_contrastive_loss(
         soft_maxsim_temperature=soft_maxsim_temperature,
         query_topk=int(query_topk or 0),
     ) / temperature
-    scores = apply_hard_bank_mining(scores, n_live, hard_bank_k)
     labels = torch.arange(scores.size(0), device=scores.device)
+    scores = apply_hard_bank_mining(
+        scores,
+        n_live,
+        hard_bank_k,
+        labels=labels,
+        bank_fn_margin=bank_fn_margin,
+        bank_random_k=bank_random_k,
+    )
     # Only the in-batch caption columns participate in multi-positive masking.
     mask = _expand_non_negative_mask(
         non_negative_mask, scores.size(1), batch, n_live=n_live
@@ -1529,6 +1410,8 @@ def text_text_matryoshka_loss(
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
     hard_bank_k: int = 0,
+    bank_fn_margin: float | None = DEFAULT_BANK_FN_MARGIN,
+    bank_random_k: int = DEFAULT_BANK_RANDOM_K,
     query_topk: int = 0,
     score_center: bool = DEFAULT_SCORE_CENTER,
     gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
@@ -1562,6 +1445,8 @@ def text_text_matryoshka_loss(
             soft_maxsim_temperature=soft_maxsim_temperature,
             non_negative_mask=non_negative_mask,
             hard_bank_k=hard_bank_k,
+            bank_fn_margin=bank_fn_margin,
+            bank_random_k=bank_random_k,
             query_topk=query_topk,
             score_center=score_center,
             gap_weight=gap_weight,
@@ -1582,6 +1467,8 @@ def matryoshka_loss(
     soft_maxsim_temperature: float | None = None,
     non_negative_mask: torch.Tensor | None = None,
     hard_bank_k: int = 0,
+    bank_fn_margin: float | None = DEFAULT_BANK_FN_MARGIN,
+    bank_random_k: int = DEFAULT_BANK_RANDOM_K,
     query_topk: int = 0,
     score_center: bool = DEFAULT_SCORE_CENTER,
     gap_weight: float = DEFAULT_GAP_LOSS_WEIGHT,
@@ -1614,6 +1501,8 @@ def matryoshka_loss(
             soft_maxsim_temperature=soft_maxsim_temperature,
             non_negative_mask=non_negative_mask,
             hard_bank_k=hard_bank_k,
+            bank_fn_margin=bank_fn_margin,
+            bank_random_k=bank_random_k,
             query_topk=query_topk,
             score_center=score_center,
             gap_weight=gap_weight,
@@ -1681,6 +1570,8 @@ class Stage1AlignmentModel(nn.Module):
         text_text_matryoshka_weight: float | None = None,
         query_image_weight: float = 1.0,
         hard_bank_negatives: int = DEFAULT_HARD_BANK_NEGATIVES,
+        bank_fn_margin: float | None = DEFAULT_BANK_FN_MARGIN,
+        bank_random_k: int = DEFAULT_BANK_RANDOM_K,
         compute_dtype: torch.dtype = torch.float16,
         memory_bank_size: int = DEFAULT_MEMORY_BANK_SIZE,
         soft_maxsim: bool = True,
@@ -1701,6 +1592,17 @@ class Stage1AlignmentModel(nn.Module):
         image_scale_max: float = DEFAULT_IMAGE_SCALE_MAX,
         image_fill_mode: str = DEFAULT_IMAGE_FILL_MODE,
         image_aug_enabled: bool = True,
+        photometric_enabled: bool = DEFAULT_PHOTOMETRIC_ENABLED,
+        photo_brightness: float = DEFAULT_PHOTO_BRIGHTNESS,
+        photo_contrast: float = DEFAULT_PHOTO_CONTRAST,
+        photo_saturation: float = DEFAULT_PHOTO_SATURATION,
+        photo_hue: float = DEFAULT_PHOTO_HUE,
+        spatial_brightness: float = DEFAULT_SPATIAL_BRIGHTNESS,
+        spatial_color: float = DEFAULT_SPATIAL_COLOR,
+        spatial_noise_grid: int = DEFAULT_SPATIAL_NOISE_GRID,
+        grayscale_prob: float = DEFAULT_GRAYSCALE_PROB,
+        image_mean: tuple[float, ...] | list[float] | None = None,
+        image_std: tuple[float, ...] | list[float] | None = None,
         heatmap_sparsity_weight: float = DEFAULT_HEATMAP_SPARSITY_WEIGHT,
         heatmap_sparsity_temperature: float = DEFAULT_HEATMAP_SPARSITY_TEMPERATURE,
         heatmap_sparsity_square: bool = DEFAULT_HEATMAP_SPARSITY_SQUARE,
@@ -1765,6 +1667,11 @@ class Stage1AlignmentModel(nn.Module):
         )
         self.query_image_weight = float(query_image_weight)
         self.hard_bank_negatives = int(hard_bank_negatives)
+        # None disables FN filter; 0.0 filters bank cols with score >= pos.
+        self.bank_fn_margin = (
+            None if bank_fn_margin is None else float(bank_fn_margin)
+        )
+        self.bank_random_k = int(bank_random_k)
         self.memory_bank = EmbeddingMemoryBank(memory_bank_size)
         self.soft_maxsim = bool(soft_maxsim)
         self.soft_maxsim_temperature = float(soft_maxsim_temperature)
@@ -1789,6 +1696,25 @@ class Stage1AlignmentModel(nn.Module):
             )
         self.image_fill_mode = fill_mode
         self.image_aug_enabled = bool(image_aug_enabled)
+        self.photometric_enabled = bool(photometric_enabled)
+        self.photo_brightness = float(photo_brightness)
+        self.photo_contrast = float(photo_contrast)
+        self.photo_saturation = float(photo_saturation)
+        self.photo_hue = float(photo_hue)
+        self.spatial_brightness = float(spatial_brightness)
+        self.spatial_color = float(spatial_color)
+        self.spatial_noise_grid = int(spatial_noise_grid)
+        self.grayscale_prob = float(grayscale_prob)
+        self.image_mean = (
+            tuple(float(x) for x in image_mean)
+            if image_mean is not None
+            else DEFAULT_IMAGE_MEAN
+        )
+        self.image_std = (
+            tuple(float(x) for x in image_std)
+            if image_std is not None
+            else DEFAULT_IMAGE_STD
+        )
         self.heatmap_sparsity_weight = float(heatmap_sparsity_weight)
         self.heatmap_sparsity_temperature = float(heatmap_sparsity_temperature)
         self.heatmap_sparsity_square = bool(heatmap_sparsity_square)
@@ -2133,7 +2059,7 @@ class Stage1AlignmentModel(nn.Module):
         return geo, metrics
 
     def _maybe_augment_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Train-only geometric + shift aug; identity in eval."""
+        """Train-only geometric + photometric + shift; identity in eval."""
         if not self.training or not self.image_aug_enabled:
             return pixel_values
         return apply_train_image_augmentations(
@@ -2144,6 +2070,17 @@ class Stage1AlignmentModel(nn.Module):
             scale_max=self.image_scale_max,
             fill_mode=self.image_fill_mode,
             max_shift=self.image_shift_max,
+            photometric=self.photometric_enabled,
+            photo_brightness=self.photo_brightness,
+            photo_contrast=self.photo_contrast,
+            photo_saturation=self.photo_saturation,
+            photo_hue=self.photo_hue,
+            spatial_brightness=self.spatial_brightness,
+            spatial_color=self.spatial_color,
+            spatial_noise_grid=self.spatial_noise_grid,
+            grayscale_prob=self.grayscale_prob,
+            image_mean=self.image_mean,
+            image_std=self.image_std,
             enabled=True,
         )
 
@@ -2215,6 +2152,7 @@ class Stage1AlignmentModel(nn.Module):
         unrelated_input_ids: torch.Tensor | None = None,
         unrelated_attention_mask: torch.Tensor | None = None,
         captions: list[str] | None = None,
+        related_queries: list[str] | None = None,
         return_loss: bool = True,
     ) -> dict[str, Any]:
         vdtype = self._module_dtype(self.vision_model)
@@ -2284,12 +2222,27 @@ class Stage1AlignmentModel(nn.Module):
 
         soft_tau = self._soft_tau()
         hard_k = self.hard_bank_negatives
-        non_neg = build_multi_positive_mask(
+        bank_fn_m = self.bank_fn_margin
+        bank_rand_k = self.bank_random_k
+        # Task-specific multi-positive masks (false-neg softening):
+        #   cap↔img / q→cap  → caption token-Jaccard
+        #   query↔image      → related_query token-Jaccard (not caption text)
+        # Using caption Jaccard on query tasks wrongly softens pairs whose
+        # search queries are dissimilar (different intents, similar captions).
+        non_neg_cap = build_multi_positive_mask(
             captions,
             batch_size=len(loss_text_tokens),
             jaccard_threshold=self.multi_positive_jaccard,
             device=loss_text_tokens[0].device,
         )
+        non_neg_query = build_multi_positive_mask(
+            related_queries,
+            batch_size=len(loss_text_tokens),
+            jaccard_threshold=self.multi_positive_jaccard,
+            device=loss_text_tokens[0].device,
+        )
+        # Fallback: if queries missing, do not reuse caption mask for q↔img.
+        # (None → standard single-positive InfoNCE on that task.)
 
         # ------------------------------------------------------------------
         # Retrieval tasks (all InfoNCE on shared live embeddings):
@@ -2315,8 +2268,10 @@ class Stage1AlignmentModel(nn.Module):
             bank_text_tokens=bank_text_tokens,
             bank_image_tokens=bank_image_tokens,
             soft_maxsim_temperature=soft_tau,
-            non_negative_mask=non_neg,
+            non_negative_mask=non_neg_cap,
             hard_bank_k=hard_k,
+            bank_fn_margin=bank_fn_m,
+            bank_random_k=bank_rand_k,
             query_topk=q_topk,
             score_center=score_center,
             gap_weight=gap_w,
@@ -2331,8 +2286,10 @@ class Stage1AlignmentModel(nn.Module):
             bank_text_raw=bank_text_raw,
             bank_image_raw=bank_image_raw,
             soft_maxsim_temperature=soft_tau,
-            non_negative_mask=non_neg,
+            non_negative_mask=non_neg_cap,
             hard_bank_k=hard_k,
+            bank_fn_margin=bank_fn_m,
+            bank_random_k=bank_rand_k,
             query_topk=q_topk,
             score_center=score_center,
             gap_weight=gap_w,
@@ -2380,6 +2337,7 @@ class Stage1AlignmentModel(nn.Module):
 
             if want_query_image:
                 # Bidirectional query↔image: query finds matching image (and reverse).
+                # Multi-pos from related_queries (search intent), not captions.
                 query_image = contrastive_late_interaction_loss(
                     loss_query_tokens,
                     loss_image_tokens,
@@ -2387,8 +2345,10 @@ class Stage1AlignmentModel(nn.Module):
                     bank_text_tokens=bank_text_tokens,
                     bank_image_tokens=bank_image_tokens,
                     soft_maxsim_temperature=soft_tau,
-                    non_negative_mask=non_neg,
+                    non_negative_mask=non_neg_query,
                     hard_bank_k=hard_k,
+                    bank_fn_margin=bank_fn_m,
+                    bank_random_k=bank_rand_k,
                     query_topk=q_topk,
                     score_center=score_center,
                     gap_weight=gap_w,
@@ -2403,8 +2363,10 @@ class Stage1AlignmentModel(nn.Module):
                     bank_text_raw=bank_text_raw,
                     bank_image_raw=bank_image_raw,
                     soft_maxsim_temperature=soft_tau,
-                    non_negative_mask=non_neg,
+                    non_negative_mask=non_neg_query,
                     hard_bank_k=hard_k,
+                    bank_fn_margin=bank_fn_m,
+                    bank_random_k=bank_rand_k,
                     query_topk=q_topk,
                     score_center=score_center,
                     gap_weight=gap_w,
@@ -2414,6 +2376,7 @@ class Stage1AlignmentModel(nn.Module):
 
             if want_query_caption:
                 # Query → matching caption; not other captions / distractors / bank.
+                # Multi-pos softens near-duplicate *captions* (doc-side FNs).
                 text_text = text_text_contrastive_loss(
                     loss_query_tokens,
                     loss_text_tokens,
@@ -2421,8 +2384,10 @@ class Stage1AlignmentModel(nn.Module):
                     temperature=self.temperature,
                     bank_doc_tokens=bank_text_tokens,
                     soft_maxsim_temperature=soft_tau,
-                    non_negative_mask=non_neg,
+                    non_negative_mask=non_neg_cap,
                     hard_bank_k=hard_k,
+                    bank_fn_margin=bank_fn_m,
+                    bank_random_k=bank_rand_k,
                     query_topk=q_topk,
                     score_center=score_center,
                     gap_weight=gap_w,
@@ -2436,8 +2401,10 @@ class Stage1AlignmentModel(nn.Module):
                     temperature=self.temperature,
                     bank_doc_raw=bank_text_raw,
                     soft_maxsim_temperature=soft_tau,
-                    non_negative_mask=non_neg,
+                    non_negative_mask=non_neg_cap,
                     hard_bank_k=hard_k,
+                    bank_fn_margin=bank_fn_m,
+                    bank_random_k=bank_rand_k,
                     query_topk=q_topk,
                     score_center=score_center,
                     gap_weight=gap_w,
@@ -2699,29 +2666,53 @@ def _checkpoint_step_key(path: Path) -> tuple[int, float]:
     return (10**12, mtime)
 
 
-def list_stage1_checkpoints(*, include_stage_root: bool = True) -> list[Path]:
-    """Valid Stage-1 checkpoint roots (history/step-* and optional stage root)."""
-    trained = Path(DEFAULT_TRAINED_DIR)
+def list_stage_checkpoints(
+    stage: int,
+    *,
+    include_stage_root: bool = True,
+) -> list[Path]:
+    """Valid checkpoint roots for ``models/trained/stage{N}/`` (+ history/step-*)."""
+    if stage < 1:
+        return []
+    trained = Path(TRAINED_ROOT) / f"stage{stage}"
     candidates: list[Path] = []
     if include_stage_root:
         candidates.append(trained)
-        candidates.append(Path(LEGACY_CHECKPOINT_DIR))
+        if stage == 1:
+            candidates.append(Path(LEGACY_CHECKPOINT_DIR))
     history = trained / "history"
     if history.is_dir():
         candidates.extend(history.glob("step-*"))
     return [p for p in candidates if checkpoint_is_valid(p)]
 
 
+def list_stage1_checkpoints(*, include_stage_root: bool = True) -> list[Path]:
+    """Valid Stage-1 checkpoint roots (history/step-* and optional stage root)."""
+    return list_stage_checkpoints(1, include_stage_root=include_stage_root)
+
+
 def _checkpoint_candidates() -> list[Path]:
     return list_stage1_checkpoints(include_stage_root=True)
 
 
-def find_latest_checkpoint() -> Path | None:
-    """Most recent valid Stage-1 root among stage dir + history/step-* (by mtime)."""
-    valid = list_stage1_checkpoints(include_stage_root=True)
+def _checkpoint_mtime_key(path: Path) -> float:
+    proj = path / PROJECTION_FILE
+    if proj.is_file():
+        return proj.stat().st_mtime
+    return path.stat().st_mtime
+
+
+def find_latest_checkpoint_for_stage(stage: int) -> Path | None:
+    """Most recent valid root under stage{N} (stage dir + history/step-*, by mtime)."""
+    valid = list_stage_checkpoints(stage, include_stage_root=True)
     if not valid:
         return None
-    return max(valid, key=lambda p: (p / PROJECTION_FILE).stat().st_mtime)
+    return max(valid, key=_checkpoint_mtime_key)
+
+
+def find_latest_checkpoint() -> Path | None:
+    """Most recent valid Stage-1 root among stage dir + history/step-* (by mtime)."""
+    return find_latest_checkpoint_for_stage(1)
 
 
 def find_latest_history_checkpoint() -> Path | None:
@@ -2736,25 +2727,57 @@ def find_latest_history_checkpoint() -> Path | None:
     return max(valid, key=_checkpoint_step_key)
 
 
+def find_latest_trained_checkpoint(
+    *,
+    max_stage: int = MAX_TRAINING_PHASE,
+    min_stage: int = 1,
+) -> Path | None:
+    """Latest valid training checkpoint across stages.
+
+    Scans ``stage{max_stage}`` … ``stage{min_stage}`` (high → low). For the
+    highest stage that has any valid checkpoint, returns the newest root among
+    that stage's live dir and ``history/step-*`` (by projection mtime).
+    """
+    hi = max(int(max_stage), int(min_stage))
+    lo = min(int(max_stage), int(min_stage))
+    lo = max(lo, 1)
+    for stage in range(hi, lo - 1, -1):
+        found = find_latest_checkpoint_for_stage(stage)
+        if found is not None:
+            return found
+    return None
+
+
 def resolve_inference_checkpoint(
     *,
     phase: int = 1,
     checkpoint_dir: str | Path | None = None,
     latest_history: bool = False,
     latest_any: bool = False,
+    latest_across_stages: bool = False,
 ) -> Path | None:
-    """Resolve a Stage-1 checkpoint root for inference/demos.
+    """Resolve a trained checkpoint root for inference/demos.
 
     Priority:
       1. Explicit ``checkpoint_dir``
-      2. ``latest_history`` → newest ``history/step-*``
-      3. ``latest_any`` → newest among stage root + history (mtime)
-      4. ``None`` → caller uses phase-based ``models/trained/stage{N}/``
+      2. ``latest_across_stages`` → stage5…1, newest in highest stage that exists
+      3. ``latest_history`` → newest ``stage1/history/step-*``
+      4. ``latest_any`` → newest among stage1 root + history (mtime)
+      5. ``None`` → caller uses phase-based ``models/trained/stage{N}/``
+         (or returns that root when valid)
     """
     if checkpoint_dir:
         root = Path(checkpoint_dir)
         if not checkpoint_is_valid(root):
             raise FileNotFoundError(f"No valid Stage-1 checkpoint at {root}")
+        return root
+    if latest_across_stages:
+        root = find_latest_trained_checkpoint()
+        if root is None:
+            raise FileNotFoundError(
+                f"No valid checkpoints under {TRAINED_ROOT}/stage{{1-{MAX_TRAINING_PHASE}}}. "
+                "Train first or use --phase 0 for seed weights."
+            )
         return root
     if latest_history:
         root = find_latest_history_checkpoint()
@@ -2768,7 +2791,7 @@ def resolve_inference_checkpoint(
         return find_latest_checkpoint()
     # Default: completed/live stage dir for phase (not history)
     if phase >= 1:
-        root = Path(DEFAULT_TRAINED_DIR) if phase == 1 else Path(f"models/trained/stage{phase}")
+        root = Path(TRAINED_ROOT) / f"stage{phase}"
         if checkpoint_is_valid(root):
             return root
     return None

@@ -222,7 +222,13 @@ def create_search_fn(
     """Build Gradio search callback with optional MaxSim heatmaps."""
 
     @torch.no_grad()
-    def search(query: str, top_k: int, show_heatmap: bool, heatmap_alpha: float):
+    def search(
+        query: str,
+        top_k: int,
+        show_heatmap: bool,
+        heatmap_alpha: float,
+        heatmap_peak_tau: float,
+    ):
         q = (query or "").strip()
         if not q:
             return (
@@ -265,6 +271,8 @@ def create_search_fn(
                         aff,
                         grid_hw=grid_hw,
                         alpha=alpha,
+                        mode="peak",
+                        peak_temperature=float(heatmap_peak_tau),
                     )
                     heat_b64 = _thumb_b64(heat)
                     cell_imgs.append(
@@ -324,7 +332,11 @@ def build_ui(
             show_heatmap = gr.Checkbox(
                 value=True,
                 label="Show query heatmaps",
-                info="Overlay MaxSim per image patch (which regions match the query).",
+                info=(
+                    "Peak-relative heat: h=exp((s−s_max)/τ). Only patches near "
+                    "the best match on that image light up; high but non-peak "
+                    "cosine stays cold."
+                ),
             )
             heatmap_alpha = gr.Slider(
                 0.15,
@@ -333,11 +345,19 @@ def build_ui(
                 step=0.05,
                 label="Heatmap opacity",
             )
+            heatmap_peak_tau = gr.Slider(
+                0.02,
+                0.20,
+                value=0.06,
+                step=0.01,
+                label="Heatmap peak τ",
+                info="Smaller → colder non-peaks (sharper match focus).",
+            )
         btn = gr.Button("Search", variant="primary")
         gallery = gr.HTML()
         results = gr.Textbox(label="Scores", lines=12)
         _evt = dict(api_name=False)
-        inputs = [query, top_k, show_heatmap, heatmap_alpha]
+        inputs = [query, top_k, show_heatmap, heatmap_alpha, heatmap_peak_tau]
         btn.click(search_fn, inputs=inputs, outputs=[gallery, results], **_evt)
         query.submit(search_fn, inputs=inputs, outputs=[gallery, results], **_evt)
         gr.Examples(

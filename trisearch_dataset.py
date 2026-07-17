@@ -1669,6 +1669,8 @@ class ImageCaptionDataset(Dataset):
             sample["query_attention_mask"] = related_text["attention_mask"][0]
             sample["unrelated_input_ids"] = unrelated_text["input_ids"][0]
             sample["unrelated_attention_mask"] = unrelated_text["attention_mask"][0]
+            # Raw query string for multi-positive (false-negative) masking on query tasks.
+            sample["related_query"] = related
         return sample
 
 
@@ -1700,4 +1702,6 @@ class Stage1Collator:
             batch["unrelated_attention_mask"] = torch.stack(
                 [f["unrelated_attention_mask"] for f in features]
             )
+            if all("related_query" in f for f in features):
+                batch["related_queries"] = [f["related_query"] for f in features]
         return batch
