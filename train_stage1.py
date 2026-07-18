@@ -48,6 +48,7 @@ from trisearch_dataset import (
     DEFAULT_PARAPHRASE_DATASET,
     DEFAULT_PARAPHRASE_QUEUE_SIZE,
     DEFAULT_PARAPHRASE_REFILL_SIZE,
+    parse_paraphrase_sources_spec,
     DEFAULT_QUERY_CACHE_PATH,
     DEFAULT_TRISEARCH_HF_DATASET,
     OPENROUTER_QUERY_BATCH_SIZE,
@@ -346,17 +347,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--paraphrase-dataset",
         type=str,
-        default=DEFAULT_PARAPHRASE_DATASET,
-        help="HF dataset for text–text paraphrase/NLI training "
-             f"(default {DEFAULT_PARAPHRASE_DATASET}). Streamed; never fully "
+        default="mix",
+        help="Text–text training source. Default 'mix' = weighted GooAQ "
+             "(~3M broad Google Q–A) + Natural Questions + light AllNLI. "
+             "Or a single HF id "
+             f"(e.g. {DEFAULT_PARAPHRASE_DATASET}). Streamed; never fully "
              "materialized in RAM.",
     )
     parser.add_argument(
         "--paraphrase-config",
         type=str,
         default=DEFAULT_PARAPHRASE_CONFIG,
-        help="Dataset config/subset (triplet|pair|pair-class; "
-             f"default {DEFAULT_PARAPHRASE_CONFIG}).",
+        help="Config for a *single* --paraphrase-dataset "
+             f"(pair|triplet|pair-class; default {DEFAULT_PARAPHRASE_CONFIG}). "
+             "Ignored when using the multi-source mix.",
+    )
+    parser.add_argument(
+        "--paraphrase-sources",
+        type=str,
+        default=None,
+        help="Explicit multi-source mix: "
+             "'dataset:config:weight,...' "
+             "(e.g. sentence-transformers/gooaq:pair:0.7,"
+             "sentence-transformers/natural-questions:pair:0.2,"
+             "sentence-transformers/all-nli:triplet:0.1). "
+             "Overrides --paraphrase-dataset when set. Use 'mix' for defaults.",
     )
     parser.add_argument(
         "--paraphrase-queue-size",
@@ -943,16 +958,32 @@ def main():
 
     paraphrase_queue = None
     if not args.no_paraphrase and args.paraphrase_weight > 0.0:
-        paraphrase_queue = StreamingTextPairQueue(
-            dataset_name=args.paraphrase_dataset,
-            config=args.paraphrase_config,
-            queue_size=args.paraphrase_queue_size,
-            refill_size=args.paraphrase_refill_size,
-            seed=args.seed,
-        )
+        if args.paraphrase_sources:
+            sources = parse_paraphrase_sources_spec(args.paraphrase_sources)
+            paraphrase_queue = StreamingTextPairQueue(
+                sources=sources,
+                queue_size=args.paraphrase_queue_size,
+                refill_size=args.paraphrase_refill_size,
+                seed=args.seed,
+            )
+        elif str(args.paraphrase_dataset).strip().lower() in ("mix", "default"):
+            paraphrase_queue = StreamingTextPairQueue(
+                use_default_mix=True,
+                queue_size=args.paraphrase_queue_size,
+                refill_size=args.paraphrase_refill_size,
+                seed=args.seed,
+            )
+        else:
+            paraphrase_queue = StreamingTextPairQueue(
+                dataset_name=args.paraphrase_dataset,
+                config=args.paraphrase_config,
+                queue_size=args.paraphrase_queue_size,
+                refill_size=args.paraphrase_refill_size,
+                seed=args.seed,
+            )
         n_prefill = paraphrase_queue.refill()
         print(
-            f"Paraphrase queue: {args.paraphrase_dataset}/{args.paraphrase_config} "
+            f"Paraphrase queue: {paraphrase_queue.describe()} "
             f"(prefilled {n_prefill}, cap={args.paraphrase_queue_size})"
         )
 
@@ -1193,7 +1224,7 @@ def main():
             f"  paraphrase     : w={args.paraphrase_weight} "
             f"batch={args.paraphrase_batch_size or args.batch_size} "
             f"queue={args.paraphrase_queue_size} "
-            f"({args.paraphrase_dataset}/{args.paraphrase_config})"
+            f"({paraphrase_queue.describe()})"
         )
     else:
         print("  paraphrase     : off")

@@ -1575,16 +1575,26 @@ def _tokenize_text(tokenizer, text: str, max_text_length: int) -> dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# Streamed AllNLI / paraphrase pairs (≤ queue_size in RAM)
+# Streamed text–text pairs (≤ queue_size in RAM)
 # ---------------------------------------------------------------------------
+# AllNLI alone is narrow (caption-style NLI). Default mix prefers broad Q–A:
+#   GooAQ (~3M Google questions) + Natural Questions (Wikipedia) + light AllNLI.
 
-DEFAULT_PARAPHRASE_DATASET = "sentence-transformers/all-nli"
-DEFAULT_PARAPHRASE_CONFIG = "triplet"
+DEFAULT_PARAPHRASE_DATASET = "sentence-transformers/gooaq"
+DEFAULT_PARAPHRASE_CONFIG = "pair"
 DEFAULT_PARAPHRASE_SPLIT = "train"
 DEFAULT_PARAPHRASE_QUEUE_SIZE = 1000
 DEFAULT_PARAPHRASE_REFILL_SIZE = 1000
 DEFAULT_PARAPHRASE_SHUFFLE_BUFFER = 10_000
 DEFAULT_MAX_TEXTS_PER_IMAGE = 4
+
+# Weighted multi-source default: broad concepts >> pure NLI.
+# Format: (hf_dataset, config, relative_weight)
+DEFAULT_PARAPHRASE_SOURCES: tuple[tuple[str, str, float], ...] = (
+    ("sentence-transformers/gooaq", "pair", 0.70),
+    ("sentence-transformers/natural-questions", "pair", 0.20),
+    ("sentence-transformers/all-nli", "triplet", 0.10),
+)
 
 
 @dataclass(frozen=True)
@@ -1596,16 +1606,25 @@ class TextPairSample:
     negative: str | None = None
 
 
-def parse_text_pair_row(row: dict[str, Any], *, config: str = "triplet") -> TextPairSample | None:
-    """Map a HF AllNLI (or similar) row to :class:`TextPairSample`.
+def _first_text(row: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        if key in row and row[key] is not None:
+            return normalize_training_text(row[key])
+    return ""
 
-    Supports ``triplet`` (anchor/positive/negative), ``pair`` (anchor/positive),
-    and ``pair-class`` (premise/hypothesis/label; only entailment kept).
+
+def parse_text_pair_row(row: dict[str, Any], *, config: str = "triplet") -> TextPairSample | None:
+    """Map a HF embedding-pair row to :class:`TextPairSample`.
+
+    Supports:
+      - ``triplet``: anchor/positive/negative (AllNLI)
+      - ``pair``: anchor/positive, question/answer, query/answer (GooAQ, NQ, …)
+      - ``pair-class``: premise/hypothesis/label (entailment only)
     """
     cfg = (config or "triplet").lower()
     if cfg == "pair-class":
-        a = normalize_training_text(row.get("premise", ""))
-        b = normalize_training_text(row.get("hypothesis", ""))
+        a = _first_text(row, "premise", "sentence1", "anchor")
+        b = _first_text(row, "hypothesis", "sentence2", "positive")
         label = row.get("label")
         # pair-class: 0=entailment, 1=neutral, 2=contradiction (ST convention)
         if label is not None and int(label) != 0:
@@ -1614,19 +1633,57 @@ def parse_text_pair_row(row: dict[str, Any], *, config: str = "triplet") -> Text
             return None
         return TextPairSample(anchor=a, positive=b, negative=None)
     if cfg == "pair":
-        a = normalize_training_text(row.get("anchor", row.get("sentence1", "")))
-        b = normalize_training_text(row.get("positive", row.get("sentence2", "")))
+        a = _first_text(
+            row, "question", "query", "anchor", "sentence1", "premise", "text"
+        )
+        b = _first_text(
+            row, "answer", "positive", "sentence2", "hypothesis", "passage", "context"
+        )
         if not a or not b or a == b:
             return None
         return TextPairSample(anchor=a, positive=b, negative=None)
     # triplet (default)
-    a = normalize_training_text(row.get("anchor", row.get("premise", "")))
-    b = normalize_training_text(row.get("positive", row.get("hypothesis", "")))
-    c = normalize_training_text(row.get("negative", "") or "")
+    a = _first_text(row, "anchor", "premise", "question", "query", "sentence1")
+    b = _first_text(row, "positive", "hypothesis", "answer", "sentence2")
+    c = _first_text(row, "negative")
     if not a or not b or a == b:
         return None
     neg = c if c and c != a and c != b else None
     return TextPairSample(anchor=a, positive=b, negative=neg)
+
+
+def parse_paraphrase_sources_spec(spec: str | None) -> list[tuple[str, str, float]]:
+    """Parse ``dataset:config:weight,dataset:config:weight,...`` or empty → defaults.
+
+    Shorthand: ``dataset`` alone uses config ``pair`` and weight 1.0.
+    ``dataset:config`` uses weight 1.0.
+    """
+    if not spec or not str(spec).strip() or str(spec).strip().lower() in ("mix", "default"):
+        return [(d, c, float(w)) for d, c, w in DEFAULT_PARAPHRASE_SOURCES]
+    out: list[tuple[str, str, float]] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = [b.strip() for b in part.split(":")]
+        if len(bits) == 1:
+            out.append((bits[0], "pair", 1.0))
+        elif len(bits) == 2:
+            # dataset:config  OR  dataset:weight
+            try:
+                w = float(bits[1])
+                out.append((bits[0], "pair", w))
+            except ValueError:
+                out.append((bits[0], bits[1], 1.0))
+        else:
+            try:
+                w = float(bits[2])
+            except ValueError:
+                w = 1.0
+            out.append((bits[0], bits[1], w))
+    if not out:
+        return [(d, c, float(w)) for d, c, w in DEFAULT_PARAPHRASE_SOURCES]
+    return out
 
 
 def build_positive_texts_for_image(
@@ -1669,11 +1726,11 @@ def build_positive_texts_for_image(
 
 
 class StreamingTextPairQueue:
-    """In-memory queue of ≤ ``queue_size`` paraphrase pairs; refill from HF stream.
+    """In-memory queue of ≤ ``queue_size`` text pairs; refill from HF stream(s).
 
-    Does **not** materialize the full dataset. When training pops pairs, they are
-    **removed** from the queue. When fewer than needed remain, a new chunk of
-    ``refill_size`` pairs is pulled from a shuffled streaming iterator.
+    Does **not** materialize full datasets. Supports a **weighted multi-source**
+    mix (e.g. GooAQ + Natural Questions + AllNLI) so refills draw broad topics
+    rather than a single narrow corpus. Pairs are **removed** on ``pop_batch``.
     """
 
     def __init__(
@@ -1687,19 +1744,40 @@ class StreamingTextPairQueue:
         shuffle_buffer: int = DEFAULT_PARAPHRASE_SHUFFLE_BUFFER,
         seed: int = 42,
         row_iterator: Iterator[dict[str, Any]] | None = None,
+        sources: Sequence[tuple[str, str, float]] | None = None,
+        use_default_mix: bool = False,
     ):
-        self.dataset_name = dataset_name
-        self.config = config
+        if sources is not None:
+            self.sources = [(d, c, float(w)) for d, c, w in sources if float(w) > 0]
+        elif use_default_mix:
+            self.sources = [
+                (d, c, float(w)) for d, c, w in DEFAULT_PARAPHRASE_SOURCES
+            ]
+        else:
+            self.sources = [(dataset_name, config, 1.0)]
+        if not self.sources:
+            self.sources = [(DEFAULT_PARAPHRASE_DATASET, DEFAULT_PARAPHRASE_CONFIG, 1.0)]
+
+        # Back-compat single-source fields (first / only source).
+        self.dataset_name = self.sources[0][0]
+        self.config = self.sources[0][1]
         self.split = split
         self.queue_size = max(1, int(queue_size))
         self.refill_size = max(1, int(refill_size))
         self.shuffle_buffer = max(100, int(shuffle_buffer))
         self.seed = int(seed)
         self._queue: list[TextPairSample] = []
-        self._iter: Iterator[dict[str, Any]] | None = row_iterator
+        # Per-source streaming state: (iterator | None, config_str)
+        self._iters: list[Iterator[dict[str, Any]] | None] = [None] * len(self.sources)
+        self._source_configs = [c for _, c, _ in self.sources]
         self._owns_stream = row_iterator is None
+        # Optional single injected iterator (tests) — always uses sources[0] config.
+        self._test_iter: Iterator[dict[str, Any]] | None = row_iterator
         self._refill_count = 0
         self._rng = random.Random(self.seed)
+        weights = [max(0.0, float(w)) for _, _, w in self.sources]
+        total_w = sum(weights) or 1.0
+        self._weights = [w / total_w for w in weights]
 
     def __len__(self) -> int:
         return len(self._queue)
@@ -1708,58 +1786,93 @@ class StreamingTextPairQueue:
     def refill_count(self) -> int:
         return self._refill_count
 
-    def _open_stream(self) -> Iterator[dict[str, Any]]:
+    def describe(self) -> str:
+        parts = [
+            f"{d}/{c}@{w:.2f}" for (d, c, _), w in zip(self.sources, self._weights)
+        ]
+        return " + ".join(parts)
+
+    def _open_stream(self, source_index: int) -> Iterator[dict[str, Any]]:
         from datasets import load_dataset
 
-        # No trust_remote_code — parquet-native AllNLI only.
+        name, cfg, _ = self.sources[source_index]
+        # No trust_remote_code — parquet-native ST datasets only.
         ds = load_dataset(
-            self.dataset_name,
-            self.config,
+            name,
+            cfg,
             split=self.split,
             streaming=True,
         )
-        seed = self.seed + self._refill_count * 9973
+        seed = self.seed + self._refill_count * 9973 + source_index * 131
         try:
             ds = ds.shuffle(seed=seed, buffer_size=self.shuffle_buffer)
         except Exception:
-            # Some stream backends lack shuffle; still iterable.
             pass
         return iter(ds)
 
-    def _ensure_iter(self) -> Iterator[dict[str, Any]]:
-        if self._iter is None:
-            self._iter = self._open_stream()
-        return self._iter
+    def _pick_source(self) -> int:
+        if len(self.sources) == 1:
+            return 0
+        r = self._rng.random()
+        acc = 0.0
+        for i, w in enumerate(self._weights):
+            acc += w
+            if r <= acc:
+                return i
+        return len(self.sources) - 1
 
-    def _next_row(self) -> dict[str, Any] | None:
-        it = self._ensure_iter()
+    def _next_row(self, source_index: int) -> tuple[dict[str, Any] | None, str]:
+        """Return (row, config) from the chosen source."""
+        cfg = self._source_configs[source_index]
+        if self._test_iter is not None and source_index == 0:
+            try:
+                return dict(next(self._test_iter)), cfg
+            except StopIteration:
+                return None, cfg
+
+        it = self._iters[source_index]
+        if it is None:
+            if not self._owns_stream:
+                return None, cfg
+            it = self._open_stream(source_index)
+            self._iters[source_index] = it
         try:
-            return dict(next(it))
+            return dict(next(it)), cfg
         except StopIteration:
             if not self._owns_stream:
-                return None
-            # Restart stream with a new shuffle seed.
-            self._iter = self._open_stream()
+                return None, cfg
+            it = self._open_stream(source_index)
+            self._iters[source_index] = it
             try:
-                return dict(next(self._iter))
+                return dict(next(it)), cfg
             except StopIteration:
-                return None
+                return None, cfg
 
     def refill(self) -> int:
         """Pull up to ``refill_size`` valid pairs into the queue (cap at queue_size)."""
         added = 0
         attempts = 0
-        max_attempts = self.refill_size * 20
+        max_attempts = self.refill_size * 25
         while (
             len(self._queue) < self.queue_size
             and added < self.refill_size
             and attempts < max_attempts
         ):
             attempts += 1
-            row = self._next_row()
+            src_i = self._pick_source()
+            row, cfg = self._next_row(src_i)
             if row is None:
-                break
-            sample = parse_text_pair_row(row, config=self.config)
+                # Try other sources before giving up this attempt.
+                if len(self.sources) > 1:
+                    for j in range(len(self.sources)):
+                        if j == src_i:
+                            continue
+                        row, cfg = self._next_row(j)
+                        if row is not None:
+                            break
+                if row is None:
+                    break
+            sample = parse_text_pair_row(row, config=cfg)
             if sample is None:
                 continue
             self._queue.append(sample)
@@ -1773,12 +1886,11 @@ class StreamingTextPairQueue:
         if len(self._queue) < n:
             self.refill()
         if len(self._queue) < n:
-            # Second chance after stream restart
             self.refill()
         if len(self._queue) < n:
             raise RuntimeError(
                 f"StreamingTextPairQueue could only collect {len(self._queue)} "
-                f"pairs (need {n}) from {self.dataset_name}/{self.config}. "
+                f"pairs (need {n}) from {self.describe()}. "
                 "Check network / dataset availability."
             )
         idxs = self._rng.sample(range(len(self._queue)), n)

@@ -1421,3 +1421,21 @@ class TestMultiPosAndParaphraseQueue(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(float(loss), 0.0)
+
+
+class TestDualGpuFuseHelpers(unittest.TestCase):
+    def test_cat_pad_text_batches(self):
+        from trisearch_models.training import Stage1AlignmentModel
+
+        ids1 = torch.ones(2, 3, dtype=torch.long)
+        m1 = torch.ones(2, 3, dtype=torch.long)
+        ids2 = torch.full((1, 5), 7, dtype=torch.long)
+        m2 = torch.ones(1, 5, dtype=torch.long)
+        out_ids, out_mask, ranges = Stage1AlignmentModel.cat_pad_text_batches(
+            [(ids1, m1), (ids2, m2)], pad_token_id=0
+        )
+        self.assertEqual(tuple(out_ids.shape), (3, 5))
+        self.assertEqual(ranges, [(0, 2), (2, 3)])
+        self.assertEqual(int(out_ids[0, 3]), 0)
+        self.assertEqual(int(out_mask[0, 3]), 0)
+        self.assertEqual(int(out_ids[2, 0]), 7)

@@ -1867,6 +1867,16 @@ class Stage1AlignmentModel(nn.Module):
         self.text_device = text_device
         self.loss_device = vision_device
         self.compute_dtype = compute_dtype
+        # Dual-GPU overlap: separate streams so vision encode ‖ text encode.
+        self._vision_stream: torch.cuda.Stream | None = None
+        self._text_stream: torch.cuda.Stream | None = None
+        if (
+            torch.cuda.is_available()
+            and vision_device.type == "cuda"
+            and text_device.type == "cuda"
+        ):
+            self._vision_stream = torch.cuda.Stream(device=vision_device)
+            self._text_stream = torch.cuda.Stream(device=text_device)
 
         self.vision_model = vision_model
         self.text_model = text_model
@@ -2342,18 +2352,7 @@ class Stage1AlignmentModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> list[torch.Tensor]:
-        input_ids = input_ids.to(self.text_device, non_blocking=True)
-        attention_mask = attention_mask.to(self.text_device, non_blocking=True)
-        text_hidden = self._text_backbone()(
-            input_ids=input_ids, attention_mask=attention_mask
-        ).last_hidden_state.to(dtype=self.compute_dtype)
-        text_raw = self.text_projection(
-            text_hidden.to(self.text_projection.weight.dtype)
-        )
-        tokens: list[torch.Tensor] = []
-        for i in range(text_raw.size(0)):
-            mask = attention_mask[i].bool()
-            tokens.append(matryoshka_normalize(text_raw[i, mask]))
+        tokens, _ = self.encode_text_tokens(input_ids, attention_mask)
         return tokens
 
     def _encode_text_batch(
@@ -2361,30 +2360,19 @@ class Stage1AlignmentModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        input_ids = input_ids.to(self.text_device, non_blocking=True)
-        attention_mask = attention_mask.to(self.text_device, non_blocking=True)
-        text_hidden = self._text_backbone()(
-            input_ids=input_ids, attention_mask=attention_mask
-        ).last_hidden_state.to(dtype=self.compute_dtype)
-        text_raw = self.text_projection(
-            text_hidden.to(self.text_projection.weight.dtype)
-        )
-        tokens: list[torch.Tensor] = []
-        raw_masked: list[torch.Tensor] = []
-        for i in range(text_raw.size(0)):
-            mask = attention_mask[i].bool()
-            raw_masked.append(text_raw[i, mask])
-            tokens.append(matryoshka_normalize(text_raw[i, mask]))
-        return tokens, raw_masked
+        return self.encode_text_tokens(input_ids, attention_mask)
 
     def encode_text_tokens(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        *,
+        already_on_device: bool = False,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Project text ids → (normalized tokens list, raw masked list)."""
-        input_ids = input_ids.to(self.text_device, non_blocking=True)
-        attention_mask = attention_mask.to(self.text_device, non_blocking=True)
+        if not already_on_device:
+            input_ids = input_ids.to(self.text_device, non_blocking=True)
+            attention_mask = attention_mask.to(self.text_device, non_blocking=True)
         text_hidden = self._text_backbone()(
             input_ids=input_ids, attention_mask=attention_mask
         ).last_hidden_state.to(dtype=self.compute_dtype)
@@ -2399,28 +2387,58 @@ class Stage1AlignmentModel(nn.Module):
             tokens.append(matryoshka_normalize(text_raw[i, mask]))
         return tokens, raw_masked
 
-    def compute_paraphrase_loss(
-        self,
-        anchor_input_ids: torch.Tensor,
-        anchor_attention_mask: torch.Tensor,
-        positive_input_ids: torch.Tensor,
-        positive_attention_mask: torch.Tensor,
+    @staticmethod
+    def cat_pad_text_batches(
+        batches: list[tuple[torch.Tensor, torch.Tensor]],
         *,
-        negative_input_ids: torch.Tensor | None = None,
-        negative_attention_mask: torch.Tensor | None = None,
+        pad_token_id: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
+        """Concatenate variable-length text batches on dim 0 (pad to shared L).
+
+        Returns ``(input_ids, attention_mask, ranges)`` where each range is
+        ``(start, end)`` into the concatenated batch for the matching input.
+        Empty list → empty tensors and empty ranges.
+        """
+        if not batches:
+            empty = torch.zeros(0, 0, dtype=torch.long)
+            return empty, empty, []
+        max_len = max(int(ids.shape[-1]) for ids, _ in batches)
+        pieces_ids: list[torch.Tensor] = []
+        pieces_mask: list[torch.Tensor] = []
+        ranges: list[tuple[int, int]] = []
+        cursor = 0
+        for ids, mask in batches:
+            if ids.ndim == 1:
+                ids = ids.unsqueeze(0)
+                mask = mask.unsqueeze(0)
+            b, l = ids.shape[0], ids.shape[1]
+            if l < max_len:
+                pad_i = ids.new_full((b, max_len - l), int(pad_token_id))
+                pad_m = mask.new_zeros((b, max_len - l))
+                ids = torch.cat([ids, pad_i], dim=1)
+                mask = torch.cat([mask, pad_m], dim=1)
+            elif l > max_len:
+                ids = ids[:, :max_len]
+                mask = mask[:, :max_len]
+            pieces_ids.append(ids)
+            pieces_mask.append(mask)
+            ranges.append((cursor, cursor + b))
+            cursor += b
+        return torch.cat(pieces_ids, dim=0), torch.cat(pieces_mask, dim=0), ranges
+
+    def _sync_tower_streams(self) -> None:
+        """Wait for overlapped vision/text encodes before joint scoring."""
+        if self._vision_stream is not None:
+            self._vision_stream.synchronize()
+        if self._text_stream is not None:
+            self._text_stream.synchronize()
+
+    def _paraphrase_from_tokens(
+        self,
+        anchor_tok: list[torch.Tensor],
+        pos_tok: list[torch.Tensor],
+        neg_tok: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """AllNLI / paraphrase MaxSim InfoNCE (text tower only)."""
-        anchor_tok, _ = self.encode_text_tokens(
-            anchor_input_ids, anchor_attention_mask
-        )
-        pos_tok, _ = self.encode_text_tokens(
-            positive_input_ids, positive_attention_mask
-        )
-        neg_tok: list[torch.Tensor] = []
-        if negative_input_ids is not None and negative_attention_mask is not None:
-            neg_tok, _ = self.encode_text_tokens(
-                negative_input_ids, negative_attention_mask
-            )
         bank = self.memory_bank
         score_text_raw, _ = self._bank_raw_for_scoring()
         bank_text = (
@@ -2431,7 +2449,9 @@ class Stage1AlignmentModel(nn.Module):
         return paraphrase_contrastive_loss(
             [self._to_loss(t) for t in anchor_tok],
             [self._to_loss(t) for t in pos_tok],
-            negative_tokens=[self._to_loss(t) for t in neg_tok] if neg_tok else None,
+            negative_tokens=(
+                [self._to_loss(t) for t in neg_tok] if neg_tok else None
+            ),
             temperature=self.temperature,
             bank_doc_tokens=bank_text,
             soft_maxsim_temperature=self._soft_tau(),
@@ -2443,6 +2463,38 @@ class Stage1AlignmentModel(nn.Module):
             gap_weight=self.gap_loss_weight,
             gap_margin=self.gap_margin,
         )
+
+    def compute_paraphrase_loss(
+        self,
+        anchor_input_ids: torch.Tensor,
+        anchor_attention_mask: torch.Tensor,
+        positive_input_ids: torch.Tensor,
+        positive_attention_mask: torch.Tensor,
+        *,
+        negative_input_ids: torch.Tensor | None = None,
+        negative_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """AllNLI / paraphrase MaxSim InfoNCE (text tower only; fused encode)."""
+        batches: list[tuple[torch.Tensor, torch.Tensor]] = [
+            (anchor_input_ids, anchor_attention_mask),
+            (positive_input_ids, positive_attention_mask),
+        ]
+        has_neg = (
+            negative_input_ids is not None and negative_attention_mask is not None
+        )
+        if has_neg:
+            batches.append((negative_input_ids, negative_attention_mask))
+        fused_ids, fused_mask, ranges = self.cat_pad_text_batches(batches)
+        tokens, _ = self.encode_text_tokens(fused_ids, fused_mask)
+        a0, a1 = ranges[0]
+        p0, p1 = ranges[1]
+        anchor_tok = tokens[a0:a1]
+        pos_tok = tokens[p0:p1]
+        neg_tok = None
+        if has_neg and len(ranges) > 2:
+            n0, n1 = ranges[2]
+            neg_tok = tokens[n0:n1]
+        return self._paraphrase_from_tokens(anchor_tok, pos_tok, neg_tok)
 
     def forward(
         self,
@@ -2459,47 +2511,140 @@ class Stage1AlignmentModel(nn.Module):
         all_attention_mask: torch.Tensor | None = None,
         text_image_ids: torch.Tensor | None = None,
         all_positive_texts: list[str] | None = None,
+        para_anchor_input_ids: torch.Tensor | None = None,
+        para_anchor_attention_mask: torch.Tensor | None = None,
+        para_positive_input_ids: torch.Tensor | None = None,
+        para_positive_attention_mask: torch.Tensor | None = None,
+        para_negative_input_ids: torch.Tensor | None = None,
+        para_negative_attention_mask: torch.Tensor | None = None,
         return_loss: bool = True,
     ) -> dict[str, Any]:
         vdtype = self._module_dtype(self.vision_model)
-        pixel_values = pixel_values.to(
-            device=self.vision_device, dtype=vdtype, non_blocking=True
-        )
-        input_ids = input_ids.to(self.text_device, non_blocking=True)
-        attention_mask = attention_mask.to(self.text_device, non_blocking=True)
-
-        # Train-only: flip / rotate / mild scale-stretch + pad fill + pixel shift.
-        pixel_values = self._maybe_augment_images(pixel_values)
-        # Augmentations can promote to float32; cast back to vision weight dtype.
-        pixel_values = pixel_values.to(dtype=vdtype)
-
-        vision_hidden = self.vision_model(
-            pixel_values=pixel_values
-        ).last_hidden_state.to(dtype=self.compute_dtype)
-        vision_raw = self.vision_projection(
-            vision_hidden.to(self.vision_projection.weight.dtype)
+        dual = (
+            self._vision_stream is not None
+            and self._text_stream is not None
+            and self.vision_device != self.text_device
         )
 
-        # Multi-text positives: encode all captions/queries for images when present.
+        # ----- Build fused text batch (captions + queries + paraphrase) -----
         use_all_texts = (
             all_input_ids is not None
             and all_attention_mask is not None
             and text_image_ids is not None
             and all_input_ids.shape[0] >= input_ids.shape[0]
         )
-        if use_all_texts:
-            assert all_input_ids is not None and all_attention_mask is not None
-            text_tokens, text_raw_masked = self.encode_text_tokens(
-                all_input_ids, all_attention_mask
+        cap_ids = all_input_ids if use_all_texts else input_ids
+        cap_mask = all_attention_mask if use_all_texts else attention_mask
+        assert cap_ids is not None and cap_mask is not None
+
+        has_queries = (
+            query_input_ids is not None
+            and query_attention_mask is not None
+            and unrelated_input_ids is not None
+            and unrelated_attention_mask is not None
+        )
+        has_para = (
+            para_anchor_input_ids is not None
+            and para_anchor_attention_mask is not None
+            and para_positive_input_ids is not None
+            and para_positive_attention_mask is not None
+        )
+        has_para_neg = (
+            has_para
+            and para_negative_input_ids is not None
+            and para_negative_attention_mask is not None
+        )
+
+        text_parts: list[tuple[torch.Tensor, torch.Tensor]] = [
+            (cap_ids, cap_mask),
+        ]
+        # ranges indices: 0=captions, then optional query, unrelated, para_a, para_p, para_n
+        part_names = ["cap"]
+        if has_queries:
+            text_parts.append((query_input_ids, query_attention_mask))
+            text_parts.append((unrelated_input_ids, unrelated_attention_mask))
+            part_names.extend(["query", "unrelated"])
+        if has_para:
+            text_parts.append((para_anchor_input_ids, para_anchor_attention_mask))
+            text_parts.append((para_positive_input_ids, para_positive_attention_mask))
+            part_names.extend(["para_a", "para_p"])
+            if has_para_neg:
+                text_parts.append(
+                    (para_negative_input_ids, para_negative_attention_mask)
+                )
+                part_names.append("para_n")
+
+        fused_ids, fused_mask, ranges = self.cat_pad_text_batches(text_parts)
+        range_by_name = {n: r for n, r in zip(part_names, ranges)}
+
+        # ----- Overlapped encode: vision ‖ fused text -----
+        def _run_vision() -> torch.Tensor:
+            pv = pixel_values.to(
+                device=self.vision_device, dtype=vdtype, non_blocking=True
             )
-            ids_map = text_image_ids.to(device=self.text_device, dtype=torch.long).view(-1)
+            # Train-only geometric/photometric augs on vision GPU.
+            pv = self._maybe_augment_images(pv)
+            pv = pv.to(dtype=vdtype)
+            vh = self.vision_model(pixel_values=pv).last_hidden_state.to(
+                dtype=self.compute_dtype
+            )
+            return self.vision_projection(
+                vh.to(self.vision_projection.weight.dtype)
+            )
+
+        def _run_text() -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+            ids = fused_ids.to(self.text_device, non_blocking=True)
+            mask = fused_mask.to(self.text_device, non_blocking=True)
+            return self.encode_text_tokens(ids, mask, already_on_device=True)
+
+        if dual:
+            with torch.cuda.device(self.vision_device):
+                with torch.cuda.stream(self._vision_stream):
+                    vision_raw = _run_vision()
+            with torch.cuda.device(self.text_device):
+                with torch.cuda.stream(self._text_stream):
+                    all_text_tokens, all_text_raw = _run_text()
+            self._sync_tower_streams()
         else:
-            text_tokens, text_raw_masked = self.encode_text_tokens(
-                input_ids, attention_mask
-            )
+            vision_raw = _run_vision()
+            all_text_tokens, all_text_raw = _run_text()
+
+        # Slice fused text into logical groups.
+        c0, c1 = range_by_name["cap"]
+        text_tokens = all_text_tokens[c0:c1]
+        text_raw_masked = all_text_raw[c0:c1]
+        if use_all_texts:
+            ids_map = text_image_ids.to(
+                device=self.text_device, dtype=torch.long
+            ).view(-1)
+        else:
             ids_map = torch.arange(
-                input_ids.shape[0], device=self.text_device, dtype=torch.long
+                c1 - c0, device=self.text_device, dtype=torch.long
             )
+
+        query_tokens: list[torch.Tensor] = []
+        query_raw: list[torch.Tensor] = []
+        distractor_tokens: list[torch.Tensor] = []
+        distractor_raw: list[torch.Tensor] = []
+        if has_queries:
+            q0, q1 = range_by_name["query"]
+            u0, u1 = range_by_name["unrelated"]
+            query_tokens = all_text_tokens[q0:q1]
+            query_raw = all_text_raw[q0:q1]
+            distractor_tokens = all_text_tokens[u0:u1]
+            distractor_raw = all_text_raw[u0:u1]
+
+        para_anchor_tok: list[torch.Tensor] = []
+        para_pos_tok: list[torch.Tensor] = []
+        para_neg_tok: list[torch.Tensor] | None = None
+        if has_para:
+            a0, a1 = range_by_name["para_a"]
+            p0, p1 = range_by_name["para_p"]
+            para_anchor_tok = all_text_tokens[a0:a1]
+            para_pos_tok = all_text_tokens[p0:p1]
+            if has_para_neg and "para_n" in range_by_name:
+                n0, n1 = range_by_name["para_n"]
+                para_neg_tok = all_text_tokens[n0:n1]
 
         # Primary caption tokens (1 per image) for bank + query→caption docs.
         n_images = vision_raw.size(0)
@@ -2510,10 +2655,15 @@ class Stage1AlignmentModel(nn.Module):
             if 0 <= img_i < n_images and primary_idx[img_i] < 0:
                 primary_idx[img_i] = t_i
         if bool((primary_idx < 0).any()):
-            # Fall back: encode primary input_ids if multipos map incomplete.
-            prim_tok, prim_raw = self.encode_text_tokens(input_ids, attention_mask)
-            primary_text_tokens = prim_tok
-            primary_text_raw = prim_raw
+            # Incomplete multipos map: use first n_images caption slots if square.
+            if len(text_tokens) >= n_images:
+                primary_text_tokens = text_tokens[:n_images]
+                primary_text_raw = text_raw_masked[:n_images]
+            else:
+                raise RuntimeError(
+                    "No primary text for every image in multipos batch "
+                    f"(n_images={n_images}, n_texts={len(text_tokens)})."
+                )
         else:
             primary_text_tokens = [text_tokens[int(i)] for i in primary_idx.tolist()]
             primary_text_raw = [text_raw_masked[int(i)] for i in primary_idx.tolist()]
@@ -2646,27 +2796,18 @@ class Stage1AlignmentModel(nn.Module):
         text_text_matryoshka = zero
         query_image = zero
         query_image_matryoshka = zero
+        paraphrase_loss = zero
         loss_query_tokens: list[torch.Tensor] = []
         loss_query_raw: list[torch.Tensor] = []
         loss_distractor_tokens: list[torch.Tensor] = []
         loss_distractor_raw: list[torch.Tensor] = []
 
-        has_queries = (
-            query_input_ids is not None
-            and query_attention_mask is not None
-            and unrelated_input_ids is not None
-            and unrelated_attention_mask is not None
-        )
+        # has_queries already determined before fused encode
         want_query_image = has_queries and self.query_image_weight > 0.0
         want_query_caption = has_queries and self.text_text_weight > 0.0
 
         if has_queries and (want_query_image or want_query_caption):
-            query_tokens, query_raw = self._encode_text_batch(
-                query_input_ids, query_attention_mask
-            )
-            distractor_tokens, distractor_raw = self._encode_text_batch(
-                unrelated_input_ids, unrelated_attention_mask
-            )
+            # Tokens already produced in the fused text encode (overlapped w/ vision).
             loss_query_tokens = [self._to_loss(t) for t in query_tokens]
             loss_distractor_tokens = [self._to_loss(t) for t in distractor_tokens]
             loss_query_raw = [self._to_loss(t) for t in query_raw]
@@ -2833,6 +2974,12 @@ class Stage1AlignmentModel(nn.Module):
         if bank.enabled:
             bank.enqueue(image_raw=loss_image_raw, text_raw=loss_primary_text_raw)
 
+        # Paraphrase CE from tokens already encoded in the fused (overlapped) text pass.
+        if has_para and para_anchor_tok and para_pos_tok:
+            paraphrase_loss = self._paraphrase_from_tokens(
+                para_anchor_tok, para_pos_tok, para_neg_tok
+            )
+
         return {
             "loss": loss,
             "retrieval_loss": retrieval_loss.detach(),
@@ -2844,6 +2991,9 @@ class Stage1AlignmentModel(nn.Module):
             "text_text_loss": text_text.detach(),
             "text_text_matryoshka_loss": text_text_matryoshka.detach(),
             "query_caption_loss": query_caption_task.detach(),
+            "paraphrase_loss": paraphrase_loss
+            if torch.is_tensor(paraphrase_loss)
+            else zero,
             # Log raw entropy [0,1] for readability; loss uses squared when enabled.
             "heatmap_sparsity_loss": sparsity_raw.detach(),
             "heatmap_sparsity_squared": sparsity.detach(),
@@ -3933,6 +4083,22 @@ def run_training(
 
     accum = max(int(args.gradient_accumulation_steps), 1)
 
+    dual_streams = (
+        getattr(model, "_vision_stream", None) is not None
+        and getattr(model, "_text_stream", None) is not None
+        and model.vision_device != model.text_device
+    )
+    if dual_streams:
+        print(
+            f"Dual-GPU encode overlap: vision on {model.vision_device} ‖ "
+            f"fused text on {model.text_device} (captions+queries+paraphrase)."
+        )
+    else:
+        print(
+            f"Encode schedule: sequential "
+            f"(vision={model.vision_device}, text={model.text_device})."
+        )
+
     while True:
         for batch in dataloader:
             # Policy B: snapshot bank for scoring at the start of each accum window.
@@ -3943,9 +4109,9 @@ def run_training(
             if backbone_frozen:
                 set_backbone_trainable(model, False)
 
-            outputs = model(**batch, return_loss=True)
-            loss = outputs["loss"]
-            para_val = 0.0
+            # Fuse paraphrase ids into the same text encode as captions/queries
+            # so vision ‖ text streams can overlap (no second text-only forward).
+            para_kwargs: dict[str, Any] = {}
             if (
                 paraphrase_queue is not None
                 and paraphrase_weight > 0.0
@@ -3956,19 +4122,25 @@ def run_training(
                     tokenizer, pairs, max_length=paraphrase_max_len
                 )
                 para_kwargs = {
-                    "anchor_input_ids": tok["anchor_input_ids"],
-                    "anchor_attention_mask": tok["anchor_attention_mask"],
-                    "positive_input_ids": tok["positive_input_ids"],
-                    "positive_attention_mask": tok["positive_attention_mask"],
+                    "para_anchor_input_ids": tok["anchor_input_ids"],
+                    "para_anchor_attention_mask": tok["anchor_attention_mask"],
+                    "para_positive_input_ids": tok["positive_input_ids"],
+                    "para_positive_attention_mask": tok["positive_attention_mask"],
                 }
                 if "negative_input_ids" in tok:
-                    para_kwargs["negative_input_ids"] = tok["negative_input_ids"]
-                    para_kwargs["negative_attention_mask"] = tok[
+                    para_kwargs["para_negative_input_ids"] = tok["negative_input_ids"]
+                    para_kwargs["para_negative_attention_mask"] = tok[
                         "negative_attention_mask"
                     ]
-                para_loss = model.compute_paraphrase_loss(**para_kwargs)
-                para_val = float(para_loss.detach().float().item())
-                loss = loss + paraphrase_weight * para_loss
+
+            outputs = model(**batch, return_loss=True, **para_kwargs)
+            loss = outputs["loss"]
+            para_val = 0.0
+            if para_kwargs and "paraphrase_loss" in outputs:
+                para_t = outputs["paraphrase_loss"]
+                if torch.is_tensor(para_t):
+                    para_val = float(para_t.detach().float().item())
+                    loss = loss + paraphrase_weight * para_t
 
             loss_val = loss.detach().float().item()
             if loss_val <= 0.0 or not math.isfinite(loss_val):
