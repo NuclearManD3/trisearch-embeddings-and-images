@@ -157,7 +157,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-model-dir", default=None,
                         help="Deprecated alias for --seed-text-dir.")
     parser.add_argument("--trained-dir", default=DEFAULT_TRAINED_DIR)
-    parser.add_argument("--checkpoint-dir", default=None)
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Explicit checkpoint root to resume "
+             "(e.g. models/trained/stage1/history/step-7400). "
+             "Overrides auto latest-by-mtime.",
+    )
+    parser.add_argument(
+        "--resume-from-step",
+        type=int,
+        default=None,
+        help="Resume from models/trained/stage1/history/step-N "
+             "(mutually exclusive with --checkpoint-dir).",
+    )
+    parser.add_argument(
+        "--history-only",
+        action="store_true",
+        help="When auto-resuming, ignore the live stage1/ root and use the "
+             "highest history/step-N only (useful after archiving a bad live head).",
+    )
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--vision-processor-id", default=SIGLIP_PROCESSOR_ID)
     parser.add_argument("--text-tokenizer-id", default=QWEN_TOKENIZER_ID)
@@ -348,11 +367,12 @@ def parse_args() -> argparse.Namespace:
         "--paraphrase-dataset",
         type=str,
         default="mix",
-        help="Text–text training source. Default 'mix' = weighted GooAQ "
-             "(~3M broad Google Q–A) + Natural Questions + light AllNLI. "
+        help="Text–text paraphrase source. Default 'mix' = paraphrase-only "
+             "blend (AllNLI triplets, ChatGPT paraphrases, COCO/Flickr caption "
+             "pairs, Quora duplicates, SimpleWiki, sentence-compression). "
              "Or a single HF id "
              f"(e.g. {DEFAULT_PARAPHRASE_DATASET}). Streamed; never fully "
-             "materialized in RAM.",
+             "materialized in RAM. Not query–answer retrieval corpora.",
     )
     parser.add_argument(
         "--paraphrase-config",
@@ -366,11 +386,11 @@ def parse_args() -> argparse.Namespace:
         "--paraphrase-sources",
         type=str,
         default=None,
-        help="Explicit multi-source mix: "
+        help="Explicit multi-source paraphrase mix: "
              "'dataset:config:weight,...' "
-             "(e.g. sentence-transformers/gooaq:pair:0.7,"
-             "sentence-transformers/natural-questions:pair:0.2,"
-             "sentence-transformers/all-nli:triplet:0.1). "
+             "(e.g. sentence-transformers/all-nli:triplet:0.4,"
+             "humarin/chatgpt-paraphrases:default:0.3,"
+             "sentence-transformers/coco-captions:pair:0.3). "
              "Overrides --paraphrase-dataset when set. Use 'mix' for defaults.",
     )
     parser.add_argument(
@@ -904,11 +924,22 @@ def main():
             query_parallelism=args.query_parallelism,
         )
 
+    if args.fresh and (args.checkpoint_dir or args.resume_from_step is not None):
+        raise SystemExit("--fresh cannot be combined with --checkpoint-dir / --resume-from-step")
+    if args.checkpoint_dir and args.resume_from_step is not None:
+        raise SystemExit("Use only one of --checkpoint-dir or --resume-from-step")
+    if args.history_only and (args.checkpoint_dir or args.resume_from_step is not None):
+        print("Note: --history-only ignored when an explicit checkpoint is set.")
+
     vision_load_dir, text_load_dir, checkpoint_root = resolve_model_dirs(
         fresh=args.fresh,
         checkpoint_dir=args.checkpoint_dir,
         seed_vision_dir=args.seed_vision_dir,
         seed_text_dir=args.seed_text_dir,
+        resume_from_step=args.resume_from_step,
+        history_only=bool(args.history_only)
+        and not args.checkpoint_dir
+        and args.resume_from_step is None,
     )
     if checkpoint_root is None:
         _require_path(args.seed_text_dir, "Seed text model")

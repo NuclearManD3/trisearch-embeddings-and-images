@@ -3140,15 +3140,64 @@ def checkpoint_is_valid(root: Path) -> bool:
     )
 
 
+# Archive / quarantine folder name fragments — never auto-resume from these.
+_CHECKPOINT_ARCHIVE_MARKERS = (
+    "archive",
+    "archived",
+    "maybe_cooked",
+    "maybe_bad",
+    "bad",
+    "quarantine",
+    "discard",
+    "trash",
+    "_old",
+)
+
+
+def history_step_number(path: Path) -> int | None:
+    """Parse ``step-1234`` directory names; None if not a clean history step dir."""
+    name = path.name
+    if not name.startswith("step-"):
+        return None
+    rest = name[5:]
+    if not rest.isdigit():
+        return None
+    return int(rest)
+
+
+def is_auto_resume_checkpoint_path(path: Path) -> bool:
+    """True if ``path`` is eligible for automatic resume discovery.
+
+    Accepts the live stage root or ``history/step-<digits>`` only. Rejects
+    nested archive folders (e.g. ``history/maybe_cooked/...``) and renamed
+    steps like ``step-10000_maybe_bad``.
+    """
+    skip_exact = {"models", "trained", "history", "checkpoints"}
+    for part in path.parts:
+        pl = part.lower()
+        if pl in skip_exact or pl.startswith("stage"):
+            continue
+        if pl.startswith("step-") and pl[5:].isdigit():
+            continue
+        for marker in _CHECKPOINT_ARCHIVE_MARKERS:
+            if marker in pl:
+                return False
+    # Under history/, only clean step-<int> dirs are eligible.
+    if "history" in path.parts:
+        return history_step_number(path) is not None
+    return True
+
+
 def _checkpoint_step_key(path: Path) -> tuple[int, float]:
     """Sort key: prefer higher step-N, then mtime. Stage root counts as step=10**12."""
-    name = path.name
-    mtime = (path / PROJECTION_FILE).stat().st_mtime if (path / PROJECTION_FILE).is_file() else path.stat().st_mtime
-    if name.startswith("step-"):
-        try:
-            return (int(name.split("-", 1)[1]), mtime)
-        except ValueError:
-            return (0, mtime)
+    mtime = (
+        (path / PROJECTION_FILE).stat().st_mtime
+        if (path / PROJECTION_FILE).is_file()
+        else path.stat().st_mtime
+    )
+    step = history_step_number(path)
+    if step is not None:
+        return (step, mtime)
     # Completed / live stage root (models/trained/stage1) — treat as "current head"
     return (10**12, mtime)
 
@@ -3158,7 +3207,11 @@ def list_stage_checkpoints(
     *,
     include_stage_root: bool = True,
 ) -> list[Path]:
-    """Valid checkpoint roots for ``models/trained/stage{N}/`` (+ history/step-*)."""
+    """Valid checkpoint roots for ``models/trained/stage{N}/`` (+ history/step-N).
+
+    Only direct ``history/step-<digits>`` children are considered — not nested
+    archive folders (e.g. ``history/maybe_cooked/step-8000``).
+    """
     if stage < 1:
         return []
     trained = Path(TRAINED_ROOT) / f"stage{stage}"
@@ -3169,8 +3222,17 @@ def list_stage_checkpoints(
             candidates.append(Path(LEGACY_CHECKPOINT_DIR))
     history = trained / "history"
     if history.is_dir():
-        candidates.extend(history.glob("step-*"))
-    return [p for p in candidates if checkpoint_is_valid(p)]
+        for child in history.iterdir():
+            if not child.is_dir():
+                continue
+            if history_step_number(child) is None:
+                continue
+            candidates.append(child)
+    return [
+        p
+        for p in candidates
+        if is_auto_resume_checkpoint_path(p) and checkpoint_is_valid(p)
+    ]
 
 
 def list_stage1_checkpoints(*, include_stage_root: bool = True) -> list[Path]:
@@ -3189,17 +3251,35 @@ def _checkpoint_mtime_key(path: Path) -> float:
     return path.stat().st_mtime
 
 
-def find_latest_checkpoint_for_stage(stage: int) -> Path | None:
-    """Most recent valid root under stage{N} (stage dir + history/step-*, by mtime)."""
-    valid = list_stage_checkpoints(stage, include_stage_root=True)
+def find_latest_checkpoint_for_stage(
+    stage: int,
+    *,
+    history_only: bool = False,
+) -> Path | None:
+    """Most recent valid root under stage{N}.
+
+    By default: stage dir + history/step-N, by projection mtime (live head usually
+    wins after a full save). With ``history_only=True``: highest step-N only.
+    """
+    valid = list_stage_checkpoints(stage, include_stage_root=not history_only)
     if not valid:
         return None
+    if history_only:
+        return max(valid, key=_checkpoint_step_key)
     return max(valid, key=_checkpoint_mtime_key)
 
 
-def find_latest_checkpoint() -> Path | None:
+def find_latest_checkpoint(*, history_only: bool = False) -> Path | None:
     """Most recent valid Stage-1 root among stage dir + history/step-* (by mtime)."""
-    return find_latest_checkpoint_for_stage(1)
+    return find_latest_checkpoint_for_stage(1, history_only=history_only)
+
+
+def find_history_checkpoint_at_step(step: int, *, stage: int = 1) -> Path | None:
+    """Return ``models/trained/stage{N}/history/step-{step}`` if valid."""
+    root = Path(TRAINED_ROOT) / f"stage{stage}" / "history" / f"step-{int(step)}"
+    if checkpoint_is_valid(root) and is_auto_resume_checkpoint_path(root):
+        return root
+    return None
 
 
 def find_latest_history_checkpoint() -> Path | None:
@@ -3288,15 +3368,28 @@ def resolve_checkpoint_root(
     *,
     fresh: bool,
     checkpoint_dir: str | None,
+    resume_from_step: int | None = None,
+    history_only: bool = False,
 ) -> Path | None:
     if fresh:
         return None
+    if checkpoint_dir and resume_from_step is not None:
+        raise ValueError("Pass only one of checkpoint_dir or resume_from_step")
     if checkpoint_dir:
         root = Path(checkpoint_dir)
         if not checkpoint_is_valid(root):
             raise FileNotFoundError(f"No valid checkpoint at {root}")
         return root
-    return find_latest_checkpoint()
+    if resume_from_step is not None:
+        root = find_history_checkpoint_at_step(int(resume_from_step))
+        if root is None:
+            raise FileNotFoundError(
+                f"No valid history checkpoint at "
+                f"{DEFAULT_TRAINED_DIR}/history/step-{int(resume_from_step)}. "
+                "List with: ls models/trained/stage1/history/step-*"
+            )
+        return root
+    return find_latest_checkpoint(history_only=history_only)
 
 
 def resolve_model_dirs(
@@ -3305,12 +3398,33 @@ def resolve_model_dirs(
     checkpoint_dir: str | None,
     seed_vision_dir: str,
     seed_text_dir: str,
+    resume_from_step: int | None = None,
+    history_only: bool = False,
 ) -> tuple[Path, Path, Path | None]:
     checkpoint_root = resolve_checkpoint_root(
-        fresh=fresh, checkpoint_dir=checkpoint_dir
+        fresh=fresh,
+        checkpoint_dir=checkpoint_dir,
+        resume_from_step=resume_from_step,
+        history_only=history_only,
     )
     if checkpoint_root is not None:
-        print(f"Resuming from checkpoint: {checkpoint_root}")
+        step = history_step_number(checkpoint_root)
+        step_msg = f" (history step {step})" if step is not None else " (live stage root)"
+        print(f"Resuming from checkpoint: {checkpoint_root}{step_msg}")
+        # Hint when live root wins over older history — common after archiving.
+        hist_latest = find_latest_history_checkpoint()
+        if (
+            hist_latest is not None
+            and checkpoint_root.resolve() != hist_latest.resolve()
+            and history_step_number(checkpoint_root) is None
+        ):
+            print(
+                f"  Note: newest history snapshot is {hist_latest}. "
+                f"Live stage root is preferred by mtime. To use history instead:\n"
+                f"    --checkpoint-dir {hist_latest}\n"
+                f"    or --resume-from-step {history_step_number(hist_latest)}\n"
+                f"    or --history-only"
+            )
         return (
             _component_dir(checkpoint_root, VISION_COMPONENT),
             _component_dir(checkpoint_root, TEXT_COMPONENT),

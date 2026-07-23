@@ -1577,23 +1577,34 @@ def _tokenize_text(tokenizer, text: str, max_text_length: int) -> dict[str, Any]
 # ---------------------------------------------------------------------------
 # Streamed text–text pairs (≤ queue_size in RAM)
 # ---------------------------------------------------------------------------
-# AllNLI alone is narrow (caption-style NLI). Default mix prefers broad Q–A:
-#   GooAQ (~3M Google questions) + Natural Questions (Wikipedia) + light AllNLI.
+# Paraphrase-only mix (same meaning, different wording) — NOT query–answer
+# retrieval. Everyday captions ("dogs running with mom") through wiki/abstract
+# rewrites ("nuclear weapons"), plus NLI hard negatives.
 
-DEFAULT_PARAPHRASE_DATASET = "sentence-transformers/gooaq"
-DEFAULT_PARAPHRASE_CONFIG = "pair"
+DEFAULT_PARAPHRASE_DATASET = "sentence-transformers/all-nli"
+DEFAULT_PARAPHRASE_CONFIG = "triplet"
 DEFAULT_PARAPHRASE_SPLIT = "train"
 DEFAULT_PARAPHRASE_QUEUE_SIZE = 1000
 DEFAULT_PARAPHRASE_REFILL_SIZE = 1000
 DEFAULT_PARAPHRASE_SHUFFLE_BUFFER = 10_000
 DEFAULT_MAX_TEXTS_PER_IMAGE = 4
 
-# Weighted multi-source default: broad concepts >> pure NLI.
+# Weighted multi-source default — all same-meaning pairs / triplets.
 # Format: (hf_dataset, config, relative_weight)
 DEFAULT_PARAPHRASE_SOURCES: tuple[tuple[str, str, float], ...] = (
-    ("sentence-transformers/gooaq", "pair", 0.70),
-    ("sentence-transformers/natural-questions", "pair", 0.20),
-    ("sentence-transformers/all-nli", "triplet", 0.10),
+    # Multi-genre NLI entailment + contradiction hard negs (SNLI + MultiNLI)
+    ("sentence-transformers/all-nli", "triplet", 0.20),
+    # Explicit multi-paraphrase rewrites (Quora / news / QA sources rephrased)
+    ("humarin/chatgpt-paraphrases", "default", 0.25),
+    # Same-image caption pairs → visual everyday language
+    ("sentence-transformers/coco-captions", "pair", 0.15),
+    ("sentence-transformers/flickr30k-captions", "pair", 0.10),
+    # Duplicate questions with different wording (intent paraphrase)
+    ("sentence-transformers/quora-duplicates", "pair", 0.10),
+    # Wikipedia ↔ simple English (broad topics: science, history, policy…)
+    ("sentence-transformers/simple-wiki", "pair", 0.05),
+    # Long ↔ short same meaning (compression paraphrases)
+    ("sentence-transformers/sentence-compression", "pair", 0.15),
 )
 
 
@@ -1613,15 +1624,59 @@ def _first_text(row: dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def parse_text_pair_row(row: dict[str, Any], *, config: str = "triplet") -> TextPairSample | None:
-    """Map a HF embedding-pair row to :class:`TextPairSample`.
+def _as_text_list(value: Any) -> list[str]:
+    """Normalize a paraphrases field (list, JSON/Python list string, or single str)."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [normalize_training_text(x) for x in value if normalize_training_text(x)]
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("["):
+            try:
+                import ast
 
-    Supports:
-      - ``triplet``: anchor/positive/negative (AllNLI)
-      - ``pair``: anchor/positive, question/answer, query/answer (GooAQ, NQ, …)
-      - ``pair-class``: premise/hypothesis/label (entailment only)
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, (list, tuple)):
+                    return [
+                        normalize_training_text(x)
+                        for x in parsed
+                        if normalize_training_text(x)
+                    ]
+            except (SyntaxError, ValueError, TypeError):
+                pass
+        t = normalize_training_text(s)
+        return [t] if t else []
+    return []
+
+
+def parse_text_pair_row(
+    row: dict[str, Any],
+    *,
+    config: str = "triplet",
+    rng: random.Random | None = None,
+) -> TextPairSample | None:
+    """Map a HF row to a same-meaning :class:`TextPairSample`.
+
+    Supports paraphrase / NLI layouts only (not asymmetric Q→passage as primary):
+
+      - ``triplet``: anchor/positive/negative
+      - ``pair``: caption1/caption2, anchor/positive, text/simplified, …
+      - ``pair-class``: premise/hypothesis entailment label
+      - multi-paraphrase rows: ``text`` + ``paraphrases`` list (e.g. ChatGPT paraphrases)
     """
     cfg = (config or "triplet").lower()
+    pick = rng.choice if rng is not None else random.choice
+
+    # Multi-paraphrase list (humarin/chatgpt-paraphrases and similar)
+    if "paraphrases" in row and row.get("text") is not None:
+        anchor = normalize_training_text(row.get("text", ""))
+        paras = [
+            p for p in _as_text_list(row.get("paraphrases")) if p and p != anchor
+        ]
+        if anchor and paras:
+            return TextPairSample(anchor=anchor, positive=pick(paras), negative=None)
+
     if cfg == "pair-class":
         a = _first_text(row, "premise", "sentence1", "anchor")
         b = _first_text(row, "hypothesis", "sentence2", "positive")
@@ -1632,19 +1687,40 @@ def parse_text_pair_row(row: dict[str, Any], *, config: str = "triplet") -> Text
         if not a or not b or a == b:
             return None
         return TextPairSample(anchor=a, positive=b, negative=None)
-    if cfg == "pair":
+
+    if cfg in ("pair", "default", ""):
+        # Prefer symmetric paraphrase fields over Q–A / passage retrieval keys.
         a = _first_text(
-            row, "question", "query", "anchor", "sentence1", "premise", "text"
+            row,
+            "caption1",
+            "anchor",
+            "sentence1",
+            "text",
+            "premise",
+            "sent1",
         )
         b = _first_text(
-            row, "answer", "positive", "sentence2", "hypothesis", "passage", "context"
+            row,
+            "caption2",
+            "positive",
+            "sentence2",
+            "simplified",
+            "hypothesis",
+            "sent2",
         )
+        # Same-meaning duplicates sometimes use two generic text fields.
+        if not a or not b:
+            a = a or _first_text(row, "sentence_a", "s1")
+            b = b or _first_text(row, "sentence_b", "s2")
         if not a or not b or a == b:
             return None
         return TextPairSample(anchor=a, positive=b, negative=None)
+
     # triplet (default)
-    a = _first_text(row, "anchor", "premise", "question", "query", "sentence1")
-    b = _first_text(row, "positive", "hypothesis", "answer", "sentence2")
+    a = _first_text(row, "anchor", "premise", "sentence1", "caption1", "text")
+    b = _first_text(
+        row, "positive", "hypothesis", "sentence2", "caption2", "simplified"
+    )
     c = _first_text(row, "negative")
     if not a or not b or a == b:
         return None
@@ -1726,11 +1802,11 @@ def build_positive_texts_for_image(
 
 
 class StreamingTextPairQueue:
-    """In-memory queue of ≤ ``queue_size`` text pairs; refill from HF stream(s).
+    """In-memory queue of ≤ ``queue_size`` paraphrase pairs; refill from HF stream(s).
 
     Does **not** materialize full datasets. Supports a **weighted multi-source**
-    mix (e.g. GooAQ + Natural Questions + AllNLI) so refills draw broad topics
-    rather than a single narrow corpus. Pairs are **removed** on ``pop_batch``.
+    mix of same-meaning pairs (NLI, caption paraphrases, wiki rewrites, …).
+    Pairs are **removed** on ``pop_batch``.
     """
 
     def __init__(
@@ -1796,13 +1872,23 @@ class StreamingTextPairQueue:
         from datasets import load_dataset
 
         name, cfg, _ = self.sources[source_index]
-        # No trust_remote_code — parquet-native ST datasets only.
-        ds = load_dataset(
-            name,
-            cfg,
-            split=self.split,
-            streaming=True,
-        )
+        # No trust_remote_code — parquet-native Hub datasets only.
+        # ``default`` / empty config: try plain load then named "default".
+        cfg_norm = (cfg or "").strip()
+        if not cfg_norm or cfg_norm.lower() == "default":
+            try:
+                ds = load_dataset(name, split=self.split, streaming=True)
+            except Exception:
+                ds = load_dataset(
+                    name, "default", split=self.split, streaming=True
+                )
+        else:
+            ds = load_dataset(
+                name,
+                cfg_norm,
+                split=self.split,
+                streaming=True,
+            )
         seed = self.seed + self._refill_count * 9973 + source_index * 131
         try:
             ds = ds.shuffle(seed=seed, buffer_size=self.shuffle_buffer)
@@ -1872,7 +1958,7 @@ class StreamingTextPairQueue:
                             break
                 if row is None:
                     break
-            sample = parse_text_pair_row(row, config=cfg)
+            sample = parse_text_pair_row(row, config=cfg, rng=self._rng)
             if sample is None:
                 continue
             self._queue.append(sample)
